@@ -2,8 +2,14 @@ import { notFound, permanentRedirect } from 'next/navigation';
 import { DocsShell } from '../docs-shell';
 import { SiteLink } from '../site-link';
 import { ArticleLinks } from '../article-links';
-import { documentRedirects, getDocument } from '../data/content-index';
+import { documentPaths, documentRedirects, getDocument } from '../data/content-index';
 type PageParams = { params: Promise<{ slug: string[] }> };
+export const dynamicParams = false;
+export function generateStaticParams() {
+  return documentPaths
+    .filter(path => !documentRedirects[path])
+    .map(path => ({ slug: path.slice(1).split('/') }));
+}
 export async function generateMetadata({ params }: PageParams) {
   const { slug } = await params;
   const doc = await getDocument('/' + slug.join('/'));
