@@ -1,35 +1,30 @@
-# IndusCode
+# IndusAGI Coding Agent
 
-## What It Is
-IndusCode is a terminal-first AI coding agent built in India.
-It is open-source, freely available, and designed for developer productivity in the terminal.
+## What it is
+IndusAGI Coding Agent is a terminal-first AI coding agent distributed as the `indusagi-coding-agent` npm package. Its installed command names are `indus` and `indusagi`.
+Source: https://registry.npmjs.org/indusagi-coding-agent/latest
 
-## Benchmark Performance
-- Terminal-Bench 2.0: 69.1% score, ranked #18 globally
-- Outperforms Claude Code and Gemini CLI on Terminal-Bench 2.0
-- Built as a solo open-source project
+The documentation on this site is generated from the IndusAGI documentation corpus pinned at commit `a24f7e9823d0149e27bf05af912fba8dd959866c`.
+Source: https://github.com/varunisrani/indusagi-docs/tree/a24f7e9823d0149e27bf05af912fba8dd959866c
 
-## Install
-npm install -g induscode
-pip install induscode
-cargo install induscode
+## Install the TypeScript coding agent
 
-## Supported LLM Providers
-Claude (Anthropic), GPT (OpenAI), Gemini (Google), and other major LLM providers.
-Bring-your-own API key. Free built-in models also included.
+```bash
+npm install -g indusagi-coding-agent
+```
 
-## Framework
-Built on indusagi-typescript — an open-source, multi-provider TypeScript SDK.
+The npm registry metadata requires Node.js 20 or newer.
+Source: https://www.npmjs.com/package/indusagi-coding-agent
 
-## Focus
-India-first. Developer productivity. Agentic coding in the terminal.
-Not an IDE plugin. A native terminal agent.
+## Documentation families
+- TypeScript framework: https://www.indusagi.com/docs/getting-started
+- TypeScript coding agent: https://www.indusagi.com/cli/README
+- Python framework: https://www.indusagi.com/python/getting-started
+- Python coding agent: https://www.indusagi.com/python-cli/getting-started
+- Rust framework: https://www.indusagi.com/rust/getting-started
+- Rust coding agent: https://www.indusagi.com/rust-cli/getting-started
 
-## Website
-https://www.indusagi.com
-
-## Documentation
-https://www.indusagi.com/docs
-
-## GitHub
-https://github.com/varunisrani/indusagi
+## Project links
+- Website: https://www.indusagi.com
+- Documentation source: https://github.com/varunisrani/indusagi-docs
+- TypeScript coding-agent source: https://github.com/varunisrani/induscode-ts

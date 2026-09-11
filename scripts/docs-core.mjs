@@ -66,7 +66,13 @@ function documentationUrl(value, basePath, slug) {
 }
 
 function slugify(value) {
-  return String(value).toLowerCase().replace(/<[^>]+>/g, '').replace(/[^a-z0-9\s-]/g, '').trim().replace(/\s+/g, '-').replace(/-+/g, '-') || 'section';
+  return String(value)
+    .toLowerCase()
+    .replace(/<[^>]+>/g, '')
+    .trim()
+    .replace(/\s*[→←↔]\s*/gu, ' ')
+    .replace(/[^\p{Letter}\p{Number}\s_-]/gu, '')
+    .replace(/\s/g, '-') || 'section';
 }
 
 function renderMarkdown(markdown, basePath, slug) {
@@ -89,7 +95,15 @@ function renderMarkdown(markdown, basePath, slug) {
     return `<a href="${safeUrl(documentationUrl(href, basePath, slug))}"${titleAttr}>${this.parser.parseInline(tokens)}</a>`;
   };
   renderer.image = ({ href, title, text }) => `<img src="${safeUrl(href)}" alt="${escapeHtml(text)}"${title ? ` title="${escapeHtml(title)}"` : ''}>`;
-  return { html: marked.parse(markdown, { renderer, gfm: true, breaks: false }), sections };
+  const rendered = marked.parse(markdown, { renderer, gfm: true, breaks: false });
+  const ids = [...rendered.matchAll(/\sid="([^"]+)"/g)].map(match => match[1]);
+  const html = rendered.replace(/href="#([^"]+)"/g, (attribute, fragment) => {
+    if (ids.includes(fragment)) return attribute;
+    const comparable = fragment.replace(/-+/g, '-');
+    const matches = ids.filter(id => id.replace(/-+/g, '-') === comparable);
+    return matches.length === 1 ? `href="#${matches[0]}"` : attribute;
+  });
+  return { html, sections };
 }
 
 async function filesUnder(directory) {
@@ -138,6 +152,7 @@ export async function buildDocumentation({ root, write = true }) {
   const previous = JSON.parse(await readFile(previousPath, 'utf8'));
   const documents = Object.fromEntries(Object.entries(previous).filter(([, doc]) => doc.kind === 'article'));
   const counts = {};
+  const redirects = {};
   let canonicalCount = 0;
 
   for (const [name, config] of Object.entries(AREA_CONFIG)) {
@@ -157,17 +172,19 @@ export async function buildDocumentation({ root, write = true }) {
     }
     const defaultSlug = config.preferred.find(slug => entries.some(entry => entry.slug === slug));
     if (!defaultSlug) throw new Error(`No default document for ${name}`);
-    documents[config.basePath] = { ...documents[`${config.basePath}/${defaultSlug}`], nav };
+    const canonicalPath = `${config.basePath}/${defaultSlug}`;
+    redirects[config.basePath] = canonicalPath;
+    documents[config.basePath] = { ...documents[canonicalPath], nav, canonicalPath };
     counts[name] = entries.length;
     canonicalCount += entries.length;
   }
 
   const sorted = Object.fromEntries(Object.entries(documents).sort(([a], [b]) => a.localeCompare(b)));
-  if (write) await writeGenerated(root, sorted);
-  return { documents: sorted, counts, canonicalCount, routeCount: Object.keys(sorted).length };
+  if (write) await writeGenerated(root, sorted, redirects);
+  return { documents: sorted, redirects, counts, canonicalCount, routeCount: Object.keys(sorted).length };
 }
 
-async function writeGenerated(root, documents) {
+async function writeGenerated(root, documents, redirects) {
   const data = join(root, 'app/data');
   const pages = join(data, 'pages');
   await rm(pages, { recursive: true, force: true });
@@ -184,7 +201,16 @@ async function writeGenerated(root, documents) {
     await writeFile(join(pages, file), `${JSON.stringify(document)}\n`);
     lines.push(`  ${JSON.stringify(path)}: () => import("./pages/${file}"),`);
   }
-  lines.push('};', 'export const documentPaths = Object.keys(loaders);', 'export async function getDocument(path: string): Promise<DocumentPage | undefined> {', '  const load = loaders[path];', '  return load ? (await load()).default : undefined;', '}', '');
+  lines.push(
+    '};',
+    `export const documentRedirects: Readonly<Record<string, string>> = ${JSON.stringify(redirects)};`,
+    'export const documentPaths = Object.keys(loaders);',
+    'export async function getDocument(path: string): Promise<DocumentPage | undefined> {',
+    '  const load = loaders[path];',
+    '  return load ? (await load()).default : undefined;',
+    '}',
+    '',
+  );
   await writeFile(join(data, 'content-index.ts'), lines.join('\n'));
 }
 
@@ -194,11 +220,25 @@ export function collectLocalHrefFailures(documents) {
   for (const [route, doc] of Object.entries(documents)) {
     for (const match of doc.html.matchAll(/href="([^"]+)"/g)) {
       const href = match[1];
-      if (!href || href.startsWith('#') || /^(?:https?:|mailto:|tel:)/i.test(href)) continue;
+      if (!href || /^(?:https?:|mailto:|tel:)/i.test(href)) continue;
+      let parsed;
       let target;
-      try { target = new URL(href, `https://local.invalid${route}`).pathname.replace(/\/$/, '') || '/'; }
+      try {
+        parsed = new URL(href.replaceAll('&amp;', '&'), `https://local.invalid${route}`);
+        target = parsed.pathname.replace(/\/$/, '') || '/';
+      }
       catch { failures.push({ route, href, reason: 'invalid URL' }); continue; }
-      if (!routes.has(target)) failures.push({ route, href, target });
+      if (!routes.has(target)) {
+        failures.push({ route, href, target });
+        continue;
+      }
+      if (parsed.hash) {
+        let fragment;
+        try { fragment = decodeURIComponent(parsed.hash.slice(1)); }
+        catch { failures.push({ route, href, target, reason: 'invalid fragment encoding' }); continue; }
+        const ids = new Set([...documents[target].html.matchAll(/\sid="([^"]+)"/g)].map(match => match[1]));
+        if (!ids.has(fragment)) failures.push({ route, href, target, fragment });
+      }
     }
   }
   return failures;

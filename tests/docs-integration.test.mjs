@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { access, readFile } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
 import {
@@ -45,6 +45,53 @@ test('generated canonical documentation has no unresolved local hrefs', async ()
   assert.deepEqual(collectLocalHrefFailures(documents), []);
 });
 
-test('LLM discovery file is bundled', async () => {
-  await access(resolve(root, 'public/llms.txt'));
+test('local href validation rejects missing fragments', () => {
+  const documents = {
+    '/docs/example': { html: '<h2 id="present">Present</h2><a href="#missing">Missing</a>' },
+  };
+  assert.deepEqual(collectLocalHrefFailures(documents), [
+    { route: '/docs/example', href: '#missing', target: '/docs/example', fragment: 'missing' },
+  ]);
+});
+
+test('authored Markdown fragments resolve to generated heading IDs', async () => {
+  const { documents } = await buildDocumentation({ root, write: false });
+  for (const [route, fragment] of [
+    ['/cli/session', 'catalog--management'],
+    ['/cli/compaction', 'budget--when-to-condense'],
+    ['/docs/README', 'install--build--test'],
+    ['/python-cli/configuration/auth', 'pindus-signin---list'],
+    ['/rust-cli/reference/crate-exports', 'window_budget'],
+  ]) {
+    assert.match(documents[route].html, new RegExp(`id="${fragment}"`), `${route} is missing #${fragment}`);
+  }
+});
+
+test('area roots have one preferred canonical identity', async () => {
+  const { documents, redirects } = await buildDocumentation({ root, write: false });
+  assert.deepEqual(redirects, {
+    '/cli': '/cli/README',
+    '/docs': '/docs/getting-started',
+    '/python': '/python/getting-started',
+    '/python-cli': '/python-cli/getting-started',
+    '/rust': '/rust/getting-started',
+    '/rust-cli': '/rust-cli/getting-started',
+  });
+  for (const [source, destination] of Object.entries(redirects)) {
+    assert.equal(documents[source].canonicalPath, destination);
+  }
+});
+
+test('required shell entrypoints are executable in release artifacts', async () => {
+  for (const file of ['build-verified.sh', 'install-ci.sh', 'install-pnpm.sh', 'sites-env.sh']) {
+    const mode = (await stat(resolve(root, 'scripts', file))).mode;
+    assert.notEqual(mode & 0o111, 0, `${file} is not executable`);
+  }
+});
+
+test('LLM discovery uses source-qualified claims and valid install commands', async () => {
+  const discovery = await readFile(resolve(root, 'public/llms.txt'), 'utf8');
+  assert.match(discovery, /npm install -g indusagi-coding-agent/);
+  assert.match(discovery, /Source:/);
+  assert.doesNotMatch(discovery, /ranked #18|npm install -g induscode/);
 });

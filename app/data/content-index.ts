@@ -181,6 +181,7 @@ const loaders: Record<string, () => Promise<{ default: DocumentPage }>> = {
   "/use-cases/india-fintech-startups": () => import("./pages/page-177.json"),
   "/use-cases/memory-management": () => import("./pages/page-178.json"),
 };
+export const documentRedirects: Readonly<Record<string, string>> = {"/docs":"/docs/getting-started","/cli":"/cli/README","/python":"/python/getting-started","/python-cli":"/python-cli/getting-started","/rust":"/rust/getting-started","/rust-cli":"/rust-cli/getting-started"};
 export const documentPaths = Object.keys(loaders);
 export async function getDocument(path: string): Promise<DocumentPage | undefined> {
   const load = loaders[path];
