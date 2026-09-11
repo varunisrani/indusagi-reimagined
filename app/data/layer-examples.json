@@ -1,0 +1,27 @@
+[
+  {
+    "path": "/docs/subsystems/llm-gateway",
+    "file": "gateway.ts",
+    "code": "import { stream, complete } from \"indusagi/llmgateway\";\n\nconst conversation = {\n  turns: [{ role: \"user\", blocks: [{ kind: \"text\", text: \"hi\" }] }],\n};\n\n// Streaming: iterate the Channel of Emissions.\nconst channel = stream(\"claude-sonnet-4\", conversation);\nfor await (const emission of channel) {\n  if (emission.kind === \"text\") process.stdout.write(emission.delta);\n}\n\n// One-shot: await the assembled Reply.\nconst reply = await complete(\"claude-sonnet-4\", conversation);"
+  },
+  {
+    "path": "/docs/subsystems/runtime",
+    "file": "agent.ts",
+    "code": "import { runtime, capabilities } from \"indusagi\";\n\nconst agent = runtime.createAgent({\n  model: \"claude-sonnet-4\",\n  tools: capabilities.toolBox(\"coding\"),\n  // optional: system, maxOutputTokens, thinking, compaction, maxTurns\n});\n\nconst unsubscribe = agent.subscribe((event) => {\n  if (event.kind === \"text_delta\") process.stdout.write(event.delta);\n});\n\nconst snapshot = await agent.submit(\"explain this repo\");\nconsole.log(snapshot.phase); // \"settled\" or \"faulted\"\nunsubscribe();"
+  },
+  {
+    "path": "/docs/subsystems/capabilities",
+    "file": "tools.ts",
+    "code": "import { toolBox } from \"indusagi/capabilities\";\n\nconst tools = toolBox(\"coding\");          // or \"read-only\" / \"all\"\n// pass to the runtime as AgentConfig.tools"
+  },
+  {
+    "path": "/docs/memory/README",
+    "file": "memory.ts",
+    "code": "import { createAgent } from \"indusagi/runtime\";\nimport type { AgentConfig } from \"indusagi/runtime\";\n\nconst config: AgentConfig = {\n  model: \"claude-sonnet-4\",\n  // Condense history once it reaches 80% of the window; keep the last 8 turns.\n  compaction: { triggerRatio: 0.8, keepRecent: 8 },\n};\n\nconst agent = createAgent(config);\nconst snapshot = await agent.submit(\"Summarize the repository layout.\");\nconsole.log(snapshot.phase, snapshot.messages.length);"
+  },
+  {
+    "path": "/cli",
+    "file": "terminal",
+    "code": "npm install -g indusagi-coding-agent\n\n\nindus       # start an interactive session in the current repo\nindusagi    # identical bin"
+  }
+]

@@ -1,0 +1,2 @@
+import {SiteLink} from './site-link';
+export default function NotFound(){return <><main className="wrap" style={{padding:'100px 0'}}><span className="eyebrow orange">404</span><h1 style={{fontSize:'48px',margin:'20px 0'}}>Page not found</h1><p>This documentation page is not available.</p><SiteLink className="primary-button" href="/docs" style={{marginTop:30}}>Open documentation →</SiteLink></main></>}
