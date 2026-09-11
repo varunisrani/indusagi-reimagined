@@ -1,0 +1,285 @@
+# CLI Reference
+
+> The complete `pindus` / `induscode` command line: the option table, the three run modes (interactive, print, wire), the `@file` attachment syntax, and the top-level subcommands (`signin`/`signout`, `install`/`remove`/`update`/`list`/`config`). Reached as the `pindus` (primary) or `induscode` console script, both wired to `induscode.entry:run`.
+
+## Table of Contents
+
+- [Synopsis](#synopsis)
+- [Flags](#flags)
+- [Run modes](#run-modes)
+- [@file attachments](#file-attachments)
+- [The -- terminator](#the----terminator)
+- [Meta short-circuits](#meta-short-circuits)
+- [Credential subcommands](#credential-subcommands)
+- [Package subcommands](#package-subcommands)
+- [Dispatch order](#dispatch-order)
+- [Exit codes](#exit-codes)
+- [Parsing the command line in Python](#parsing-the-command-line-in-python)
+
+## Synopsis
+
+```bash
+pindus [options] [prompt] [@file ...]
+```
+
+Both console scripts (`pindus` and `induscode`) map to `induscode.entry:run`, which calls `induscode.entry:main(argv)` and `asyncio.run(boot(args))`. `main` installs a one-shot logging filter that drops `[MCP]` transport chatter from the root logger (a no-op when `INDUSAGI_DEBUG` is set), and `run` treats a `BrokenPipeError` from a vanished stdout reader (e.g. `pindus … | head`) as a clean exit 0.
+
+A bare command line opens the interactive [console](/python-cli/console/overview). A leading `prompt` positional is the first user message; everything after it becomes the positional tail. State lives under `~/.pindusagi/` (overridable via `INDUSAGI_CODING_AGENT_DIR`).
+
+```bash
+pindus                                  # interactive console (default)
+pindus "refactor the auth module"       # interactive, prompt pre-filled
+pindus -p "summarize this repo"         # one-shot, print the result, exit
+pindus -i "start here"                  # force interactive even with a prompt
+pindus -m anthropic/claude --thinking high "review this diff"
+```
+
+## Flags
+
+Every option is declared exactly once in a single declarative flag table (`launch.invocation.flags.FLAG_SPECS`, 17 rows). The parser (`read_invocation`) indexes that table and the `--help` renderer (`render_usage`) walks the same rows, so the help text can never drift from what the parser accepts. The flags are grouped into the editorial sections below; an inline `--name=value` and a separated `--name value` are equivalent, `list` flags accept a comma-separated token or repetition, and clustered short booleans (`-pi`) expand to their component switches.
+
+### Output
+
+| Flag | Alias | Kind | Purpose |
+|------|-------|------|---------|
+| `--print` | `-p` | boolean | Run a single request, print only the result, and exit. |
+| `--json` | `--rpc` | boolean | Speak the headless line protocol for a driving parent process. |
+| `--interactive` | `-i` | boolean | Force the interactive session even when a prompt is supplied. |
+
+### Model
+
+| Flag | Alias | Kind | Purpose |
+|------|-------|------|---------|
+| `--model` | `-m` | string | Select the model, provider-qualified or bare (e.g. `provider/name`). |
+| `--account` | — | string | Authenticate the run with a named stored credential account. |
+| `--thinking` | — | string | Set the reasoning effort: one of `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. |
+| `--list-models` | — | string | List the available models (optionally filtered by a substring) and exit. |
+
+The `--thinking` vocabulary (`ThinkingEffort`) is a superset of the framework `ThinkingLevel` — it adds `off`. An unrecognised value is silently ignored (treated as absent) rather than rejected. See [Models](/python-cli/configuration/models) for the catalog and [Auth](/python-cli/configuration/auth) for `--account`.
+
+### Context
+
+| Flag | Alias | Kind | Purpose |
+|------|-------|------|---------|
+| `--cwd` | — | string | Scope the run to a working directory (default: the current directory). |
+| `--system` | — | string | Replace the built-in system prompt with the given text. |
+| `--append-system` | — | string | Append extra text after the system prompt. |
+| `--resume` | `-r` | boolean | Pick a previous session to resume. |
+| `--continue` | `-c` | boolean | Continue the most recent session in this directory. |
+
+`--resume` and `--continue` are honoured by the interactive runner and resolve through the [Sessions](/python-cli/subsystems/sessions) store; `--resume` mounts the Textual session picker, `--continue` reloads the newest session for the current directory.
+
+### Tools
+
+| Flag | Alias | Kind | Purpose |
+|------|-------|------|---------|
+| `--tools` | — | list | Allow only the named built-in tools (comma-separated or repeated). |
+| `--no-tools` | — | boolean | Disable every built-in tool for this run. |
+| `--mcp` | — | list | Attach an external MCP server endpoint (comma-separated or repeated). |
+
+`--tools` validates each name against the closed roster of built-in tool ids (`ToolName` / `TOOL_NAMES`); names that are not recognised are dropped. `--mcp` endpoints are mounted through the framework's MCP client — see [MCP](/python-cli/configuration/mcp) and the [Capability Deck](/python-cli/subsystems/capability-deck).
+
+```bash
+pindus --tools read,bash "list and read the config files"
+pindus --no-tools "just explain how this code works"
+pindus --mcp http://localhost:8931/sse "use the browser tools"
+```
+
+### Meta
+
+| Flag | Alias | Kind | Purpose |
+|------|-------|------|---------|
+| `--help` | `-h` | boolean | Show the usage and exit. |
+| `--version` | `-v` | boolean | Show the version and exit. |
+
+### Unknown flags
+
+The parse is total: an unrecognised `--flag` is **not rejected**. It is recorded as a boolean switch in the loose `flags` bag (an inline `--flag=value` keeps its value), so it survives parsing for a later phase (e.g. an extension) to reinterpret. Nothing is silently dropped.
+
+## Run modes
+
+The output flags resolve to one of three modes, derived by `_derive_mode` over the flag bag. The launch-level mode name (`OutputMode`) projects one-to-one onto the boot runner that handles it:
+
+| Output mode | Runner | Triggered by | Behavior |
+|-------------|--------|--------------|----------|
+| `text` | `repl` (interactive) | default (no `-p`/`--json`, or `-i`) | The Textual [console](/python-cli/console/overview): a live REPL, slash commands, dialogs. |
+| `json` | `oneshot` (print) | `-p` / `--print` (without `-i`) | One non-interactive request to settlement, then exit. Clean final text by default; an NDJSON event log when `--json` is also set. |
+| `rpc` | `link` (wire) | `--json` / `--rpc` | The long-lived bidirectional JSON-RPC 2.0 / NDJSON [channel](/python-cli/subsystems/channels) over stdin/stdout for a driving parent process. |
+
+Derivation precedence: `--json` / `--rpc` wins (→ `rpc`); otherwise `--print` without `--interactive` → `json`; otherwise `text`. So `-p` alone is the one-shot print mode, `-p --json` is the one-shot **NDJSON** print mode, and `--json` on its own is the headless wire link.
+
+```bash
+# interactive (text -> repl)
+pindus "help me debug this"
+
+# print: clean final text (json -> oneshot, text shape)
+pindus -p "summarize this repo"
+
+# print: streamed NDJSON event log (json -> oneshot, ndjson shape)
+pindus -p --json "summarize this repo"
+#   {"type":"signal","name":"start",...}
+#   ...
+#   {"type":"signal","name":"end","body":{"phase":...,"usage":...}}
+
+# wire: headless JSON-RPC link (rpc -> link)
+pindus --json
+#   -> {"jsonrpc":"2.0","id":"lnk-..","method":"submit","params":{"input":"hi"}}
+#   <- {"jsonrpc":"2.0","id":"lnk-..","result":{"model":"...","streaming":false,...}}
+```
+
+The wire link serves the `submit`, `abort`, `snapshot`, `resume`, `listModels`, and `cycleModel` operations; the full protocol (framing, dialog ask/tell, snapshot fields) is documented in [Channels](/python-cli/subsystems/channels).
+
+## @file attachments
+
+Any token of the form `@<path>` (before the `--` terminator) is collected as a file attachment for the first message rather than as a positional. The gatherer (`gather_attachments`) resolves each path against the run's working directory (with `~` expansion) and classifies it by extension:
+
+- **Text files** are inlined as a `<file path="…">…</file>` prose block, capped at **10 MB**.
+- **Image files** are read and surfaced as a base64 `indusagi.ai.ImageContent` media value, capped at **20 MB**.
+
+Anything else raises a typed `AttachmentError` whose kind is one of `unsupported` (extension is neither text nor image), `too-large` (over the per-kind cap), `not-found`, or `read-failed`.
+
+```bash
+pindus "review this change" @src/main.py @docs/diagram.png
+pindus -p "explain this config" @~/.config/app/settings.toml
+```
+
+## The -- terminator
+
+A bare `--` stops option parsing. Every subsequent token is treated as a positional, even if it starts with `-` or `@`. Use it to pass a prompt that would otherwise look like a flag:
+
+```bash
+pindus -- "--this is a prompt, not a flag--"
+```
+
+## Meta short-circuits
+
+Three requests are handled before any session starts or any directory is touched:
+
+```bash
+pindus --help                 # usage banner (generated from the flag table)
+pindus --version              # e.g. "induscode 0.1.2"
+pindus --list-models          # the full provider/model catalog
+pindus --list-models claude   # filtered by a case-insensitive substring
+```
+
+`--list-models` prints an aligned table with the columns **provider**, **model**, **context window**, **max output**, **thinking**, and **images**, sorted by provider then model id. The data is derived from the conductor's `ModelCatalog` (a normalized view over the framework's `get_providers` / `get_models`). At the CLI level the optional argument is a search substring; the underlying `CatalogFilter` also supports `provider`, `thinking_only`, and `images_only` when called programmatically.
+
+`--version` reports the version single-sourced from installed package metadata (`importlib.metadata.version("induscode")`), so it reflects the installed wheel, not a hardcoded literal.
+
+## Credential subcommands
+
+When the first token is a credential verb the launcher runs the sign-in / sign-out command and exits, before any normal launch. `login` / `logout` are accepted as natural-language aliases of `signin` / `signout`.
+
+```bash
+pindus signin                              # pick a provider from the menu
+pindus signin --provider anthropic         # browser sign-in preferred when capable
+pindus signin --provider openai --method api-key
+pindus signin --list                       # read-only list of saved accounts
+pindus signout --provider anthropic --account work
+pindus login                               # alias of signin
+```
+
+| Verb | Aliases | Purpose |
+|------|---------|---------|
+| `signin` | `login` | Store a credential for a provider — browser sign-in (OAuth) when supported, otherwise an api key. |
+| `signout` | `logout` | Remove the named account, or all accounts for the provider when `--account` is omitted. |
+
+Verb flags (parsed by the credential command, not the main flag table):
+
+| Flag | Applies to | Purpose |
+|------|------------|---------|
+| `--provider <id>` | both | The provider id to act on. The first bare positional is also taken as the provider. |
+| `--account <name>` | both | Name the credential account (default: `default`). Letters, digits, `-`, `_`; max 50 chars. |
+| `--method <oauth\|api-key>` | `signin` | Force the sign-in method. `--oauth` and `--api-key` are shorthands. |
+| `--list` (`--ls`) | `signin` | Read-only listing of saved accounts (kind + default marker); stores nothing. |
+
+When a provider supports browser sign-in and no `--method` is given, the OAuth (browser) path is preferred; otherwise the api-key path stores a key. The api-key flow consults the conventional env var first (via the framework `get_env_api_key`), so an already-exported key (e.g. `ANTHROPIC_API_KEY`) can be stored without re-typing it.
+
+**OAuth-capable providers** (browser sign-in): `anthropic`, `openai`, and `github-copilot` (the last via an RFC 8628 device-authorization grant). These are registered by an explicit prime (`register_built_in_oauth_providers`) the boot layer runs as a stage — never at import time.
+
+**Api-key providers** (the `PROVIDER_DIRECTORY`, 14 entries): `anthropic`, `openai`, `google`, `xai`, `groq`, `cerebras`, `mistral`, `openrouter`, `minimax`, `kimi`, `sarvam`, `krutrim`, `nvidia`, `zai` — each with its conventional env var and key-dashboard url.
+
+Every failure is a typed `CredentialFault` (one of `unknown-provider`, `invalid-key`, `invalid-account`, `name-collision`, `not-found`, `vault`, `aborted`) printed via `format_credential_fault` before a non-zero exit; nothing is signalled by a bare `sys.exit` or string sentinel. See [Auth](/python-cli/configuration/auth) for the on-disk vault and the [framework AI facade](/python/facades/ai) for the credential primitives.
+
+## Package subcommands
+
+When the first token is a package subcommand the launcher manages the extension-package sources and exits. Sources are plain strings the addon loader understands — an `npm:` spec, a `git:` / `https:` repo, or a bare local path — persisted under the `extensionPackages` key in the two-tier [settings](/python-cli/configuration/settings) store.
+
+```bash
+pindus install npm:@scope/my-ext     # add a source (idempotent)
+pindus list                          # show configured sources
+pindus remove npm:@scope/my-ext      # drop a source
+pindus update                        # re-read and confirm the configured set
+pindus config                        # print resolved settings paths + merged JSON
+```
+
+| Subcommand | Argument | Purpose |
+|------------|----------|---------|
+| `install` | source | Add a package source to the configured set (idempotent under source matching). |
+| `remove` | source | Remove a package source from the configured set. |
+| `update` | — | Re-read and report the configured sources (resolution is lazy at startup; no separate fetch step). |
+| `list` | — | Print the configured package sources. |
+| `config` | — | Print the global/project settings file locations and the merged resolved settings as JSON. |
+
+`install` / `remove` compare sources structurally, so two spellings of the same package match: an `npm:` spec ignores a trailing `@version`, a git url drops its scheme and `.git` suffix, and a local path matches verbatim. A missing or invalid argument is reported as a printed error line and a non-zero exit code (the command never raises for an expected failure). See [Addons](/python-cli/subsystems/addons) for how the configured sources are loaded.
+
+## Dispatch order
+
+`boot.boot` consumes the command line in a fixed order, so a leading subcommand verb always wins over a prompt of the same spelling:
+
+1. **Credential command** — `argv[0]` ∈ `{signin, signout, login, logout}` → run and exit.
+2. **Package command** — `argv[0]` ∈ `{install, remove, update, list, config}` → run and exit.
+3. **Meta short-circuits** — `--help`, `--version`, `--list-models [filter]` → print and exit, before any stage runs or any directory is touched.
+4. **Stage pipeline** — build the run context (workspace, settings, auth, model, tools, MCP, addons).
+5. **Runner dispatch** — `select_runner` picks the runner whose `accepts` predicate matches the resolved mode (`repl` / `oneshot` / `link`), defaulting to the interactive REPL.
+
+See [Boot](/python-cli/subsystems/boot) for the stage pipeline and runner registry.
+
+## Exit codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Clean run (or a `BrokenPipeError` from a closed stdout reader). |
+| `1` | An unexpected failure during boot, a handled credential command that did not complete (printed fault), or a package command that reported a bad/missing argument. |
+
+The one-shot (`oneshot`) channel additionally returns `1` when the settled run is faulted (`state.phase == "faulted"`).
+
+## Parsing the command line in Python
+
+The parser is exposed for embedding and testing. `read_invocation` folds a sliced `argv` into a fully-typed `Invocation`; `read_file_references` re-walks just the `@file` refs.
+
+```python
+from induscode.launch import read_invocation, read_file_references
+
+inv = read_invocation(["-p", "--model", "openai/gpt", "hello", "@notes.md"])
+assert inv.mode == "json" and inv.print is True
+assert inv.model == "openai/gpt" and inv.prompt == "hello"
+
+refs = read_file_references(["-p", "hi", "@notes.md"])  # -> ["notes.md"]
+```
+
+Expand `@file` refs into attachments, print the catalog, and drive the subcommands directly:
+
+```python
+from induscode.launch import (
+    gather_attachments, AttachmentOptions,
+    print_model_catalog, CatalogFilter,
+    register_built_in_oauth_providers, run_credential_command,
+    format_credential_fault, run_package_command,
+)
+
+att = await gather_attachments(["README.md", "logo.png"], AttachmentOptions(cwd="/repo"))
+# att.prose -> <file path=…>…</file> blocks; att.media -> base64 ImageContent
+
+print_model_catalog(filter=CatalogFilter(provider="anthropic", thinking_only=True, search="claude"))
+
+register_built_in_oauth_providers()  # explicit prime: anthropic, openai, github-copilot
+result = await run_credential_command(["signin", "--provider", "openai"], vault=my_vault, profile_dir="/home/u/.pindusagi")
+if result.fault:
+    print(format_credential_fault(result.fault))
+
+res = await run_package_command(["install", "npm:@scope/my-ext"], store=pref_store)
+assert res.handled and res.code == 0
+```
+
+The full export surface (`Invocation`, `OutputMode`, `FLAG_SPECS`, `CredentialFault`, `AuthVault`, `CatalogFilter`, and the rest) is catalogued in [Package Exports](/python-cli/reference/package-exports); the launch subsystem internals are documented in [Launch](/python-cli/subsystems/launch).

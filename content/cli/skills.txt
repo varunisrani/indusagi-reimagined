@@ -1,0 +1,225 @@
+> indusagi can create skills. Ask it to build one for your use case.
+
+# Skills
+
+Skills are self-contained instruction packages the agent loads on-demand. A skill
+is a markdown document (`SKILL.md`, or a root-level `*.md`) with frontmatter the
+loader validates, plus any helper scripts and references it points at. Only each
+skill's name and description sit in the system prompt; the full instructions are
+loaded when a task matches.
+
+The implementation is `indus-code-rebuild/src/briefing/skills.ts` (the loader and
+validator) and `src/briefing/compose.ts` (the system-prompt block). Skills follow
+the Agent Skills format; the policy over the frontmatter is the rebuild's own.
+
+## Table of Contents
+
+- [Locations](#locations)
+- [How Skills Work](#how-skills-work)
+- [Skill Commands](#skill-commands)
+- [Skill Structure](#skill-structure)
+- [Frontmatter](#frontmatter)
+- [Validation](#validation)
+- [Example](#example)
+
+## Locations
+
+> **Security:** Skills can instruct the model to perform any action and may include
+> executable code the model invokes. Review skill content before use.
+
+Skills are discovered from two roots, **project before user** (so a project-local
+card shadows a user-global one of the same name), defined in
+`src/console/startup.ts` and `src/console/slash/builtins.ts`:
+
+- Project: `<cwd>/.indusagi/skills/`
+- User: `<home>/.indusagi/skills/`
+
+Discovery rules (`gatherSkillCards` over each root):
+
+- A direct `*.md` file at the **root** of a skills directory is a single-file skill
+  (its name defaults to the enclosing directory).
+- A `SKILL.md` file in any **subdirectory** is a packaged skill.
+
+Names are deduped across roots — the first card found wins.
+
+> **Note:** Unlike older docs, there is no `--skill` / `--no-skills` CLI flag and no
+> `skills` settings array. The two roots above are the only sources. Adding other
+> harnesses' skill directories (e.g. `~/.claude/skills`) is not supported by the
+> current loader.
+
+## How Skills Work
+
+1. At startup, indusagi scans the skill roots (`gatherSkillCards`) and lists each
+   discovered card — name plus shortened location — in the startup banner panel
+   (`gatherSkills` in `src/console/startup.ts`).
+2. The system prompt's skills section (`SKILLS_SECTION` in `src/briefing/compose.ts`)
+   renders the model-invocable cards into an `<available_skills>` block —
+   `name`, `description`, and `location` per skill.
+3. When a task matches a skill's description, the agent loads the full `SKILL.md` at
+   `location` with the `read` tool and follows it, using relative paths for scripts
+   and assets.
+
+This is progressive disclosure: only descriptions are in context; full
+instructions load on demand. A skill whose frontmatter sets
+`disable-model-invocation: true` is excluded by `modelInvocableCards` from the set
+the `<available_skills>` block would render, and is reachable only via its command.
+
+> **Status:** Step 1 (the startup scan and banner) is live. Step 2 is the
+> compose-layer behavior, and it is fully implemented — but the session runner
+> currently composes the system prompt with only `{ tools }`
+> (`composeBriefing({ tools })` in `src/boot/runners/session.ts`), so it never
+> passes `skills` into the briefing context. The `<available_skills>` block is
+> therefore built by the composer but not yet emitted into the live system prompt.
+> The `/skill:<name>` commands (below), which inject the invocation block directly
+> as a turn, are wired and work today. See `FEATURE_GAP_ROADMAP.md`.
+
+## Skill Commands
+
+Each discovered card is registered as a `/skill:<name>` slash command
+(`buildDynamicCommands` in `src/console/slash/commands/dynamic.ts`, spliced into
+the catalog by `src/console/slash/builtins.ts`):
+
+```
+/skill:brave-search           # run the skill with no body
+/skill:pdf-tools extract      # run the skill, "extract" becomes the body
+```
+
+Invoking the command submits an Agent-Skills invocation block as a normal turn:
+
+```
+<skill name="pdf-tools" location="/abs/path/SKILL.md">
+extract
+</skill>
+```
+
+The conductor parses that leading block (`parseSkillInvocation` in
+`src/conductor/skill-parse/parse.ts`) and submits the body text as the prompt. The
+trailing argument string after the command becomes the body.
+
+An `enableSkillCommands` preference exists in `settings.json` (default `true`,
+declared in `src/settings/contract.ts` and exposed as a toggle in the settings
+picker):
+
+```json
+{
+  "enableSkillCommands": true
+}
+```
+
+> **Note:** This preference is defined and surfaced in the settings UI, but the
+> current `builtins.ts` builds the `/skill:<name>` rows unconditionally at module
+> load — nothing reads `enableSkillCommands` to suppress them yet. Treat the
+> toggle as not-yet-wired (see `FEATURE_GAP_ROADMAP.md`).
+
+## Skill Structure
+
+A packaged skill is a directory with a `SKILL.md` file; everything else is freeform.
+
+```
+my-skill/
+├── SKILL.md              # required: frontmatter + instructions
+├── scripts/
+│   └── process.sh
+├── references/
+│   └── api-reference.md
+└── assets/
+    └── template.json
+```
+
+### SKILL.md Format
+
+```markdown
+---
+name: my-skill
+description: What this skill does and when to use it. Be specific.
+---
+
+# My Skill
+
+## Setup
+
+Run once before first use:
+`cd /path/to/skill && npm install`
+
+## Usage
+
+`./scripts/process.sh <input>`
+```
+
+Reference bundled files with paths relative to the skill's own directory.
+
+## Frontmatter
+
+Parsed and projected by `projectFrontmatter` in `src/briefing/skills.ts`. The
+recognised keys:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | (see below) | ≤ 64 chars, lowercase words joined by single hyphens. For a packaged `SKILL.md` it must match the parent directory. |
+| `description` | Yes | ≤ 1024 chars. What the skill does and when to use it. |
+| `license` | No | License tag. |
+| `compatibility` | No | Free-form compatibility note. |
+| `metadata` | No | Open key/value mapping. |
+| `allowed-tools` | No | Comma/whitespace-separated tool list; projected to `allowedTools`. |
+| `disable-model-invocation` | No | When `true`, hide from the prompt; expose only as `/skill:<name>`. |
+
+The length limits are the exported constants `SKILL_NAME_LIMIT` (64) and
+`SKILL_DESCRIPTION_LIMIT` (1024). Any frontmatter key not in this set is an error
+(`checkFrontmatterKeys`).
+
+### Name Rules
+
+The name must match `^[a-z0-9]+(?:-[a-z0-9]+)*$` — lowercase letters/digits joined
+by single internal hyphens, no leading/trailing or consecutive hyphens. When the
+frontmatter omits `name`, the loader infers it from the directory and skips the
+directory-match check.
+
+Valid: `pdf-processing`, `data-analysis`, `code-review`
+Invalid: `PDF-Processing`, `-pdf`, `pdf--processing`
+
+## Validation
+
+The loader is non-throwing: each candidate file produces a `SkillDiagnostic` with a
+`kind` of `loaded`, `skipped`, `invalid`, or `collision`. A file fails to load
+(`invalid`) when:
+
+- it cannot be read,
+- it carries an unrecognised frontmatter key,
+- the name is empty, too long, malformed, or (for a packaged `SKILL.md`) does not
+  match its directory,
+- the description is missing or exceeds the limit.
+
+A second card with a name already taken is dropped as a `collision` (first wins).
+
+## Example
+
+```
+brave-search/
+├── SKILL.md
+├── search.js
+└── content.js
+```
+
+**SKILL.md:**
+```markdown
+---
+name: brave-search
+description: Web search and content extraction via Brave Search API. Use for searching documentation, facts, or any web content.
+---
+
+# Brave Search
+
+## Setup
+
+`cd /path/to/brave-search && npm install`
+
+## Search
+
+`./search.js "query"`              # basic search
+`./search.js "query" --content`    # include page content
+```
+
+## Related
+
+- [Prompt Templates](prompt-templates.md) — `/name` macros that expand into prompts
+- [Extensions](extensions.md) — addons that contribute tools and commands

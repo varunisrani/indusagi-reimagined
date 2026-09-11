@@ -1,0 +1,132 @@
+# Providers
+
+Indusagi authenticates to an LLM provider in one of three ways: a browser sign-in (for the providers that support it), a stored api key, or an api key read straight from the environment. The set of models is supplied by the bundled `indusagi` framework registry.
+
+## Table of Contents
+
+- [Browser Sign-In](#browser-sign-in)
+- [API Keys](#api-keys)
+- [The Auth Vault](#the-auth-vault)
+- [Environment Variables](#environment-variables)
+- [Selecting a Model](#selecting-a-model)
+- [Resolution Order](#resolution-order)
+
+## Browser Sign-In
+
+Three providers can be authenticated through the browser. Run `indus signin` (or `/login` inside an interactive session) and pick one:
+
+| Provider | Sign-in id | Sign-in |
+|----------|-----------|---------|
+| Anthropic (Claude) | `anthropic` | Claude sign-in |
+| OpenAI (ChatGPT) | `openai-codex` | ChatGPT (Codex) sign-in |
+| GitHub Copilot | `github-copilot` | Copilot sign-in |
+
+The browser-sign-in id is the framework provider id. Note that OpenAI's browser flow registers under `openai-codex`, so `indus signin --provider openai` selects the **api-key** entry (id `openai`), while `indus signin --provider openai-codex` runs the ChatGPT browser sign-in.
+
+```bash
+indus signin                          # lists every provider; pick by number
+indus signin --provider anthropic     # sign in to a specific provider
+indus signin --provider openai-codex  # ChatGPT (Codex) browser sign-in
+indus signin anthropic --oauth        # force the browser flow
+```
+
+The command opens the provider's consent page in your default browser, relays any prompt it raises, and stores the returned tokens in the auth vault. When a provider supports both browser sign-in and an api key, the browser path is preferred unless you pass `--method api-key`.
+
+`indus signout` (or `/logout`) removes a stored credential:
+
+```bash
+indus signout anthropic              # remove every Anthropic account
+indus signout anthropic --account work
+```
+
+## API Keys
+
+Every provider in the directory below can store a plain api key. The sign-in flow first checks whether the provider's environment variable is already set; if so it offers to store that value, otherwise it prompts for the key.
+
+```bash
+indus signin --provider openai --api-key
+indus signin groq --method api-key
+```
+
+| Provider | id | Environment Variable |
+|----------|----|---------------------|
+| Anthropic (Claude) | `anthropic` | `ANTHROPIC_API_KEY` |
+| OpenAI | `openai` | `OPENAI_API_KEY` |
+| Google Gemini | `google` | `GEMINI_API_KEY` |
+| xAI (Grok) | `xai` | `XAI_API_KEY` |
+| Groq | `groq` | `GROQ_API_KEY` |
+| Cerebras | `cerebras` | `CEREBRAS_API_KEY` |
+| Mistral | `mistral` | `MISTRAL_API_KEY` |
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
+| MiniMax | `minimax` | `MINIMAX_API_KEY` |
+| Kimi (Moonshot) | `kimi` | `MOONSHOT_API_KEY` |
+| Sarvam | `sarvam` | `SARVAM_API_KEY` |
+| Krutrim | `krutrim` | `KRUTRIM_API_KEY` |
+| NVIDIA | `nvidia` | `NVIDIA_API_KEY` |
+| Z.ai | `zai` | `ZAI_API_KEY` |
+
+An api key is validated before it is stored: it must be at least 20 characters and not look like a placeholder.
+
+Multiple accounts per provider are supported with `--account`:
+
+```bash
+indus signin anthropic --account work
+indus signin anthropic --account personal
+indus signin --list                    # list every saved account
+```
+
+The first account stored for a provider becomes its default. Choose a non-default account for a run with `--account`:
+
+```bash
+indus --account work "review this PR"
+```
+
+## The Auth Vault
+
+Stored credentials — both api keys and browser-sign-in tokens — live in:
+
+```
+~/.indusagi/agent/auth.json
+```
+
+Set `INDUSAGI_CODING_AGENT_DIR` to relocate the whole profile directory (the vault moves with it).
+
+At session start the agent makes stored credentials visible to the underlying request two ways. For the common providers it exports the stored key into the environment variable the framework reads for that provider (the table above), unless that variable is already set in your shell. For every provider — including browser-sign-in providers the framework has no env-var mapping for (notably `openai-codex`) — a per-request resolver reads the usable key straight from the vault, refreshing an expired browser-sign-in token before use.
+
+## Environment Variables
+
+If you would rather not store anything, export the provider's variable directly and launch:
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+indus
+```
+
+An explicit shell variable always wins over a stored key, so you can override a saved credential for a single shell without signing out.
+
+## Selecting a Model
+
+With no `--model`, the agent picks a default model belonging to the first provider you are authenticated with. Override per run:
+
+```bash
+indus --model anthropic/claude-sonnet-4-20250514
+indus -m claude-sonnet-4-20250514          # bare id, if unambiguous
+```
+
+List what is available (optionally filtered by a substring):
+
+```bash
+indus --list-models
+indus --list-models claude
+```
+
+Inside an interactive session, `/model` (alias `/models`) opens the model picker. See [Custom Models](models.md).
+
+## Resolution Order
+
+When a run needs a key for a provider:
+
+1. The provider's environment variable, if already set in the shell.
+2. A credential stored in `auth.json` for the named (`--account`) account, else the provider's default account, else its first stored account. For providers the framework reads from an env var, the stored key is also exported into that variable at startup; for the rest (including `openai-codex`) it is resolved per request directly from the vault.
+
+When choosing the model, an explicit `--model` wins; otherwise the agent falls back to a default model for the first authenticated provider.

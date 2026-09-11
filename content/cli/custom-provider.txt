@@ -1,0 +1,211 @@
+# Custom Providers
+
+The bundled `indusagi` framework owns provider registration. Through `indusagi/ai` you can:
+
+- **Add models** — register models for a new or existing provider (see [Custom Models](models.md)).
+- **Add a streaming API** — implement a non-standard LLM API as an adapter and register it under an `api` name.
+- **Add a browser sign-in** — register an OAuth provider so it appears in `signin` / `/login`.
+
+> Provider registration lives in the framework, not in an extension API. There is no `registerProvider(name, config)` extension hook in the coding agent — extensions register tools, slash commands, hooks, and tool interceptors only. Use the framework `indusagi/ai` surfaces below from a bootstrap module that runs before a session starts.
+
+## Table of Contents
+
+- [Registering Models](#registering-models)
+- [Routing Through a Proxy](#routing-through-a-proxy)
+- [Registering a Streaming API](#registering-a-streaming-api)
+- [Registering a Browser Sign-In](#registering-a-browser-sign-in)
+- [Type Reference](#type-reference)
+
+## Registering Models
+
+Use the framework `ModelRegistry` to add models. Each model names the `api` its provider speaks and a `baseUrl`. A registered model surfaces in `getModels()`, so it shows up in `--list-models` and the `/model` picker.
+
+```ts
+import { ModelRegistry } from "indusagi/ai";
+
+const registry = new ModelRegistry();
+
+registry.registerCustomModel({
+  id: "my-model",
+  name: "My Model",
+  api: "openai-completions",   // a built-in or custom streaming API name
+  provider: "my-provider",
+  baseUrl: "https://api.example.com/v1",
+  reasoning: false,
+  input: ["text", "image"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 128000,
+  maxTokens: 4096,
+});
+```
+
+Add several at once with `registry.loadCustomModels([...])`. The built-in API names are listed under [Supported APIs](models.md#supported-apis).
+
+## Routing Through a Proxy
+
+Most OpenAI-compatible endpoints (Ollama, LM Studio, vLLM, gateways) work with `api: "openai-completions"`. Point `baseUrl` at the endpoint:
+
+```ts
+registry.registerCustomModel({
+  id: "llama-3.1-8b",
+  name: "Llama 3.1 8B (Local)",
+  api: "openai-completions",
+  provider: "ollama",
+  baseUrl: "http://localhost:11434/v1",
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 128000,
+  maxTokens: 32000,
+});
+```
+
+For endpoint quirks, set `compat` on an `openai-completions` model (e.g. `{ maxTokensField: "max_tokens" }`).
+
+## Registering a Streaming API
+
+For a provider with a non-standard wire protocol, implement the streaming adapter and register it under an `api` name with `registerApiProvider`. The adapter is keyed by its `api` field; any model whose `api` matches will use it.
+
+```ts
+import {
+  registerApiProvider,
+  type ApiProvider,
+} from "indusagi/ai";
+
+const myApi: ApiProvider = {
+  api: "my-custom-api",
+  stream(model, context, options) {
+    // return an AssistantMessageEventStream
+  },
+  streamSimple(model, context, options) {
+    // simplified variant
+  },
+};
+
+registerApiProvider(myApi, "my-extension");   // 2nd arg: source id, for unregistration
+```
+
+Models that reference this api are then registered the usual way:
+
+```ts
+registry.registerCustomModel({
+  id: "my-custom-model",
+  name: "My Custom Model",
+  api: "my-custom-api",
+  provider: "my-provider",
+  baseUrl: "https://api.example.com",
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 200000,
+  maxTokens: 16384,
+});
+```
+
+Use `unregisterApiProviders(sourceId)` to remove every adapter a source registered.
+
+## Registering a Browser Sign-In
+
+To add a provider users can authenticate via `signin` / `/login`, register an OAuth provider that satisfies `OAuthProviderInterface` (the framework also exports it under its newer name, `AuthProviderContract`). The credential command drives its `login` flow, opens any url it hands back in the default browser, relays prompts, and persists the returned credentials in the auth vault.
+
+```ts
+import {
+  registerOAuthProvider,
+  type OAuthProviderInterface,
+  type OAuthCredentials,
+  type OAuthLoginCallbacks,
+} from "indusagi/ai";
+
+const corporate: OAuthProviderInterface = {
+  id: "corporate-ai",
+  name: "Corporate AI (SSO)",
+
+  async login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials> {
+    callbacks.onAuth({ url: "https://sso.corp.com/authorize?..." });
+    const code = await callbacks.onPrompt({ message: "Enter SSO code:" });
+    const tokens = await exchangeCodeForTokens(code);
+    return {
+      access: tokens.accessToken,
+      refresh: tokens.refreshToken,
+      expires: Date.now() + tokens.expiresIn * 1000,
+    };
+  },
+
+  async refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials> {
+    const tokens = await refreshAccessToken(credentials.refresh);
+    return {
+      access: tokens.accessToken,
+      refresh: tokens.refreshToken ?? credentials.refresh,
+      expires: Date.now() + tokens.expiresIn * 1000,
+    };
+  },
+
+  getApiKey(credentials: OAuthCredentials): string {
+    return credentials.access;
+  },
+};
+
+registerOAuthProvider(corporate);
+```
+
+After registration, `indus signin --provider corporate-ai` runs the flow and stores the result in `~/.indusagi/agent/auth.json`. The three OAuth providers that ship registered are Anthropic (Claude), OpenAI (ChatGPT), and GitHub Copilot.
+
+## Type Reference
+
+### OAuthLoginCallbacks
+
+```ts
+interface OAuthFlowCallbacks {
+  onAuth(info: { url: string; instructions?: string }): void;
+  onPrompt(prompt: { message: string; placeholder?: string; allowEmpty?: boolean }): Promise<string>;
+  onManualCodeInput?(): Promise<string>;
+}
+
+interface OAuthFlowOptions {
+  onProgress?(message: string): void;
+  signal?: AbortSignal;
+}
+
+type OAuthLoginCallbacks = OAuthFlowCallbacks & OAuthFlowOptions;
+```
+
+### OAuthCredentials
+
+Persisted in `~/.indusagi/agent/auth.json`.
+
+```ts
+type OAuthCredentials = {
+  access: string;    // bearer token sent on API calls (short-lived)
+  refresh: string;   // long-lived token used to mint a new access token
+  expires: number;   // ms Unix timestamp the access token expires at
+  issuedAt?: number; // ms Unix timestamp the credential was issued
+  provider?: string; // owning provider id
+  [key: string]: unknown;
+};
+```
+
+### OAuthProviderInterface
+
+Exported from `indusagi/ai` as `OAuthProviderInterface` (alias of `AuthProviderContract`).
+
+```ts
+interface OAuthProviderInterface {
+  readonly id: string;
+  readonly name: string;
+  login(callbacks: OAuthLoginCallbacks): Promise<OAuthCredentials>;
+  refreshToken(credentials: OAuthCredentials): Promise<OAuthCredentials>;
+  getApiKey(credentials: OAuthCredentials): string;
+  usesCallbackServer?: boolean;
+  modifyModels?(models: Model<Api>[], credentials: OAuthCredentials): Model<Api>[];
+}
+```
+
+### ApiProvider
+
+```ts
+interface ApiProvider<TApi extends Api = Api> {
+  api: TApi;
+  stream(model: Model<TApi>, context: Context, options?: StreamOptions): AssistantMessageEventStream;
+  streamSimple(model: Model<TApi>, context: Context, options?: SimpleStreamOptions): AssistantMessageEventStream;
+}
+```

@@ -1,0 +1,650 @@
+# Console Overview
+
+> The interactive console is the Rust edition's product shell — the ratatui REPL a
+> TTY launch hands a session to take over the terminal. It is a deliberate
+> re-architecture of the TypeScript Ink/React surface: one immutable
+> `ConsoleState`, one pure `console_reducer`, a typed `ConsoleEvent` enum, and an
+> immediate-mode `view::draw(frame, &state)` that paints a masthead, a tailing
+> transcript of streaming markdown / tool cards / diffs, a bordered composer, and a
+> bottom chrome strip — every decision unit-testable without a terminal. It is built
+> on the Rust [`indusagi`](/rust) framework's `tui` / `tui_render` immediate-mode
+> rendering layer and lives behind the crate's `tui` feature.
+
+## Table of Contents
+
+- [What it is](#what-it-is)
+- [Module map](#module-map)
+- [Reaching the console](#reaching-the-console)
+- [The state backbone](#the-state-backbone)
+- [The reducer](#the-reducer)
+- [The event union](#the-event-union)
+- [Input handling](#input-handling)
+- [The signal cursor and live turn projection](#the-signal-cursor-and-live-turn-projection)
+- [The view tree](#the-view-tree)
+- [The mount loop](#the-mount-loop)
+- [Overlays](#overlays)
+- [Public surface](#public-surface)
+- [See also](#see-also)
+
+## What it is
+
+The console crate ports `indus-code-rebuild/src/console/**` (≈5,826 LOC of
+Ink/React) onto the frozen `indusagi-tui` / `indusagi-tui-render` immediate-mode
+framework. It is **not** a line-by-line translation. The Ink `useReducer` +
+`conductor.subscribe` design becomes four cooperating pieces, exactly as the crate
+docstring (`console/mod.rs`) describes:
+
+- **One immutable [`ConsoleState`](/rust-cli/console/overview#the-state-backbone)** —
+  every observable property of the surface (composer buffer/caret, history ring,
+  transcript rows, the active overlay, status line, display toggles). Live session
+  data (messages, usage, the bound model) is deliberately *absent*: it is projected
+  on every draw from the conductor's snapshot, so the reducer never knows about the
+  agent loop.
+- **One pure [`console_reducer`](/rust-cli/console/overview#the-reducer)** —
+  `(ConsoleState, ConsoleEvent) -> ConsoleState`, an exhaustive `match` (no `_`
+  arm) with no I/O, so every transition is unit-/snapshot-testable headless.
+- **Immediate-mode [`view`](/rust-cli/console/overview#the-view-tree)** —
+  `draw(frame, &state)` over ratatui, with streaming markdown made flicker-free by
+  a stable-prefix cache and an inline viewport for the transcript (not the
+  alt-screen).
+- **A typed [`ConsoleEvent`](/rust-cli/console/overview#the-event-union) enum** —
+  the closed `domain:verb` action union the reducer folds; each variant snapshots
+  cleanly.
+
+[`mount_console`](/rust-cli/console/overview#the-mount-loop) is the boot entry. It
+inverts how the TS `repl-runner.ts` mounted Ink: the boot `ReplRunner` TTY branch
+calls *into* this crate rather than the crate spinning up its own host. The whole
+subsystem performs exactly one terminal takeover (`ratatui::init`); everything else
+stays pure or presentational.
+
+The crate ships two binaries from one entry — `indusr` and `indusagir`
+(`Cargo.toml` `[[bin]]`) — both gated behind the crate's `tui` feature
+(`tui = ["indusagi/tui"]`). A headless build (`--no-default-features`) proves the
+rest of the agent compiles without a terminal in the loop; `mount_console` then
+refuses cleanly instead of mounting.
+
+## Module map
+
+The `console` module (`console/mod.rs`) re-exports the names every writer and the
+boot wire code against:
+
+| Module | File | Role |
+|--------|------|------|
+| `state` | `console/state.rs` | The frozen `ConsoleState` + `ViewRow` / `ModalKind` / `ThemeScheme` value types. |
+| `events` | `console/events.rs` | The typed `ConsoleEvent` action union and its `type_tag` discriminants. |
+| `reducer` | `console/reducer.rs` | The single pure total fold `console_reducer` + `init_console_state`. |
+| `input` | `console/input.rs` | The keymap, chord latch, paste coalescing, completion engine, and live `InputController`. |
+| `mount` | `console/mount.rs` | `mount_console`, the `SignalCursor` turn projection, and the live ratatui loop. |
+| `tool_row` | `console/tool_row.rs` | Projects a settled `ToolEnd` into a rendered `ToolCard` via the framework descriptor. |
+| `slash` | `console/slash.rs` | The slash-command registry, dispatch, and effects. |
+| `theme` | `console/theme.rs` | Maps a `ThemeScheme` to a resolved framework adapter. |
+| `overlays` | `console/overlays/` | The 13 modal overlays keyed by `ModalKind`. |
+| `view` | `console/view/` | The immediate-mode painter (banner, chrome, composer, transcript, diff, markdown). |
+
+The top-level re-exports are:
+
+```rust
+pub use events::ConsoleEvent;
+pub use mount::{MountConsoleOptions, MountResult, mount_console};
+pub use state::{
+    ConsoleState, ModalKind, ModalPayload, ModalState, NO_MODAL, ThemeScheme, ViewRow, ViewRowKind,
+    transition_modal,
+};
+```
+
+## Reaching the console
+
+In an attended terminal the launcher selects the interactive REPL by default; the
+boot `ReplRunner` TTY branch awaits `mount_console`. A run mode passes a
+[`Conductor`](/rust-cli/subsystems/conductor) and a `MountConsoleOptions` bundle:
+
+```rust
+use induscode::console::{mount_console, MountConsoleOptions, MountResult};
+
+let result: MountResult = mount_console(
+    conductor,                       // the assembled session this console drives
+    MountConsoleOptions {
+        scheme: Some("midnight".into()),
+        initial_input: Some("explain this repo".into()),
+        cwd: Some(workspace.cwd.clone()),
+        auth_path: Some(workspace.auth_path.clone()),
+        sessions_dir: Some(workspace.sessions_dir.clone()),
+        prefs: Some(prefs),
+        ..Default::default()
+    },
+).await?;
+```
+
+Everything but the conductor is optional and defaults sensibly.
+`MountConsoleOptions` (ports `MountConsoleOptions`, `console/mount.ts:27-49`)
+carries:
+
+| Field | Purpose |
+|-------|---------|
+| `scheme` | The colour-scheme name (`midnight`/`daylight`/`midnight-cb`/`daylight-cb`); `None` → the default scheme. |
+| `initial_input` | An optional first user turn submitted on mount (streams in as the agent publishes its run events). |
+| `initial_images` | Local image paths to attach to the first turn (retained for parity). |
+| `verbose` | Render verbose diagnostics in the banner. |
+| `cwd` | The working directory shown in the footer (`--cwd`); also roots `@path` completion. |
+| `auth_path` | The `auth.json` the sign-in / sign-out overlays read and write through a `DiskAuthVault`; also filters the `/model` picker to authenticated providers. |
+| `sessions_dir` | The workspace `sessions/` the data overlays read (`/resume`, `/tree`, `/branch`, `/timeline`). |
+| `prefs` | The two-tier `PreferenceStore` the settings overlay and theme picker read and persist through. |
+
+`mount_console` returns a `MountResult { clean: bool }` once the surface exits.
+Off a TTY (a pipe, CI, a test) it refuses cleanly — `ratatui::init` would panic in
+raw mode — so the boot runner maps that to its headless fallback exit:
+
+```rust
+if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
+    anyhow::bail!("the interactive console requires a terminal (stdout/stdin are not a TTY)");
+}
+```
+
+## The state backbone
+
+`ConsoleState` (`console/state.rs`, ports `ConsoleState`, `contract.ts:363-392`) is
+the single immutable value the entire surface is reduced from. The surface holds
+exactly one and never mutates it in place. Live session data is *not* here — it is
+projected from the conductor snapshot on every draw.
+
+```rust
+pub struct ConsoleState {
+    pub rows: Vec<ViewRow>,            // the rendered transcript, newest row last
+    pub blocks: Vec<UiDisplayBlock>,   // out-of-band display blocks (changelog, etc.)
+    pub buffer: String,                // the composer text buffer
+    pub caret: usize,                  // caret offset in CHARS (not bytes)
+    pub history: Vec<String>,          // the submitted-input ring, oldest first
+    pub history_at: Option<usize>,     // cursor into history, or None when not browsing
+    pub stash: String,                 // buffer stashed before history browsing began
+    pub modal: ModalState,             // the active modal overlay
+    pub modal_selected: usize,         // highlighted row in the active list overlay
+    pub status: Option<StatusMessage>, // the transient status line
+    pub scheme: ThemeScheme,           // the active colour scheme
+    pub show_reasoning: bool,          // whether reasoning/thinking rows are shown
+    pub show_images: bool,             // whether inline images are rendered
+    pub expand_tools: bool,            // whether settled tool output is expanded (Ctrl+O)
+    pub busy: bool,                    // whether a turn is in flight
+    pub tick: u64,                     // monotonic re-render tick
+}
+```
+
+`ConsoleState::default()` is the freshly-seeded state a session opens with (ports
+`EMPTY_CONSOLE_STATE`): empty collections, `caret 0`, `history_at None`, `modal
+NO_MODAL`, `scheme Midnight`, `show_reasoning false`, `show_images true`, `busy
+false`, `tick 0`.
+
+### Transcript rows
+
+The console renders its scrollback as a flat list of typed rows, not one message
+blob. A `ViewRow` (ports `ViewRow`, `contract.ts:266-275`) is identity-stable: a
+streaming row keeps its `id` while its `text` grows, so the renderer reconciles in
+place.
+
+```rust
+pub struct ViewRow {
+    pub id: String,
+    pub kind: ViewRowKind,         // Prompt | Answer | Reason | ToolRun | Notice
+    pub text: String,
+    pub run_id: Option<String>,    // tool-run correlation id, ToolRun only
+    pub output: Option<String>,    // a settled tool's rendered body (full per-tool logs)
+    pub diff: Option<RowDiff>,     // a settled tool's file-edit diff
+}
+```
+
+`ViewRowKind` is `Prompt` (a user turn), `Answer` (streamed assistant text),
+`Reason` (streamed thinking, shown only when enabled), `ToolRun` (a tool invocation
+correlated by `run_id`), or `Notice` (an out-of-band changelog/system note). A
+`RowDiff { path, old, new }` mirrors the conductor's `ToolDiff` payload that the
+framework diff engine consumes.
+
+### Modal state
+
+`ModalKind` (ports `ModalKind`, `contract.ts:301-314`) is the closed set of
+overlays. Exactly one is active at a time:
+
+| Variant | Overlay |
+|---------|---------|
+| `None` | No overlay; the composer has focus. |
+| `Settings` | The settings list. |
+| `Models` | The single-model picker. |
+| `ScopedModels` | The per-scope model picker. |
+| `Theme` | The scheme picker (preview-on-move, commit-on-Enter, revert-on-Esc). |
+| `Sessions` | The session resume/list picker. |
+| `Tree` | The transcript-tree navigator. |
+| `UserTurns` | The prior-user-turn picker (for branching/forking). |
+| `SignIn` | The provider sign-in launcher. |
+| `SignOut` | The provider sign-out confirmation. |
+| `Oauth` | The in-flight OAuth device/redirect flow. |
+| `Plugin` | A plugin-supplied select/confirm/input/custom overlay. |
+| `Approval` | A pending tool-permission prompt (allow once / always / deny). |
+
+Rust has no `unknown`, so where the TS payload was `payload?: unknown` the Rust port
+uses a typed `ModalPayload` enum (`Approval`, `Oauth`, `Plugin`, `ScopedModels`,
+`SignIn`); overlays that carry no data simply never construct one. The pure
+`transition_modal(next, payload)` helper computes the next `ModalState`: opening
+`ModalKind::None` (or closing) returns the inert `NO_MODAL` constant; any other kind
+raises that overlay carrying its payload.
+
+## The reducer
+
+`console_reducer` (`console/reducer.rs`, ports `consoleReducer`,
+`reducer.ts:186-260`) is the one place every transition lives. It is **pure and
+total**: each event has a defined transition, and the input is taken *by value* so
+it can never be observed mutated — "never mutate the input" is enforced by the move.
+The `match` is exhaustive (no `_` arm), the Rust analogue of the TS `const _never:
+never = event` guard, so adding a variant without handling it is a compile error.
+
+```rust
+pub fn console_reducer(mut state: ConsoleState, event: ConsoleEvent) -> ConsoleState { /* ... */ }
+
+pub fn init_console_state(scheme: Option<ThemeScheme>) -> ConsoleState { /* ... */ }
+```
+
+Transitions fall into families mirroring the event grouping:
+
+- **Composer edits** (`buffer:*`, `caret:*`) splice and navigate the live input
+  buffer, keeping the caret clamped into `[0, buffer.len_chars()]`.
+- **History recall** (`history:*`) walks the submitted-input ring, stashing the
+  live buffer on the way in and restoring it on the way out. `push_history`
+  ignores blank lines and an immediate duplicate of the newest entry.
+- **Transcript view** (`rows:*`, `block:append`, `blocks:clear`) appends and
+  patches the rows projected from the conductor's signal stream. `patch_row`
+  grows a streaming row in place by id (a missing id is a harmless no-op);
+  `patch_tool_row` reconciles a settled `ToolRun` row (text + output + diff).
+- **Overlays / status / theme / toggles / busy** flip the small UI-local flags.
+  Notably, `BusySet(true)` also clears a sticky status toast so a stale
+  permission-mode line can't masquerade as live progress while the
+  `WorkingIndicator` shows the agent is busy; ending a turn keeps whatever
+  terminal status the turn set.
+
+### The char-offset hazard
+
+`ConsoleState::caret` is a **char** offset (a count of `char`s), not a byte offset.
+Rust `String` is UTF-8, so slicing it at a raw caret value would panic on a
+non-ASCII boundary. Every splice/erase walks the buffer with `char_indices` to
+convert a char offset to its byte offset before touching the string. This is the
+single place that hazard is handled — `byte_at`, `splice_at`, `with_buffer`, and the
+`erase_prev`/`erase_next` helpers all go through it. The reducer's tests pin this
+with multi-byte buffers (`héllo`, inserting `ü`, erasing the `é`).
+
+## The event union
+
+`ConsoleEvent` (`console/events.rs`, ports `ConsoleEvent`, `contract.ts:435-458`)
+is the closed action union the reducer folds. Each variant carries the `domain:verb`
+discriminant the TS console used (returned by `type_tag()` for logging/filtering).
+The variants carry only `induscode`-owned data plus the two framework value types
+the transcript needs (`StatusMessage`, `UiDisplayBlock`) — never live session data.
+
+| Variant | Tag | Effect |
+|---------|-----|--------|
+| `BufferSet(String)` | `buffer:set` | Replace the whole buffer; caret to end. |
+| `BufferInsert(String)` | `buffer:insert` | Splice text in at the caret; caret advances. |
+| `BufferErasePrev` | `buffer:erasePrev` | Delete the char before the caret. |
+| `BufferEraseNext` | `buffer:eraseNext` | Delete the char after the caret. |
+| `CaretMove(i64)` | `caret:move` | Move the caret by a signed delta (clamped). |
+| `CaretJump(usize)` | `caret:jump` | Set the caret to an absolute char offset. |
+| `HistoryPush(String)` | `history:push` | Append the just-submitted input (dedups, exits browsing). |
+| `HistoryBack` | `history:back` | Recall the previous (older) entry. |
+| `HistoryForward` | `history:forward` | Recall the next entry, or restore the stash. |
+| `RowsSet(Vec<ViewRow>)` | `rows:set` | Replace the whole row list. |
+| `RowsAppend(ViewRow)` | `rows:append` | Append one row. |
+| `RowsPatch { id, text }` | `rows:patch` | Replace a row's text by id. |
+| `RowsPatchTool { id, text, output, diff }` | `rows:patchTool` | Patch a settled tool row (text + body + diff). |
+| `BlockAppend(UiDisplayBlock)` | `block:append` | Append an out-of-band display block. |
+| `BlocksClear` | `blocks:clear` | Drop every display block. |
+| `ModalOpen { kind, payload }` | `modal:open` | Raise an overlay (resets `modal_selected` to 0). |
+| `ModalClose` | `modal:close` | Drop back to the composer. |
+| `ModalSelectMove(i32)` | `modal:selectMove` | Move the list cursor by a signed delta (saturates at 0). |
+| `ModalSelectSet(usize)` | `modal:selectSet` | Set the list cursor to an absolute index. |
+| `StatusSet(StatusMessage)` | `status:set` | Show a transient status message. |
+| `StatusClear` | `status:clear` | Clear the status line. |
+| `SchemeSet(ThemeScheme)` | `scheme:set` | Switch the active colour scheme. |
+| `ToggleReasoning` | `toggle:reasoning` | Flip reasoning-row visibility. |
+| `ToggleImages` | `toggle:images` | Flip inline-image rendering. |
+| `ToggleExpandTools` | `toggle:expandTools` | Flip tool-output expansion (Ctrl+O). |
+| `BusySet(bool)` | `busy:set` | Set the in-flight flag (true also clears a sticky status). |
+| `Tick` | `tick` | Bump the status-bar re-render tick. |
+
+The two `modal:select*` cursor verbs are added over the 22 ported variants for the
+shared list-overlay navigation. Because `block:append` / `status:set` embed
+framework types that are not `Serialize`, `ConsoleEvent` is intentionally `Debug`
+only — snapshot tests assert on the `Debug` rendering, which pins every variant.
+
+## Input handling
+
+`console/input.rs` decodes crossterm events into reducer-bound effects. It ports
+the five Ink-free `console/input/*` modules plus the `useInput` glue, keeping the
+pure decision functions terminal-free so they unit-test exactly as the TS modules
+tested without Ink. Only `KeyChord::from_crossterm` and `InputController` touch
+crossterm types.
+
+### The keymap and chord latch
+
+`read_key(input, &KeyChord) -> ConsoleIntent` (ports `readKey`,
+`keymap.ts:211-286`) is a pure, memoryless classifier. Resolution order is
+load-bearing: control combos and named keys win over raw text, so `Ctrl+U` never
+also types "u". `KeyChord::from_crossterm` adapts a crossterm `KeyEvent` into the
+boolean flag-bag the branch order reads (folding `BackTab` to `tab + shift`, and
+`Delete`/DEL/BS into erase-backward). The intents are `ConsoleVerb`s grouped by
+concern (editing, caret, flow, model, mode, queue, input-sources, overlays,
+view-toggles). The live chord bindings:
+
+| Chord | Verb / effect |
+|-------|---------------|
+| `Ctrl+C` | `FlowInterrupt` — abort a busy turn; idle, leaves. |
+| `Ctrl+Z` | `FlowSuspend` — background the process (SIGTSTP). |
+| `Ctrl+U` | `EditClearLine` — clear the line; twice on an empty buffer fires `Clear2` (request exit). |
+| `Ctrl+A` / `Ctrl+E` | `NavHome` / `NavEnd`. |
+| `Ctrl+J` | `TextNewline` — soft newline. |
+| `Ctrl+N` / `Ctrl+P` | `FlowCycleModel` — rotate the bound model. |
+| `Ctrl+T` | `ModelCycleThinking` — step the reasoning-effort ladder. |
+| `Ctrl+V` | `InputPasteImage` — stage a clipboard image. |
+| `Ctrl+G` | `InputExternalEditor` — hand the buffer to `$EDITOR`. |
+| `Ctrl+R` | `OverlayOpen(Sessions)` — raise the session picker. |
+| `Ctrl+L` | `OverlayOpen(Models)` — raise the model picker. |
+| `Ctrl+O` | `ViewExpandTools` — toggle full tool-output rendering. |
+| `Alt+Up` | `QueueDequeue` — pull the newest queued input back into the composer. |
+| `Enter` / `Shift+Enter` | `FlowSubmit` / `TextNewline`. |
+| `Tab` / `Shift+Tab` | `FlowAccept` (accept completion / 2-space indent) / `ModeCyclePermission`. |
+| `Esc` | `FlowDismiss`; twice within the window fires `Dismiss2` (open the tree). |
+
+`advance_chord(&ChordLatch, &ConsoleIntent) -> ChordStep` (ports `advanceChord`)
+layers the double-tap latch over the pure classifier. A first chord-eligible key
+arms; a second matching tap within `CHORD_WINDOW_MS` (600 ms) fires the outcome
+(`Dismiss2` or `Clear2`); any other key clears the latch. The window expiry is the
+surface's job — `InputController::expire_chord` resets a stale latch synchronously
+via `Instant` comparison (no async timer).
+
+### Paste coalescing
+
+A large pasted chunk is hidden behind a `[Pasted text #N +K lines]` marker rather
+than spliced verbatim. `classify_paste(chunk, &PASTE_THRESHOLDS)` (defaults: 8
+newlines or 800 chars) returns `Inline` or `Coalesce`; `coalesce_paste` mints a
+marker into a fresh immutable `PasteVault` (`bodies: BTreeMap<u64, String>` +
+`minted`); `expand_markers` rewrites every marker back to its body at submit time.
+A hand-rolled `next_marker` scanner replaces the TS regex (no `regex`/`once_cell`
+dep), so there is no JS `lastIndex` hazard. Bracketed paste arrives as one
+`Event::Paste`; non-bracketing terminals fall back to a per-char burst the
+controller folds (`PASTE_BURST_GAP_MS` = 24 ms) and classifies as a unit.
+
+### Completion
+
+`complete_at(buffer, caret, &SlashRegistry, &DirReader) -> CompletionResult` (ports
+`completeAt`) routes on the active token's stem: a `/` **only at buffer-start**
+yields slash completion (a slash mid-prose is a path separator); an `@`/path-like
+stem yields directory completion; anything else is inert. `complete_slash` matches
+the stem against each command's `name` and `aliases` by prefix with exact matches
+floated front; `complete_path` lists the resolved directory (dirs-first,
+alphabetical, trailing-slash on directories) through the injected `DirReader`. The
+one impure seam is `create_dir_reader(cwd)`, an `std::fs`-backed reader where every
+error collapses to an empty `Vec` so the composer never panics mid-type.
+`apply_suggestion(buffer, span, &Suggestion)` splices the accepted value over the
+token's char-offset span.
+
+### The InputController
+
+`InputController` is the live glue — the React `useInput` replacement. It owns
+every value the pure modules can't hold: the chord latch (+ window), the paste
+vault, the per-char burst fallback, the completion highlight, and the last offering.
+`on_event(ev, &ConsoleState)` returns the `InputEffect`s the surface applies — it
+performs no I/O itself:
+
+```rust
+pub enum InputEffect {
+    Edit(ConsoleEvent),                          // a buffer/caret/history edit to dispatch
+    Submit(String),                              // commit the buffer (burst-folded + expanded)
+    OpenOverlay(ModalKind),
+    AcceptCompletion(Suggestion, TokenSpan),
+    MoveHighlight(isize),
+    HistoryBack, HistoryForward,
+    Interrupt, Dismiss, Suspend,
+    CycleModel, CyclePermission, TogglePlan, CycleThinking,
+    ExpandTools, ToggleReasoning,
+    PasteImage, ExternalEditor, Dequeue,
+    DoubleDismiss, RequestExit,
+    None,
+}
+```
+
+`refresh_completion` is called after every edit *and* on every frame, but resets the
+highlight to the first row only when the `(buffer, caret)` signature actually changed
+— so a `NavUp`/`NavDown` move survives the next per-frame refresh (the documented
+"BUG A" fix). With a completion menu open, `Enter` on a slash row accepts *and*
+submits the completed line in one press (so `/logout` runs on one Enter), while an
+`@file` row only accepts into the buffer.
+
+## The signal cursor and live turn projection
+
+`SignalCursor` (`console/mount.rs`) is the mutable cursor a conductor
+[`SessionSignal`](/rust-cli/subsystems/conductor) stream is projected through into
+transcript rows. It re-derives the deleted signal→state projection: it tracks which
+streaming `Answer`/`Reason` rows are "live" so successive deltas grow the *same* row
+in place (a stable id the reducer patches) rather than appending a fresh row per
+delta. `project(&SessionSignal) -> Vec<ConsoleEvent>` is pure of I/O, so the whole
+projection is headlessly testable; `apply_signal(&mut cursor, state, signal)` is the
+single application path the live loop and tests share (it also syncs
+`cursor.show_images` from the live state so a settled card honours the toggle).
+
+How each signal renders a live turn:
+
+| `SessionSignal` | Projection |
+|-----------------|------------|
+| `Prompt { text }` | Close open streams, append a `Prompt` row, `BusySet(true)`. |
+| `Text { delta }` | Grow the open `Answer` row (`rows:patch`), or open one (`rows:append`). |
+| `Thinking { delta }` | Grow/open the `Reason` row (gated by `show_reasoning` at render). |
+| `ToolStart { id, name }` | Append a `ToolRun` row `"> <FriendlyTitle> (running)"`, tracked by `run_id`. |
+| `ToolEnd { id, name, ok, output, diff }` | Build the full settled card and **patch the same row** (or append if pruned). |
+| `TurnEnd { .. }` / `Idle` | Close streams, `BusySet(false)`. |
+| `Fault { fault }` | Close streams, `BusySet(false)`, set a status (calm "Stopped" for `Aborted`, else a "Turn faulted" warning). |
+| `Compacted` | Append a muted `Notice` row "Context condensed to fit the window." |
+| `Persisted { .. }` / `Queue { .. }` | No transcript surface. |
+
+A `ToolEnd` is turned into a `ToolCard` by `console/tool_row.rs`, which reuses the
+framework descriptor (`describe_tool_source` from
+`indusagi::tui_render::utils::tool_display`) — the same per-tool switch
+(read/write/edit/ls/find/grep/bash/task/todo/default) the TS console uses — so every
+tool renders its real output/logs/diff rather than just `name · done`:
+
+```rust
+pub fn build_tool_card(
+    name: &str, ok: bool, output: Option<&Value>, has_diff: bool, show_images: bool,
+) -> ToolCard;   // -> { text: "<marker> <Title> (<summary>)", body, has_diff }
+```
+
+The status marker is `=` on success, `!` on error (`>` while running). A diff-shaped
+card (edit/write, or whenever the conductor extracted a `{ path, old, new }` triple)
+leaves the plain `body` empty so the diff renderer owns the change — no double
+rendering.
+
+## The view tree
+
+`console/view/` is the immediate-mode painter: `draw(frame, &state)` over ratatui.
+The transcript scrolls inline in the primary buffer (not the alt-screen), and
+streaming markdown is flicker-free via a stable-prefix cache. Each leaf maps one TS
+component family.
+
+### Banner (`view/banner.rs`)
+
+The startup masthead — the big six-row "INDUS CODE" ANSI-Shadow block-figlet
+(`WORDMARK_ROWS`, copied verbatim), accent-tinted with a static per-row `row_gradient`
+sweep, the `indus console  vVERSION` brand line, and a `welcome_line` greeting. It is
+built as `Vec<Line<'static>>` and *prepended* to the transcript lines, so it sits
+above the messages and scrolls with the content — exactly like the TS `<Banner>` sat
+above `<MessageList>`. The gradient is a single render pass (no timer), reduced-motion
+safe by construction.
+
+### Transcript (`view/transcript.rs`)
+
+`build_transcript_lines(rows, show_reasoning, expand_tools, theme)` turns `&[ViewRow]`
+into the full ordered line list (pure, snapshot-testable), and `render_transcript`
+paints the last `area.height` lines so the newest rows always tail on screen — O(visible)
+per frame regardless of scrollback depth. Each `ViewRowKind` is themed independently:
+
+- `Prompt` — a bold accent `You` header + the literal prompt text (no markdown).
+- `Answer` — a bold accent `Assistant` header + the streamed text through
+  `render_streaming` with the syntect highlighter, so a settled answer matches its
+  streaming form byte-for-byte and code fences carry syntax colours.
+- `Reason` — a dim `…` glyph + muted body; skipped entirely when `show_reasoning`
+  is off (mirrors `MessageList { show_thinking }`).
+- `ToolRun` — a dim `⏵` glyph + the settled card header; beneath it the output body
+  (clamped to `TOOL_BODY_COLLAPSED_LINES` = 10 with a `... N more line(s)` footer
+  collapsed, full when expanded via Ctrl+O) and, for edit/write tools, the colored
+  unified diff (only when expanded).
+- `Notice` — a dim `›` glyph + muted body.
+
+A blank gap row separates entries (the framework `MessageList` inter-entry gap).
+
+### Streaming markdown (`view/markdown.rs`)
+
+`StreamingMarkdownCache` caches the settled *stable prefix*'s rendered lines across
+deltas so only the growing unstable tail is re-lexed per frame. It is built on the
+framework's `render_streaming` / `last_stable_boundary`: `last_stable_boundary` is
+monotonic under growth, so the cached prefix only ever grows, and a cache hit is
+valid only when the new content still starts with the cached prefix bytes *and* its
+boundary did not regress. A reset / a different answer fails the guard and rebuilds —
+so a stale prefix can never be orphaned onto an unrelated tail. The output is always
+byte-identical to a fresh `render_streaming`; the cache is a pure speedup.
+`render_stream(content, theme)` is the un-cached one-shot convenience for callers
+(e.g. a settled transcript row) that don't hold a cache.
+
+### Diff (`view/diff.rs`)
+
+`render_file_diff(old, new, path, theme)` turns an `(old, new, path)` triple into the
+cached `Vec<Line<'static>>` a transcript diff row paints, or `None` when `old == new`.
+The heavy lifting — the line diff with `CONTEXT_LINES=3` hunking, word-level
+intra-line spans, the dim line-number gutter, the `diffAddedBg`/`diffRemovedBg`
+truecolor tints, bold changed-word emphasis, and dim `…` inter-hunk separators —
+lives in the frozen framework (`build_structured_diff` + `render_diff`). This module
+adds only the console header (`path  +N -M`) and the `DIFF_INDENT` body indent.
+
+### Composer (`view/composer.rs`)
+
+The prompt-input surface: a rounded box (muted-frame tone, `borderMuted → accent →
+gray` fallthrough) with a `› ` prompt glyph and the live buffer wrapped to the inner
+width by *visible columns*. The caret is drawn by inverting the cell under it (a
+`Modifier::REVERSED` span — the immediate-mode analogue of `<Text inverse>`), or a
+trailing reversed space at end-of-buffer, so the composer is a pure draw with no real
+cursor escape. Beneath the box it draws up to `SUGGESTION_WINDOW` (8) completion rows,
+the highlighted one as `▸ label` in accent. When `busy`, the buffer text is dimmed
+but the caret stays legible.
+
+### Chrome (`view/chrome.rs`)
+
+Two stacked presentational rows:
+
+- `WorkingIndicator` — the live "agent is working" row: a braille spinner
+  (`SPINNER_FRAMES`), a rotating whimsical word (`WORKING_WORDS`, 30 of them, picked
+  by `pick_word`) or a concrete `phase_label` (`tooling → "Running tools"`,
+  `condensing → "Compacting context"`), an elapsed-seconds clock, and an "esc to
+  interrupt" hint. Renders nothing (height 0) when idle. Animation state is passed in
+  as plain data (frame, elapsed_ms, word_offset) — no internal timer.
+- `StatusBar` — the framework `StatusLine` toast row, an optional `● permission:
+  <label>` badge (`permission_badge` labels each cycled mode and colours it:
+  `bypass-permissions` red, `plan` cyan, `accept-edits` yellow, `default` grey), and
+  the framework `Footer` session/usage strip (cwd,
+  branch, model `provider/name`, token/cost/context-window counters). It is fed a
+  projected `SessionSnapshot` and runs with `show_busy_text=false` so the toast never
+  competes with the `WorkingIndicator`.
+
+## The mount loop
+
+The live loop lives in `console/mount.rs`'s `live` module (gated behind `tui`).
+After taking over the terminal (`crossterm` bracketed paste on, `ratatui::init`
+installing the panic hook that restores the terminal on a crash), each iteration:
+
+1. **Drain + project signals.** The conductor subscription pushes raw signals onto a
+   shared queue; the loop drains them and folds each through
+   `apply_signal(&mut cursor, state, signal)`.
+2. **Drain approvals.** Tool-permission requests parked by the gate's `ask`
+   decisions are pulled off a channel into a serialising `ApprovalQueue`; the head is
+   mirrored into the `Approval` modal (one prompt at a time).
+3. **Refresh completion** against the live buffer.
+4. **Draw the frame.** `draw(...)` measures the composer + working row + status bar
+   heights, gives the transcript the remainder via a bottom-anchored
+   `Layout::vertical`, paints `render_transcript`, the `WorkingIndicator`, the
+   `Composer`, and the `StatusBar`, and draws the active overlay on top.
+   `project_snapshot` resolves the bound model id to a `provider/name` pair and a
+   `ContextUsage` (per-model context window + live cost) from the gateway catalog.
+5. **Poll input** with a 40 ms timeout (`POLL_TIMEOUT`) so streamed signals flush
+   even while the user is idle.
+6. **Route the key.** With a modal open, keys route to the overlay (list overlays
+   share `modal_selected`; the theme picker previews-on-move; the dialog overlays own
+   their `handle_key`; the approval prompt settles the head choice). Otherwise the key
+   goes through `InputController` and the resulting `InputEffect`s are applied by
+   `apply_input_effect`.
+
+A submit is routed by `submit_line`: the buffer is cleared and pushed to history,
+then `slash::dispatch_slash(&line, registry)` runs. A `NotSlash` line is sent to the
+conductor as a prompt (`spawn_submit`); a `Handled`/`Submit` result drains its
+`SlashEffect`s (`Event`, `OpenModal`, `CloseModal`, `Status`, `SetBuffer`,
+`AppendBlock`, `RequestExit`, `Conductor(action)`) into the state and conductor; an
+`Unknown(name)` raises a warning toast. The slash effects are *not* sent to the
+model. `Ctrl+C` while busy aborts the turn and stays up; idle, it leaves. The
+turn-boundary edge (`busy` false→true) restarts the per-turn clock and re-seeds the
+`WorkingIndicator` word.
+
+## Overlays
+
+The 13 overlays live in `console/overlays/`, keyed by `ModalKind` and mirrored onto
+the framework dialog layer at draw time while `ConsoleState.modal` stays the
+reducer-owned source of truth. `draw_overlay` dispatches on `state.modal.kind`, drawing
+each over the whole frame on top of the content. The data-bearing overlays follow a
+"fetch before the push" discipline (`OverlayData`): a synchronous `draw` can't `await`,
+so the async session reads (`/resume` session list, `/tree` branch DAG, `/branch`
+prior turns) happen when the modal opens and the result is stashed for the pure
+`draw_*` functions; the reducer/`ConsoleState` stays I/O-free. The model catalog is
+global + synchronous, built once at mount and filtered to authenticated providers.
+The full overlay catalog and flows are documented in
+[Dialogs](/rust-cli/console/dialogs).
+
+## Public surface
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `mount_console` | async fn | `console/mount.rs` | The single entry a run mode awaits to take over the terminal; returns `MountResult`. |
+| `MountConsoleOptions` | struct | `console/mount.rs` | The mount option bundle (scheme, initial input, cwd, auth/sessions/prefs paths). |
+| `MountResult` | struct | `console/mount.rs` | `{ clean: bool }` — whether the surface tore down cleanly. |
+| `console_reducer` | fn | `console/reducer.rs` | The single pure total fold over `ConsoleState`; exhaustive `match`. |
+| `init_console_state` | fn | `console/reducer.rs` | Build the initial state, overlaying the optional scheme. |
+| `ConsoleState` | struct | `console/state.rs` | The frozen UI-local state slice. |
+| `ConsoleEvent` | enum | `console/events.rs` | The closed `domain:verb` action union. |
+| `ViewRow` / `ViewRowKind` | struct / enum | `console/state.rs` | One immutable transcript row + its kind. |
+| `ModalKind` / `ModalPayload` / `ModalState` | enum / enum / struct | `console/state.rs` | The 13-kind overlay machine + its typed payload. |
+| `NO_MODAL` / `transition_modal` | const / fn | `console/state.rs` | The inert "no overlay" state + the pure transition helper. |
+| `ThemeScheme` | enum | `console/state.rs` | The four built-in colour schemes (+ `parse`/`as_str`). |
+
+Internal-but-load-bearing: `SignalCursor` / `apply_signal` (turn projection),
+`build_tool_card` (`console/tool_row.rs`), `StreamingMarkdownCache` /
+`render_stream` (`console/view/markdown.rs`), `InputController` / `InputEffect`
+(`console/input.rs`), and `WorkingIndicator` / `StatusBar` / `Composer` /
+`render_transcript` (`console/view/`).
+
+## See also
+
+- [Conductor](/rust-cli/subsystems/conductor) — the session core whose
+  `SessionSignal` stream the console projects into transcript rows.
+- [Slash commands](/rust-cli/console/slash-commands) — the registry, dispatch, and
+  `SlashEffect` catalog the composer routes a `/`-line through.
+- [Dialogs](/rust-cli/console/dialogs) — the 13 `ModalKind` overlays (pickers,
+  sessions, auth, approval, plugin).
+- [Boot](/rust-cli/subsystems/boot) — how the `ReplRunner` TTY branch reaches
+  `mount_console`.
+- [Launch & CLI flags](/rust-cli/subsystems/launch) — the flag grammar that selects
+  the interactive runner.
+- [`indusagi` framework](/rust) — the Rust `tui` / `tui_render` immediate-mode
+  rendering layer (`render_streaming`, `build_structured_diff`, `Footer`,
+  `StatusLine`, the dialog widgets) the console wraps.
+- [Console (Python edition)](/python-cli/console/overview) and
+  [Console (TS edition)](/cli) — the parity references this Rust surface
+  re-architects.
+
+Notes:
+
+- The crate is `induscode` (Rust edition); the binaries are `indusr` and
+  `indusagir`, both gated behind the `tui` feature.
+- `ConsoleState.caret` is a **char** offset, never a byte offset — every splice goes
+  through `char_indices` (the §6.1 hazard).
+- The reducer is pure, total, and exhaustive (no `_` arm); the view is immediate-mode
+  and bottom-anchored inline (not the alt-screen).
+- Live session data (messages/usage/model) is projected from the conductor snapshot
+  on every draw, never stored in `ConsoleState`.

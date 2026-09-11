@@ -1,0 +1,528 @@
+# Launch
+
+> The CLI front door of the Rust `induscode` agent. `induscode::launch` owns the *application* command line — distinct from the framework's *boot-routing* parser in [`indusagi::shell_app::invocation`](/rust). One declarative `flag_specs()` table feeds **both** the table-driven argv reader (`read_invocation`) **and** the generated `--help` renderer (`render_usage`), so help text and parsing can never drift. The subsystem also expands `@file` attachments, prints a filtered/sorted model catalog, resolves the effective model id, runs the typed `signin`/`signout` credential command over a byte-compatible `auth.json` vault, drives three real OAuth flows, and supplies resume / settings / package picker data. Reached by running `indusr` / `indusagir`, or by `use induscode::launch::*`.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Module layout](#module-layout)
+- [The frozen contract](#the-frozen-contract)
+- [The flag table](#the-flag-table)
+- [The argv parser](#the-argv-parser)
+- [Mode derivation](#mode-derivation)
+- [Usage rendering](#usage-rendering)
+- [Attachments (@file)](#attachments-file)
+- [Model catalog and resolution](#model-catalog-and-resolution)
+- [Credentials (signin / signout)](#credentials-signin--signout)
+- [The on-disk vault](#the-on-disk-vault)
+- [OAuth browser sign-in](#oauth-browser-sign-in)
+- [Pickers (resume + settings + packages)](#pickers-resume--settings--packages)
+- [Public API](#public-api)
+- [Key concepts](#key-concepts)
+- [Related pages](#related-pages)
+
+## Overview
+
+`induscode::launch` turns a raw argument vector into a fully-configured run. It is the
+*front* of the pipeline: it owns the entire application command line and the credential
+surface, while [boot](/rust-cli/subsystems/boot) orchestrates dispatch, supplies the
+concrete on-disk vault path, and injects the ratatui session picker.
+
+The hard architectural decision (doc 40 §0) is a **single declarative flag table**.
+`flags::flag_specs()` returns one `&'static [FlagSpec]`; `parser::read_invocation`
+indexes it to parse, and `usage::render_usage` walks it to print help. Adding a row
+adds both behavior and help text at once. This is the deliberate contrast with the
+framework's separate 10-row routing table in `indusagi::shell_app::invocation` — a test
+pins the agent table at 18 rows so a contributor cannot accidentally edit the wrong one.
+
+The crate is `induscode` (one merged product crate); the launch subsystem is the
+`pub mod launch` under `src/`, built on the published [`indusagi`](/rust) framework
+crate. The brand bin name surfaced in usage comes from `indusagi::core::BRAND.bin_name`
+(`"indusagi"`), so a rebrand is a one-file edit.
+
+## Module layout
+
+`launch/mod.rs` declares the fixed module set and re-exports the frozen contract as a
+barrel (`pub use contract::*`):
+
+```rust
+// induscode::launch
+pub mod attachments;  // @file inliner -> Attachments / AttachmentError
+pub mod catalog;      // ModelRegistry over ModelCard (filter / sort / resolution)
+pub mod contract;     // shared frozen types (Invocation, OutputMode, FlagValue, …)
+pub mod credentials;  // multi-account vault + auth.json schema + command surface
+pub mod flags;        // FLAG table + FlagSpec/FlagKind/FlagGroup/Mode types
+pub mod oauth;        // 3 OAuth providers + poll/refresh FSM
+pub mod parser;       // tokenize + parse -> Invocation, derive_mode precedence
+pub mod pickers;      // resume / settings / package DATA (ratatui UI deferred)
+pub mod usage;        // render_usage from flag_specs() + flag groups
+```
+
+The crate is `#![forbid(unsafe_code)]`. The `oauth` module is gated behind the `oauth`
+feature (it pulls in `indusagi-connectors-saas` and `reqwest`); the rest compiles
+unconditionally and is unit-testable with no real disk, TTY, or network.
+
+## The frozen contract
+
+`contract.rs` declares only shapes plus inert, pure helpers — no parsing, no terminal
+I/O. Every behavior module is written against these names. The media element of an
+attachment is the framework image block `indusagi::llmgateway::Block::Image` directly —
+there is no second image type.
+
+| Type | Purpose |
+|------|---------|
+| `Invocation` | The fully-parsed command line: `mode`, `prompt`, the loose `flags` bag, `positionals`, plus resolved typed fields (`model`, `fallback_model`, `account`, `cwd`, `system`, `append_system`, `thinking`, `tools`, `no_tools`, `mcp`, `print`, `interactive`, `help`, `version`, `attachments`) |
+| `OutputMode` | `Text` / `Json` / `Rpc` — the agent's own vocabulary, mapped to the boot runner; `as_str()` and `is_output_mode()` narrow. **Not** the framework `Mode` (Print/Wire/Repl/Help/Version) |
+| `ThinkingEffort` | `Off`/`Minimal`/`Low`/`Medium`/`High`/`XHigh` accepted by `--thinking`; the ordered `THINKING_EFFORTS` tuple is the single source of truth, a superset of the framework `ThinkingLevel` (which omits `Off`); `parse()` + `is_thinking_effort()` |
+| `ToolName` | Closed 13-id roster the `--tools` / `--no-tools` flags validate against before any tool is built (`Read`, `Write`, `Edit`, `Bash`, `Grep`, `Find`, `Ls`, `Task`, `TodoRead`, `TodoWrite`, `WebFetch`, `WebSearch`, `Composio`); `TOOL_NAMES`, `parse()`, `is_tool_name()` |
+| `FlagValue` | `Bool` / `Str` / `Num(f64)` / `List(Vec<String>)` — the runtime value a parsed flag carries in `Invocation::flags` |
+| `Attachments` / `AttachmentOptions` | Result of `@file` expansion (`prose: String` + `media: Vec<Block>`) and the gatherer's `cwd` option |
+| `CredentialFault` / `CredentialFaultKind` | Typed credential failure (7 kinds) + the `credential_fault()` builder; impls `Display` + `Error` |
+| `CredentialVerb` / `ProviderEntry` | The `Signin`/`Signout` verb enum and a directory row (`id`/`label`/`env_key`/`docs_url`) |
+| `CatalogFilter` | `--list-models` filter: optional `provider`, `thinking_only`, `images_only`, and a case-insensitive `search` substring |
+| `ResumeFault` / `SettingsBrowseOptions` | Resume-picker fault + the settings-browser options (resolved `Preferences`, grouped resource paths, cwd, profile dir) |
+
+## The flag table
+
+`flags::flag_specs()` is the **one** declarative option table — 18 `FlagSpec` rows
+across five render groups (`Output`, `Model`, `Context`, `Tools`, `Meta`), built once
+in an `OnceLock` because the `--thinking` description is computed from
+`THINKING_EFFORTS`.
+
+```rust
+pub struct FlagSpec {
+    pub name: &'static str,          // canonical long spelling, leading dashes
+    pub aliases: &'static [&'static str],
+    pub kind: FlagKind,              // Boolean | String | Number | List
+    pub group: FlagGroup,            // Output | Model | Context | Tools | Meta
+    pub describe: &'static str,
+}
+```
+
+`FlagKind::List` is the agent's superset over the framework's `{Boolean,String,Number}`
+(it models the comma-split / repeat-accumulate `--tools` and `--mcp`); `group` is the
+sidecar that drives sectioned help and is inert at parse time. The complete table:
+
+| Flag | Aliases | Kind | Group | Purpose |
+|------|---------|------|-------|---------|
+| `--print` | `-p` | Boolean | Output | Run a single request, print only the result, and exit. |
+| `--json` | `--rpc` | Boolean | Output | Speak the headless line protocol for a driving parent process. |
+| `--interactive` | `-i` | Boolean | Output | Force the interactive session even when a prompt is supplied. |
+| `--model` | `-m` | String | Model | Select the model, provider-qualified or bare (e.g. `provider/name`). |
+| `--fallback-model` | — | String | Model | Model to switch to mid-turn when the selected model is overloaded (HTTP 529). |
+| `--account` | — | String | Model | Authenticate the run with a named stored credential account. |
+| `--thinking` | — | String | Model | Set the reasoning effort (one of: off, minimal, low, medium, high, xhigh). |
+| `--list-models` | — | String | Model | List the available models (optionally filtered by a substring) and exit. |
+| `--cwd` | — | String | Context | Scope the run to a working directory (default: the current directory). |
+| `--system` | — | String | Context | Replace the built-in system prompt with the given text. |
+| `--append-system` | — | String | Context | Append extra text after the system prompt. |
+| `--resume` | `-r` | Boolean | Context | Pick a previous session to resume. |
+| `--continue` | `-c` | Boolean | Context | Continue the most recent session in this directory. |
+| `--tools` | — | List | Tools | Allow only the named built-in tools (comma-separated or repeated). |
+| `--no-tools` | — | Boolean | Tools | Disable every built-in tool for this run. |
+| `--mcp` | — | List | Tools | Attach an external MCP server endpoint (comma-separated or repeated). |
+| `--help` | `-h` | Boolean | Meta | Show this usage and exit. |
+| `--version` | `-v` | Boolean | Meta | Show the version and exit. |
+
+Three derived indexes are computed once and cached:
+
+- `flag_key(name)` strips leading dashes (`"--no-tools"` -> `"no-tools"`) to get the
+  flag-bag key.
+- `token_index()` maps every canonical name **and** every alias to its owning row index
+  (so `"-p"`, `"--print"`, and `"--rpc"` all resolve correctly).
+- `short_booleans()` is the `HashSet<char>` of single-letter boolean aliases
+  (`p`, `i`, `r`, `c`, `h`, `v`) used for cluster expansion — `-m` is excluded because
+  it is a string flag.
+
+## The argv parser
+
+`parser::read_invocation(argv: &[String]) -> Invocation` is the hand-rolled,
+table-driven, **total** reader. It walks the sliced argv once via `token_index()`,
+accumulates into a private `ParseState`, then folds that into the strongly-typed
+`Invocation`. The grammar is entirely data-driven — there is no per-flag branch:
+
+- `--name=value` and `--name value` both bind a value flag; an inline `=value` wins,
+  otherwise the next token is consumed unless it is itself a flag (`raw = value ?? ""`).
+- `--` terminates option parsing; every later token is positional.
+- clustered short booleans (`-pi`) expand to each switch via `apply_short_cluster`; a
+  cluster with any unknown letter is kept whole as one extension flag.
+- `list` flags accumulate across repetition and `split_list` comma-splits a token,
+  trimming and dropping blanks.
+- `@file` tokens (`@x` with len > 1) are recorded as attachment references, never as
+  flags or positionals.
+- the parse is **total**: an unrecognised `--flag` is tolerated as a loose boolean (or a
+  string when it carries `=value`) in the `flags` bag — the extension-flag escape hatch.
+  This is the hard contrast with the framework `tokenize_invocation`, which returns an
+  `InvocationError` on an unknown flag.
+
+The first positional becomes `prompt`; the rest accumulate in `positionals`. A final
+fold derives the named fields — `resolve_thinking` drops an unrecognised `--thinking`
+value, `resolve_tools` filters `--tools` to known `ToolName`s, and `js_number` mirrors
+JS `Number(raw)` (`NaN`-as-absent) for the `Number` kind. The `attachments` field is
+left `None`; `read_file_references(argv)` re-walks argv for just the `@file` refs so the
+gatherer can expand them separately.
+
+```rust
+use induscode::launch::parser::{read_invocation, read_file_references};
+
+let inv = read_invocation(&[
+    "-p".into(), "prompt".into(), "-m".into(), "model".into(),
+    "--mcp".into(), "a".into(), "--mcp".into(), "b".into(),
+    "--thinking".into(), "high".into(), "--no-tools".into(),
+]);
+assert_eq!(inv.mode, OutputMode::Json);
+assert_eq!(inv.model.as_deref(), Some("model"));
+assert_eq!(inv.mcp, vec!["a".to_string(), "b".to_string()]);
+assert_eq!(inv.thinking, Some(ThinkingEffort::High));
+assert!(inv.no_tools);
+
+let refs = read_file_references(&["-p".into(), "hi".into(), "@notes.md".into()]); // ["notes.md"]
+```
+
+## Mode derivation
+
+`derive_mode(&flags)` resolves the `OutputMode` via a fixed precedence:
+
+```rust
+fn derive_mode(flags: &HashMap<String, FlagValue>) -> OutputMode {
+    if read_bool(flags, "json") {
+        return OutputMode::Rpc;                                   // --json / --rpc
+    }
+    if read_bool(flags, "print") && !read_bool(flags, "interactive") {
+        return OutputMode::Json;                                  // -p one-shot
+    }
+    OutputMode::Text                                              // interactive default
+}
+```
+
+So the headless line protocol (`--json` / `--rpc`) wins over a one-shot `--print`,
+which implies the non-interactive `Json` result mode unless `--interactive` overrides
+it; with neither, the mode is the interactive `Text` session.
+
+```bash
+indusr "refactor the auth module"          # interactive text mode (default)
+indusr -p "summarize this repo"            # one-shot json mode, then exits
+indusr --json                              # headless rpc line protocol
+indusr -i "start here"                     # force interactive even with a prompt
+indusr -m anthropic/claude --thinking high "..."
+indusr "review" @src/main.rs @diagram.png  # @file attachments
+```
+
+## Usage rendering
+
+`usage::render_usage() -> String` generates the `--help` banner entirely from
+`FLAG_GROUPS` then the matching `flag_specs()` rows in declaration order — there is no
+second hand-maintained help string. The synopsis carries `BRAND.bin_name`; each option
+line is a signature column padded to `SIGNATURE_COLUMN` (28) followed by `describe`.
+Per-kind placeholders: `Boolean` -> none, `Number` -> ` <n>`, `List` -> ` <a,b>`,
+`String` -> ` <value>`. A trailing `Arguments:` block documents `@file` and `--`. The
+returned string has no trailing newline; the CLI print wrapper appends it.
+
+A byte-for-byte oracle test pins the generated banner against drift in the table, the
+column padding, the group order, or the brand name. The exact rendered output begins:
+
+```
+Usage: indusagi [options] [prompt] [@file ...]
+
+A terminal-first AI coding agent.
+
+Output:
+  --print (-p)                Run a single request, print only the result, and exit.
+  --json (--rpc)              Speak the headless line protocol for a driving parent process.
+  ...
+Arguments:
+  @file                       Attach a text or image file to the first message.
+  --                          Stop parsing options; treat every later token as a positional.
+```
+
+## Attachments (@file)
+
+`attachments::gather_attachments(references: &[String], options: &AttachmentOptions)
+-> Result<Attachments, AttachmentError>` expands each `@file` ref into one `Attachments`
+value. Each reference is resolved against `options.cwd` (a private `resolve_read_path`
+expands a leading `~` to `$HOME` / `%USERPROFILE%`, takes an absolute path verbatim,
+otherwise joins onto cwd), classified by lower-cased extension, bounded by a per-kind
+size cap, and folded into the result:
+
+- **text files** — a closed `TEXT_EXTENSIONS` set (`.txt`, `.md`, `.rs`, `.ts`, `.py`,
+  `.json`, `.toml`, `.yaml`, … 40-odd extensions) — are read as UTF-8 and inlined into
+  `Attachments.prose`, each wrapped in a `<file path="...">…</file>` block so the model
+  sees which file each block came from. Cap: `MAX_TEXT_BYTES` = 10 MiB. Blocks are
+  joined with a blank line.
+- **image files** — `IMAGE_MIME_BY_EXT` maps `.png`/`.jpg`/`.jpeg`/`.gif`/`.webp`/
+  `.bmp`/`.svg` to a media type — are base64-encoded into the framework
+  `indusagi::llmgateway::Block::Image { media_type, data_base64 }` and collected in
+  `Attachments.media`. Cap: `MAX_IMAGE_BYTES` = 20 MiB.
+- an empty (zero-byte) file is skipped silently; an unknown extension, an oversized
+  file, a missing file, or a read error returns a typed `AttachmentError` carrying a
+  discriminant `kind` — `Unsupported` / `TooLarge` / `NotFound` / `ReadFailed` — plus
+  the offending `reference` and resolved path, never a string sentinel or a process
+  exit.
+
+```rust
+use induscode::launch::attachments::gather_attachments;
+use induscode::launch::contract::AttachmentOptions;
+
+let att = gather_attachments(
+    &["README.md".into(), "logo.png".into()],
+    &AttachmentOptions { cwd: "/repo".into() },
+)?;
+// att.prose has <file path="...">...</file> text blocks; att.media has Block::Image
+```
+
+## Model catalog and resolution
+
+`catalog::print_model_catalog(io, filter, source)` renders the `--list-models` table.
+Rows come from a `CatalogModelSource` seam: `RegistrySource` reads the live
+`indusagi::facade::ai` catalog (`get_providers()` × `get_models(..)` — ~708 models /
+24 providers) and filters out `EXCLUDED_PROVIDERS` (`"mock"`); `SliceSource` projects an
+injected `Vec<ModelCard>` for deterministic tests. Each row is projected to a
+`CatalogRow` (Provider, Model, Context, Max Output, Thinking, Images). `filter_rows`
+applies provider equality (lower-cased), `thinking_only`, `images_only`, and a
+case-insensitive `search` substring over `"provider/modelId"`; `sort_rows` orders by
+provider then model id. `format_token_count` renders compact widths (`128K` / `1.5M` /
+`-`), and `layout` computes per-column widths, emits a Title-Case header, a dash rule,
+then body rows. An empty match prints one notice line. The `CatalogIo` sink
+(`StdoutCatalogIo` / `VecCatalogIo`) is injectable so the layout is unit-tested in
+memory.
+
+```rust
+use induscode::launch::catalog::{print_model_catalog, CatalogFilter, RegistrySource, StdoutCatalogIo};
+
+print_model_catalog(
+    &mut StdoutCatalogIo,
+    &CatalogFilter { provider: Some("anthropic".into()), thinking_only: true, ..Default::default() },
+    &RegistrySource,
+);
+```
+
+The same module owns `resolve_model_id(invocation_model, saved_model, authed) -> String`,
+mirroring the merged framework + product precedence:
+
+1. an **explicit `--model`** that names a real catalog model wins outright;
+2. a **saved `settings.default_model`** — but only when `saved_model_usable` (it names a
+   real model **and** its owning provider is in the authenticated set), so a stale id
+   from an unauthenticated provider is skipped;
+3. an **authenticated provider's current model** via `provider_default_model` (which
+   uses the `PREFERRED_DEFAULT` table to avoid leading-but-deprecated catalog entries);
+4. the catalog-guaranteed `FALLBACK_MODEL_ID`, hardened to `CAPABLE_DEFAULT_MODEL_ID`
+   (`claude-sonnet-4`) when the framework fallback names no card — so a bare launch
+   never lands on a zero-window model that would trip a spurious auto-condense.
+
+`model_known` screens a candidate against both the facade catalog (canonical or bare id)
+and the gateway routing cards; `model_provider(id)` reports the owning provider slug.
+See [Models](/rust-cli/configuration/models) for the catalog data model and the
+framework [LLM Gateway](/rust/subsystems/llm-gateway).
+
+## Credentials (signin / signout)
+
+`credentials::run_credential_command(argv, vault, io, oauth) -> CredentialResult` owns
+the first positional token only. It returns `handled == false` when `argv[0]` is not a
+verb, so the orchestrator calls it first and falls through to a normal launch on a miss.
+The recognised verbs are `signin`/`login` and `signout`/`logout` (the natural-language
+aliases keep `indusr login` from being mistaken for a chat prompt). `read_verb_flags`
+peels `--provider` / `--account` / `--method` / `--oauth` / `--api-key` (alias
+`--apikey`) / `--list` (alias `--ls`) off the tail, with the first bare positional
+treated as the provider.
+
+```bash
+indusr signin anthropic                       # browser sign-in preferred when capable
+indusr signin openai --method api-key         # force the api-key flow
+indusr signin --list                          # read-only list of saved accounts
+indusr signout anthropic --account work
+```
+
+`PROVIDER_DIRECTORY` is the 14-provider api-key directory (`anthropic`, `openai`,
+`google`, `xai`, `groq`, `cerebras`, `mistral`, `openrouter`, `minimax`, `kimi`,
+`sarvam`, `krutrim`, `nvidia`, `zai`); each `ProviderEntry` carries the conventional
+`env_key` (read directly by name via `env_api_key`, since the agent directory is wider
+than the framework `ProviderId` enum) and a `docs_url`. The flow:
+
+1. resolve the provider — named via `--provider` / first positional, or a numbered pick
+   from the merged login directory;
+2. prefer browser sign-in when the provider `is_oauth_capable`; otherwise the api-key
+   flow, consulting the env key first so an already-exported key needs no re-typing;
+3. validate with `validate_api_key` (non-empty, ≥ 20 chars, no `PLACEHOLDER_MARKERS`) or
+   `validate_account_name` (≤ 50 chars, `[A-Za-z0-9_-]+`);
+4. persist through the injected `AuthVault` and return a `CredentialResult` carrying a
+   typed `CredentialFault` on failure — never panicking for an expected failure.
+
+`CredentialFaultKind` is the closed union `UnknownProvider | InvalidKey | InvalidAccount
+| NameCollision | NotFound | Vault | Aborted`; `format_credential_fault` renders the
+single human-facing message (`label: message` + an indented `hint`). The `CredentialIo`
+trait injects the three console operations (`print`, `ask`, `ask_secret`), so the whole
+flow is unit-tested with an in-memory vault and no real TTY.
+
+Secret hygiene is enforced by `SecretString`: its `Debug` and `Display` both emit
+`<redacted>`, and the only path to cleartext is `expose()`, so a stray `{:?}` log line
+or panic message can never leak a key or token.
+
+## The on-disk vault
+
+`DiskAuthVault` is the concrete `#[async_trait] AuthVault`, constructed over the
+`auth.json` path from `indusagi::core::Locator::auth_store_path()`
+(`<profile>/auth.json`). It reads and rewrites the whole tiny file behind a
+`tokio::sync::Mutex` per call. The on-disk shape is a serde-tagged discriminated record
+keyed `provider -> account -> record`:
+
+```rust
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum AuthRecord {
+    ApiKey { key: SecretString, #[serde(rename = "isDefault")] is_default: bool },
+    Oauth  { #[serde(flatten)] credentials: OAuthCredentials,
+             #[serde(rename = "isDefault")] is_default: bool },
+}
+```
+
+Files are written `JSON.stringify(_, null, 2) + "\n"` (serde pretty + trailing newline)
+with mode `0o600` on Unix, and `IndexMap` + `preserve_order` keeps insertion order so the
+bytes match an installed build. The reader is permissive (doc 41 §1.2): a missing or
+malformed file reads as empty, a single bad record is skipped, the legacy
+pre-discriminant `{ apiKey, isDefault }` layout is tolerated by `normalise_record`, and a
+framework-written single-record `{ provider: { accessToken, … } }` store is **upgraded**
+to one `default` OAuth account by `upgrade_framework_record`. Removal promotes the first
+surviving account to default; `make_default` clears peers first. `status_entries()`
+enumerates every stored sign-in (across both shapes) for an `auth status` report,
+labelling api keys and OAuth tokens with a freshness phrase
+(`describe_oauth_freshness`).
+
+## OAuth browser sign-in
+
+The Rust framework ships only the OAuth *transport* skeleton, so `oauth.rs` (behind the
+`oauth` feature) owns the high-level provider *registry* and three real flows, building
+on `indusagi::llmgateway::{create_pkce_pair, build_auth_url, exchange_code,
+refresh_token, OAuthConfig, AuthUrlInputs, PkcePair}`.
+
+- `register_built_in_oauth_providers()` is the **explicit prime** — Rust has no
+  import-time side effect, so boot calls this once before any auth path. It idempotently
+  registers `AnthropicProvider`, `OpenAiCodexProvider`, and `GithubCopilotProvider` into
+  the process-global `OAuthProviderRegistry` (`OnceLock` + `RwLock<IndexMap>`) and returns
+  the live ids. `register_oauth_provider` / `get_oauth_provider` / `get_oauth_providers`
+  manage the registry; `is_oauth_capable(id)` reports whether a browser flow exists.
+- the two paste-code flows (Anthropic, OpenAI Codex) share `paste_code_login`: generate
+  a PKCE pair and CSRF state, build the consent URL, surface it through
+  `OAuthLoginCallbacks::on_auth`, await a pasted code (cleaned by `extract_code`, which
+  handles a bare code, `code#state`, or a full redirect URL with `?code=`), and exchange
+  it. GitHub Copilot uses the RFC 8628 device grant; its poll FSM is modelled on the
+  framework connectors-saas `ConnectAction` rule table via `classify_poll` (maps
+  `authorization_pending` / `slow_down` / `access_denied` / `expired_token` to
+  `PollStatus`) and `plan_poll` (returns `PollDecision::{Done, Poll{wait_ms, slowed},
+  Expired, Failed}`).
+- `has_registered_oauth_client_id` / `resolve_client_id` gate every flow on the
+  `<UNREGISTERED-…>` sentinel: no real client id ships in source, so a flow refuses with
+  an actionable error naming the exact per-provider env var
+  (`INDUSAGI_ANTHROPIC_OAUTH_CLIENT_ID`, `INDUSAGI_OPENAI_CODEX_CLIENT_ID`,
+  `INDUSAGI_GITHUB_COPILOT_CLIENT_ID`) when it is unset, rather than opening a doomed
+  browser tab.
+- `start_oauth_login(provider_id, callbacks, vault, account)` drives the provider's login
+  and persists through an `OAuthVaultSink` (the first stored account becomes default);
+  `list_login_providers(api_key_directory)` is the merged sign-in directory (OAuth rows
+  leading, then api-key rows). `open_login_url(url)` launches the consent URL but only for
+  syntactically valid `http`/`https` URLs — `is_web_url` refuses any other scheme before
+  spawning a process.
+
+The stored `OAuthCredentials` (`access`/`refresh`/`expires`/`issued_at`/`provider` +
+flattened `extra` passthrough) is converted from the gateway wire `OAuthTokens` by
+`tokens_to_credentials`, and has a **redacting** `Debug` so a token never lands in a log
+line. See the framework [LLM Gateway](/rust/subsystems/llm-gateway) for the PKCE / OAuth
+transport primitives.
+
+## Pickers (resume + settings + packages)
+
+`pickers.rs` holds picker **data** only — the ratatui session dialog belongs to the
+console (doc 13), so the launch crate carries no `ratatui` dependency.
+
+`pick_resume_target(current, all, deps) -> ResumeOutcome` takes the already-loaded
+current-directory and all-directory session lists (the async store I/O stays at the boot
+edge), merges them with `merge_sessions` (de-dupes by path, current wins the key, sorts
+`last_modified` descending), and either returns the newest session on a non-interactive
+stdin (the `ResumeDeps::is_interactive` fast-path) or mounts the injected
+`ResumeDeps::mount_picker`. It returns a `ResumeOutcome { path, fault }` — a typed
+`ResumeFault` is *returned*, never panicked, when a mount fails, so the orchestrator can
+fall back to a fresh session.
+
+`render_settings_listing(opts) -> Vec<String>` is the pure line builder (working /
+profile directories, default model, extension-package count, and discovered resource
+paths grouped and sorted by category); `browse_settings(opts, io)` prints it through the
+injected `SettingsBrowseIo` and pauses for a keypress.
+
+`run_package_command(argv, store, io) -> PackageResult` is the `install` / `remove` /
+`update` / `list` / `config` surface over the `extensionPackages` settings key, stored in
+the typed `Preferences::extension_packages` field via `crate::core::PreferenceStore`. Like
+the credential command it owns the first token only (`handled == false` on a miss) and
+never panics — a bad argument is a printed error plus a non-zero `PackageResult.code`.
+`source_key` / `sources_match` classify a source for equality so an `npm:` spec ignores a
+trailing `@version`, a git url drops its scheme and `.git` suffix, and a local path
+matches verbatim. `is_package_command(token)` is the routing predicate boot uses to
+short-circuit before a session is built.
+
+```bash
+indusr install npm:@scope/my-ext
+indusr list
+indusr remove npm:@scope/my-ext
+indusr config
+```
+
+## Public API
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `read_invocation` / `read_file_references` | fn | `parser.rs` | Table-driven argv parser -> `Invocation`; the latter re-walks argv for just the `@file` refs |
+| `render_usage` | fn | `usage.rs` | Generates the `--help` banner from `flag_specs()` / `FLAG_GROUPS` |
+| `flag_specs` / `FLAG_GROUPS` / `FlagSpec` / `FlagKind` / `FlagGroup` | fn/const/type | `flags.rs` | The single 18-row option table, its render groups, and row types |
+| `flag_key` / `token_index` / `short_booleans` | fn | `flags.rs` | The derived parse indexes over the table |
+| `gather_attachments` / `AttachmentError` / `AttachmentErrorKind` | fn/type | `attachments.rs` | Expands `@file` refs -> `Attachments`; returns a typed error |
+| `print_model_catalog` / `CatalogIo` / `CatalogModelSource` / `RegistrySource` / `SliceSource` / `CatalogRow` | fn/trait/type | `catalog.rs` | Renders the aligned model table over the facade catalog with injectable seams |
+| `resolve_model_id` / `model_provider` / `saved_model_usable` | fn | `catalog.rs` | The merged model-id resolution precedence + its helpers |
+| `run_credential_command` / `CredentialResult` / `CredentialIo` | fn/type/trait | `credentials.rs` | The `signin` / `signout` command; resolves a provider, prefers OAuth, returns `CredentialResult` |
+| `PROVIDER_DIRECTORY` / `find_provider` / `validate_api_key` / `validate_account_name` / `format_credential_fault` / `as_signin_method` | const/fn | `credentials.rs` | The 14-provider directory, lookup, validators, fault formatter, method vocabulary |
+| `AuthVault` / `DiskAuthVault` / `SecretString` / `OAuthCredentials` / `AuthKind` / `AuthStatusEntry` | trait/type | `credentials.rs` | The vault trait, the on-disk multi-account implementation, and the secret/record shapes |
+| `register_built_in_oauth_providers` / `start_oauth_login` / `is_oauth_capable` / `list_login_providers` / `open_login_url` / `classify_poll` / `plan_poll` | fn | `oauth.rs` | The explicit registry prime, the login driver, the merged directory, the browser launcher, and the device-poll FSM (`oauth` feature) |
+| `pick_resume_target` / `ResumeDeps` / `ResumeOutcome` / `merge_sessions` | fn/trait/type | `pickers.rs` | Merges resumable sessions, uses the newest on non-TTY, else mounts the injected picker |
+| `render_settings_listing` / `browse_settings` / `SettingsBrowseIo` | fn/trait | `pickers.rs` | The pure settings listing builder and its paused console dump |
+| `run_package_command` / `PackageCommand` / `PackageResult` / `PackageIo` / `is_package_command` | fn/type/trait | `pickers.rs` | The `install`/`remove`/`update`/`list`/`config` command over `extensionPackages` |
+
+## Key concepts
+
+**Single declarative flag table.** `flags::flag_specs()` is the one source of truth: the
+parser indexes it and `render_usage` walks it, so help and parsing cannot drift. Adding a
+row adds both behavior and help text. A test pins the 18-row roster so a contributor
+cannot edit the framework's 10-row routing table by mistake.
+
+**Frozen contract seam.** `contract.rs` declares only shapes and inert helpers (no I/O);
+every behavior module writes against those names and the barrel re-exports them.
+
+**Typed faults over sentinels.** Failures are typed enums/structs — `CredentialFault`
+(7 kinds), `AttachmentError` (4 kinds), `ResumeFault`, `OAuthError` — each carrying a
+discriminant plus a hint, never a string sentinel or a bare process exit.
+
+**Total parsing.** An unknown flag is tolerated as a loose boolean (or a string with
+`=value`); the parse never errors. This is the deliberate contrast with the framework
+`tokenize_invocation`, which rejects unknown flags.
+
+**Injectable I/O seams.** `CatalogIo`, `CredentialIo`, `PackageIo`, `SettingsBrowseIo`,
+`ResumeDeps`, `CatalogModelSource`, and `OAuthSeam` are traits with live defaults,
+letting the whole subsystem be unit-tested with in-memory stand-ins and no real terminal,
+disk, or network.
+
+**Byte-compatible vault + explicit OAuth prime.** `DiskAuthVault` reads and upgrades a
+framework-written single-record `auth.json`, and writes byte-identical multi-account
+output; `register_built_in_oauth_providers` must be primed explicitly at boot because the
+Rust crate has no import-time side effects.
+
+**Secret redaction.** `SecretString` and `OAuthCredentials` redact in `Debug`/`Display`;
+the browser launcher refuses non-`http(s)` schemes before spawning. No real OAuth client
+id ships in source — flows resolve it from a per-provider env var or refuse.
+
+## Related pages
+
+- [Boot](/rust-cli/subsystems/boot) — consumes the launch surface in fixed order and supplies the concrete disk vault path and the ratatui picker.
+- [Conductor](/rust-cli/subsystems/conductor) — drives the agent loop with the resolved model and tools.
+- [Sessions](/rust-cli/subsystems/sessions) — the `SavedSession` store the resume picker merges from.
+- [Capability Deck](/rust-cli/subsystems/capability-deck) — the built-in tool set the `--tools` / `--no-tools` roster selects against.
+- [Models](/rust-cli/configuration/models) — the catalog data model and `--list-models`.
+- [Settings](/rust-cli/configuration/settings) — the `PreferenceStore` the package command and settings browser read.
+- [Slash Commands](/rust-cli/console/slash-commands) and [Dialogs](/rust-cli/console/dialogs) — the in-console `/login`, `/model`, and `/resume` surfaces.
+- [induscode (Rust) Overview](/rust-cli/README) — the `indusr` / `indusagir` front door and the flag summary.
+- Framework [LLM Gateway](/rust/subsystems/llm-gateway) — the `ModelCard` catalog, `Block::Image`, and PKCE / OAuth primitives launch builds on.
+- Parity: the [TypeScript](/cli) and [Python](/python-cli/subsystems/launch) editions of this subsystem.

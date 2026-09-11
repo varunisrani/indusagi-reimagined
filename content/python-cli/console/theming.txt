@@ -1,0 +1,220 @@
+# Theming & Input
+
+> The console's presentation and composer layers: the four-scheme theme engine (`induscode.console.theme`), the keystroke-intent + chord + autocomplete input layer (`induscode.console.input`), and the reusable chrome widgets (`induscode.console.components`). All three are deliberately thin over the `indusagi[tui]` framework — every decision lives in a pure module, so the colour math, chord machines, and completion logic are testable without a TTY. Reached through the interactive `pindus` session, or imported directly (`from induscode.console import resolve_theme, THEMES`).
+
+## Table of Contents
+
+- [Overview](#overview)
+- [The Theme Engine](#the-theme-engine)
+- [Palettes and Schemes](#palettes-and-schemes)
+- [Token Derivation](#token-derivation)
+- [The Framework Boundary](#the-framework-boundary)
+- [Resolving and Switching Themes](#resolving-and-switching-themes)
+- [The Input Layer](#the-input-layer)
+- [Intents and the Chord Table](#intents-and-the-chord-table)
+- [Chord Machines](#chord-machines)
+- [Autocomplete](#autocomplete)
+- [Components](#components)
+- [Source Files](#source-files)
+
+## Overview
+
+Three subpackages under `induscode.console` cover everything between a resolved scheme name and the painted terminal:
+
+| Subpackage | Concern | Public surface |
+|------------|---------|----------------|
+| `console.theme` | The colour engine: 4 accent ramps → 25 semantic tokens → framework projection | `resolve_theme`, `THEMES`, `derive_tokens`, `framework_colors`, `theme_bundle` |
+| `console.input` | The composer layer: keystroke intents, chord latches, slash/path completion | `INTENT_TABLE`, `advance_chord`, `advance_exit_window`, `complete_at`, `ConsoleAutocompleteProvider`, `create_dir_reader` |
+| `console.components` | The presentational chrome widgets | `Banner`, `Emblem`, `StatusBar` |
+
+The split mirrors the rest of the console: pure data and pure functions define the behaviour, while the [framework react-ink](/python/ui/react-ink) widgets and the [framework editor](/python/ui/tui) do the actual rendering and keystroke decoding. The `ConsoleApp` surface (see [Console overview](/python-cli/console/overview)) is the only place that wires these into a live Textual mount.
+
+## The Theme Engine
+
+The theme engine runs one pipeline, once per scheme, at module load:
+
+```text
+ThemePalette ──derive_tokens──▶ ThemeTokens ──framework_colors──▶ framework keys
+   (9-stop ramp)                 (25 roles)        │
+                                                   └─create_theme_bundle─▶ ThemeBundle
+                                                        (adapter + Textual Theme + Pygments)
+   └──────────────────────────────────────────────────────────────────┘
+                              ConsoleTheme
+```
+
+The console body never names a hex code or a framework colour key — it names a semantic *role* (`signal`, `frame`, `body_text`, `alarm`, …). The pipeline binds each role to a ramp stop exactly once, then projects the role set onto the framework's own colour-key vocabulary at a single boundary. Because the heavy work (adapter + Textual `Theme` + Pygments style construction) happens at load time, the render path only ever reads an already-built `ConsoleTheme`.
+
+| Symbol | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `ThemePalette` | dataclass | `contract.py` | The raw 9-stop accent ramp a scheme is built from |
+| `ThemeTokens` | dataclass | `contract.py` | The 25 derived semantic roles the console renders against |
+| `ConsoleTheme` | dataclass | `contract.py` | A fully resolved scheme: `scheme` + `palette` + `tokens` + `adapter` + `bundle` |
+| `ThemeScheme` | type | `contract.py` | `midnight` \| `daylight` \| `midnight-cb` \| `daylight-cb` |
+| `derive_tokens` | function | `theme/tokens.py` | Expand a `ThemePalette` into the 25 `ThemeTokens` |
+| `framework_colors` | function | `theme/adapter.py` | Project the tokens onto the framework's colour-key mapping |
+| `theme_bundle` | function | `theme/adapter.py` | Build the framework `ThemeBundle` via `create_theme_bundle` |
+| `resolve_theme` | function | `theme/resolve.py` | Map a scheme name to its built `ConsoleTheme` (falls back to default) |
+| `THEMES` | const | `theme/resolve.py` | The frozen 4-scheme table assembled once at load |
+
+## Palettes and Schemes
+
+A `ThemePalette` is the source nine-stop ramp: three accent hues (a cool primary, a warm secondary, a muted support tertiary), a three-stop neutral text gradient (`ink` / `body` / `muted`), and three status hues (`affirm` / `caution` / `alarm`). The four shipped schemes are derived from four ramps in `theme/palette.py`:
+
+| Scheme | Palette | Target | Notes |
+|--------|---------|--------|-------|
+| `midnight` | `MIDNIGHT_PALETTE` | dark terminal | Cool spring-teal primary, warm amber secondary, soft periwinkle support; the default |
+| `daylight` | `DAYLIGHT_PALETTE` | light terminal | Same roles re-derived deeper/saturated against a bright background |
+| `midnight-cb` | `MIDNIGHT_CB_PALETTE` | dark, color-blind-safe | Clones midnight, remaps the status hues so success vs failure separate off the red-green axis (`affirm → #4aa3ff`) |
+| `daylight-cb` | `DAYLIGHT_CB_PALETTE` | light, color-blind-safe | The daylight counterpart, status hues tuned for lightness separation on a bright background |
+
+The color-blind variants only move the three *status* stops; the accent hues and the neutral gradient carry over unchanged, so the overall look stays the parent scheme. `DEFAULT_SCHEME` is `midnight`. The raw ramps are reachable as `PALETTES` (a `ThemeScheme → ThemePalette` mapping the token step reads from).
+
+## Token Derivation
+
+`derive_tokens(palette)` is the one place the 25 roles are bound to ramp stops. It is pure, total, and deterministic — every `ThemeTokens` field is assigned exactly once, so a ramp missing a stop fails at construction rather than producing an undefined colour at render time. The status and chrome roles map straight onto stops (`signal ← primary`, `frame ← tertiary`, `body_text ← body`, `alarm ← alarm`, …).
+
+The markdown / diff / syntax-highlight roles are *derived* from the same nine stops so the styled transcript, colored diffs, and fenced-code surfaces recolour with the scheme and need no extra palette stop:
+
+- `syn_keyword ← primary`, `syn_string ← affirm`, `syn_number ← caution`, `syn_comment ← muted`, `syn_type ← tertiary`
+- `diff_added_text ← affirm`, `diff_removed_text ← alarm`
+- `diff_added_bg` / `diff_removed_bg` are computed by blending the status hue 78% toward the scheme's implied terminal background, so the tint stays recognisably green/red (or blue/red on the CB schemes) without overpowering the foreground painted on top.
+
+`luminance(hex)` returns the relative luminance (0 dark → 1 light) of a colour. It picks the background anchor for the diff tints (a light `ink` implies a dark terminal, so the anchor is black) and the same logic drives the Textual dark flag in the resolver. The hex math (parse / mix / round) preserves half-up rounding so the derived hexes are stable.
+
+## The Framework Boundary
+
+`framework_colors(tokens)` is the single boundary projecting console semantic roles onto the framework's wire vocabulary — the camelCase keys its react-ink components pass to `theme.color(...)` / `theme.background(...)` / `theme.role(...)`. The rest of the console never speaks a framework key name, and the framework never sees a console role name.
+
+```text
+framework key   ← console role
+accent          ← signal          userMessage     ← prompt_surface
+text            ← body_text       customMessage   ← card_accent
+dim / muted     ← muted_text      success         ← affirm
+borderMuted     ← quiet_frame     warning         ← caution
+bashBorder      ← frame           error           ← alarm
+highlight       ← ink_text        info            ← notice
+diffAddedBg     ← diff_added_bg   synKeyword      ← syn_keyword   (…and the rest)
+```
+
+`theme_bundle(scheme_name, tokens, dark=...)` is the only place `create_theme_bundle` is invoked for a console theme. It yields the painter `InkThemeAdapter` plus a registrable `textual.theme.Theme` (every key/role as a CSS variable like `$user-message` / `$diff-added-bg`) and a Pygments style for fenced-code highlighting. `theme_adapter(...)` builds just the painter adapter and is kept for parity and painter-only tests.
+
+## Resolving and Switching Themes
+
+`resolve_theme(scheme)` is the single sanctioned way the surface turns a scheme name — from settings, a `/theme` slash argument, or the default — into a built `ConsoleTheme`. An unrecognised or absent name falls back to `DEFAULT_SCHEME` rather than raising, so a corrupt preference never blanks the console.
+
+```python
+from induscode.console import resolve_theme, THEMES
+
+theme = resolve_theme("midnight-cb")   # color-blind-safe dark scheme
+assert theme.scheme == "midnight-cb"
+
+adapter = theme.adapter                # framework InkThemeAdapter (Rich painters)
+rich_text = adapter.color("accent", "[tool read]")
+
+list(THEMES.keys())   # ('midnight', 'daylight', 'midnight-cb', 'daylight-cb')
+```
+
+Because every scheme's bundle carries a full Textual `Theme`, the `ConsoleApp` registers all four at startup and a `scheme:set` event becomes a native `app.theme = scheme` live retheme — the [theme picker](/python-cli/console/dialogs) gets preview-before-commit for free. `THEME_SCHEMES` is the picker-order tuple, derived from `THEMES` so adding a scheme adds it to the picker with no second list to update.
+
+## The Input Layer
+
+The console contributes only autocomplete, submit, and app-level chords to the composer; everything printable (typing, deletion, caret motion, history, completion accept) is consumed by the [framework `PromptEditor`](/python/ui/react-ink) over `EditorCore` and `EditorKeybindingsManager` before it reaches the app. The TS `readKey` classifier and the whole paste vault are deliberately *not* ported — Textual's key decoder and native `events.Paste` do that job.
+
+| Symbol | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `INTENT_TABLE` | const | `input/intents.py` | Chord → `ConsoleIntent` map (the data `ConsoleApp` BINDINGS derive from) |
+| `ConsoleVerb` / `CONSOLE_VERBS` | type / const | `input/intents.py` | The closed keystroke-verb vocabulary |
+| `EDITOR_DELEGATED` | const | `input/intents.py` | The verbs that collapsed into the framework `EditorCore`, as data |
+| `advance_chord` | function | `input/chord.py` | The double-tap latch (Esc×2, Ctrl+U×2) |
+| `advance_exit_window` | function | `input/chord.py` | The Ctrl+C exit-window machine (abort / clear / arm / exit) |
+| `complete_at` / `apply_suggestion` | function | `input/providers.py` | The pure completion core |
+| `ConsoleAutocompleteProvider` | class | `input/providers.py` | The slash/path router handed to `PromptEditor` |
+| `create_dir_reader` | function | `input/dir_reader.py` | The live `os.scandir` binding of the injectable `DirReader` seam |
+
+## Intents and the Chord Table
+
+`ConsoleVerb` is the verb vocabulary (`flow:submit`, `flow:interrupt`, `overlay:open`, `view:toggleReasoning`, …); `INTENT_TABLE` is the surviving app-level slice, a chord → `ConsoleIntent` map in the framework's `KeyId` spelling. The app derives its Textual `BINDINGS` and `action_*` methods from this table, while the table itself stays pure data so the chord→verb matrix is unit-tested without mounting Textual.
+
+| Chord | Verb | Effect |
+|-------|------|--------|
+| `ctrl+c` | `flow:interrupt` | Abort / clear / exit (drives `advance_exit_window`) |
+| `ctrl+z` | `flow:suspend` | Suspend the session |
+| `ctrl+n` / `ctrl+p` | `flow:cycleModel` | Rotate the active model forward in scope |
+| `shift+tab` | `model:cycleThinking` | Step the reasoning ladder |
+| `ctrl+t` | `view:toggleReasoning` | Toggle reasoning display |
+| `ctrl+o` | `view:expandTools` | Toggle full tool-output rendering |
+| `ctrl+v` | `input:pasteImage` | Paste an image into the turn |
+| `ctrl+g` | `input:externalEditor` | Hand the composer buffer to `$EDITOR` |
+| `ctrl+r` | `overlay:open` (sessions) | Raise the session picker |
+| `ctrl+l` | `overlay:open` (models) | Raise the model picker |
+| `alt+up` | `queue:dequeue` | Pull the newest queued input back into the composer |
+| `escape` | `flow:dismiss` | Dismiss overlay / abort busy / feed the double-Esc latch |
+| `ctrl+u` | `edit:clearLine` | Editor clears the line; the app observes the chord on an empty buffer to arm `clear×2` |
+
+`EDITOR_DELEGATED` documents the verbs absorbed by the framework editor (`edit:erasePrev → deleteCharBackward`, `flow:submit → submit`/`selectConfirm`, etc.) as data, so a coverage test pins that every verb in `CONSOLE_VERBS` is either an app intent, editor-delegated, or the inert `none`.
+
+## Chord Machines
+
+Two pure machines fold one keystroke into a carried latch. The `ConsoleApp` owns the live latch values and the timers; the functions themselves take an injectable clock so the whole thing is deterministic under test.
+
+**Double-tap latch** — `advance_chord(latch, intent)`. A first tap of a chord-eligible verb arms the latch; a matching second tap within `CHORD_WINDOW_MS` (600 ms) fires the outcome and disarms; any other intent breaks the latch. The eligible verbs are `flow:dismiss` → `dismiss×2` (the configurable double-Escape action: tree / fork / clear) and `edit:clearLine` → `clear×2` (request exit).
+
+**Ctrl+C exit window** — `advance_exit_window(window, *, busy, buffer_empty, now_ms, window_ms=...)`. Folds one Ctrl+C press in TS branch order: a busy turn is `abort`ed; a non-empty buffer is `clear`ed; an empty buffer `arm`s the window, and a second empty-buffer press within `CTRL_C_EXIT_WINDOW_MS` (500 ms) fires `exit`.
+
+```python
+from induscode.console.input import advance_exit_window, NO_EXIT_WINDOW
+
+step = advance_exit_window(NO_EXIT_WINDOW, busy=False, buffer_empty=True, now_ms=0.0)
+assert step.action == "arm"
+step = advance_exit_window(step.next, busy=False, buffer_empty=True, now_ms=200.0)
+assert step.action == "exit"     # second press inside the 500 ms window
+```
+
+## Autocomplete
+
+`complete_at(buffer, caret, registry, read_dir)` is the pure completion core. It finds the whitespace-delimited active token and routes:
+
+- a `/` opening the buffer (`span.start == 0`) → **slash completion** against the [slash registry](/python-cli/console/slash-commands), via `match_prefix`; exact token matches float to the front, and a command that `takes_args` gets a trailing space so the caret lands ready for input.
+- a stem carrying the `@` attachment sigil or a `/` separator → **path completion**, listing the resolved directory through the injected `read_dir`, sorting directories first then alphabetically, and appending a trailing `/` to a directory so the next accept descends into it.
+- anything else → the inert `none`, so plain prose never triggers a directory scan.
+
+`apply_suggestion(buffer, span, suggestion)` replaces the whole active-token span with the suggestion value and returns the rewritten buffer with the caret after it. `ConsoleAutocompleteProvider(registry, read_dir)` wraps the same routing as a framework `AutocompleteProvider` (the slash branch and the path branch as `SlashCommandProvider` / `PathCompletionProvider`), which is what the console hands straight to `PromptEditor`. The path branch lists through `create_dir_reader(cwd)` — a live `os.scandir` binding where every failure mode (missing dir, permission error, a path that names a file) collapses to an empty list, so the composer never raises mid-type.
+
+```python
+from induscode.console.input import complete_at, apply_suggestion, create_dir_reader
+from induscode.console.slash_commands import build_default_registry
+
+reg = build_default_registry()
+res = complete_at("/mod", caret=4, registry=reg, read_dir=create_dir_reader("."))
+assert res.kind == "slash"
+applied = apply_suggestion("/mod", res.span, res.suggestions[0])   # -> '/model ' etc.
+```
+
+## Components
+
+The chrome widgets are purely presentational — Static / container widgets rendering prebuilt Rich `Text` through the framework `ThemeAdapter`. They hold no state of their own; the surface threads the resolved adapter and a projected `SessionSnapshot` into them.
+
+| Widget | Source | Role |
+|--------|--------|------|
+| `Banner` | `components/banner.py` | The masthead: block-figlet wordmark + two-tone emblem, brand/version + welcome lines, bordered Session and Startup Map panels, the changelog block, and an optional *frozen* (non-animated, reduced-motion-safe) colour sweep |
+| `Emblem` | `components/emblem.py` | The two-tone block monogram (box-quadrant fill/shadow rows) |
+| `StatusBar` | `components/status_bar.py` | A thin `Vertical` composing the framework `StatusLine` (transient toast row) above the `Footer` (persistent session/usage strip) |
+
+All `Banner` inputs are reactive, so a scheme switch or late-arriving startup data re-skins the masthead in place; `quiet` and `compact` collapse the full masthead to a single condensed header line. `StatusBar.update_state(snapshot, *, branch, provider_count, status)` threads one prop set into the framework strips' reactives once per projected snapshot. The TS `Composer` (its software caret + inline suggestion window) is deleted on port — the framework `PromptEditor`, fed the `input` autocomplete providers, replaces the whole input row.
+
+## Source Files
+
+Internal source (`induscode-python-rebuild/src/induscode/console`):
+
+- `theme/palette.py` — the four accent ramps + `PALETTES`.
+- `theme/tokens.py` — `derive_tokens` + `luminance` (the hex math).
+- `theme/adapter.py` — `framework_colors` projection + `theme_bundle` boundary.
+- `theme/resolve.py` — `THEMES` table + `resolve_theme` + `THEME_SCHEMES`.
+- `input/intents.py` — `ConsoleVerb` vocabulary + `INTENT_TABLE` + `EDITOR_DELEGATED`.
+- `input/chord.py` — `advance_chord` double-tap latch + `advance_exit_window` Ctrl+C machine.
+- `input/providers.py` — `complete_at` core + the framework `AutocompleteProvider` adapters.
+- `input/dir_reader.py` — the `DirReader` `os.scandir` seam.
+- `components/banner.py`, `emblem.py`, `banner_sweep.py`, `status_bar.py` — the chrome widgets.
+- `contract.py` — `ThemePalette` / `ThemeTokens` / `ConsoleTheme` / `ThemeScheme` / `DEFAULT_SCHEME` / `is_theme_scheme`.
+
+See [Console overview](/python-cli/console/overview) for how the surface wires these together, [Dialogs](/python-cli/console/dialogs) for the theme/model overlay flows, and [Slash commands](/python-cli/console/slash-commands) for the registry the completion core matches against.

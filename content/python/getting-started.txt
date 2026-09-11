@@ -1,0 +1,277 @@
+# Getting Started
+
+> `indusagi` is the terminal-first AI coding-agent framework for Python. It ships
+> both the `pindusagi` CLI and an embeddable library surface organized by capability
+> layer. Install with `pip install indusagi`, then `import indusagi` (or a single
+> subpackage such as `import indusagi.llmgateway`).
+
+## Table of Contents
+
+- [Install](#install)
+- [The Agent library quickstart](#the-agent-library-quickstart)
+- [Gateway-direct quickstart](#gateway-direct-quickstart)
+- [The pindusagi CLI quickstart](#the-pindusagi-cli-quickstart)
+- [Auth and credentials](#auth-and-credentials)
+- [Notes](#notes)
+
+## Install
+
+```bash
+pip install indusagi
+```
+
+The core install pulls in only the wire-level dependencies (`httpx`, `pydantic`,
+`wcwidth`, `python-ulid`, `regex`) — no vendor SDKs. Two optional extras add the
+interactive surface and external-tool mounting:
+
+```bash
+# interactive Textual TUI + syntax highlighting + markdown rendering
+pip install "indusagi[tui]"
+
+# Model Context Protocol server mounting
+pip install "indusagi[mcp]"
+
+# both at once
+pip install "indusagi[mcp,tui]"
+```
+
+`indusagi` requires **Python 3.11+**. Installing it also registers two equivalent
+console scripts, `indusagi` and `pindusagi`, both wired to
+`indusagi.shell_app.cli:run`.
+
+Confirm the install and read the version the way the runtime does — it is resolved
+from package metadata, never hardcoded:
+
+```python
+import indusagi
+
+print(indusagi.__version__)   # e.g. '0.1.2' when installed
+print(indusagi.VERSION)       # same value
+
+# Subsystems are lazily re-exported as namespaces:
+gw = indusagi.gateway         # -> indusagi.llmgateway
+rt = indusagi.runtime         # -> indusagi.runtime
+```
+
+## The Agent library quickstart
+
+The high-level entry point is the [`Agent`](/python/facades/agent) class from
+`indusagi.agent`. You construct one, attach a tool collection bound to a working
+directory, and drive it with `await agent.prompt(...)`. The whole surface is
+`async`/`await`.
+
+```python
+import asyncio
+from indusagi.agent import Agent, create_coding_tools
+
+async def main():
+    agent = Agent()
+    agent.set_model("claude-sonnet-4")           # a catalog id (see the gateway)
+    agent.set_system_prompt("You are a helpful coding assistant.")
+    agent.set_tools(create_coding_tools("/path/to/project"))
+
+    # Tap the live event stream; subscribe() returns an unsubscribe disposer.
+    unsubscribe = agent.subscribe(lambda ev: print(ev.type))
+
+    # prompt() drives the run to settlement; it returns None — results land
+    # on agent.state.messages.
+    await agent.prompt("explain this repository")
+    unsubscribe()
+
+    for msg in agent.state.messages:
+        print(getattr(msg, "role", None))
+
+asyncio.run(main())
+```
+
+`Agent()` accepts an optional `AgentOptions` mapping (or kwargs) — `steering_mode`,
+`follow_up_mode`, `session_id`, `get_api_key`, `thinking_budgets`, and a few more.
+The model is set with `set_model(...)`, tools with `set_tools(...)`, and the system
+preamble with `set_system_prompt(...)`. The provider key (e.g. `ANTHROPIC_API_KEY`)
+is read from the environment automatically.
+
+`create_coding_tools(cwd)` builds the read/write/bash/edit/process/todo/web tool set;
+`create_read_only_tools(cwd)` is the safe subset (read/grep/find/ls/todoread/web).
+You can also `steer()` a live run, queue `follow_up()` prompts, `abort()`, and
+`await agent.wait_for_idle()`:
+
+```python
+import asyncio
+from indusagi.agent import Agent, create_read_only_tools
+
+async def main():
+    agent = Agent(steering_mode="one-at-a-time", follow_up_mode="all")
+    agent.set_model("claude-sonnet-4")
+    agent.set_tools(create_read_only_tools("."))
+    agent.set_thinking_level("medium")
+
+    task = asyncio.create_task(agent.prompt("survey the codebase"))
+    agent.steer("focus on the agent package")        # folds into the live run
+    agent.follow_up("now summarize what you found")  # held until idle
+    await task
+    await agent.wait_for_idle()
+
+asyncio.run(main())
+```
+
+See [Agent facade](/python/facades/agent) for the full surface (sessions, custom
+message kinds, the event vocabulary) and [Capabilities](/python/subsystems/capabilities)
+for the built-in tools.
+
+## Gateway-direct quickstart
+
+If you only need raw model access — no agent loop, no tools — talk straight to the
+[LLM Gateway](/python/subsystems/llm-gateway). It resolves a model id to a `ModelCard`,
+routes to the connector that speaks the card's wire dialect, and returns either a
+streaming channel of `Emission`s (`stream`) or an assembled `Reply` (`complete`).
+
+```python
+import asyncio
+from indusagi.llmgateway import (
+    complete, get_card, estimate_cost,
+    Conversation, UserTurn, TextBlock, StreamOptions,
+)
+
+async def main():
+    convo = Conversation(
+        turns=(UserTurn(blocks=(TextBlock(text="summarize the repo"),)),),
+        system="Be terse.",
+    )
+    opts = StreamOptions(temperature=0.2, max_output_tokens=512, thinking="low")
+
+    reply = await complete("claude-sonnet-4", convo, opts)
+    print(reply.stop, reply.usage)
+
+    card = get_card("claude-sonnet-4")        # context window / pricing / wire dialect
+    if card:
+        print(estimate_cost(card, reply.usage), "USD")
+
+asyncio.run(main())
+```
+
+`stream()` is synchronous and lazy — nothing hits the network until you iterate, and
+the returned channel is re-iterable (re-iterating re-issues the request):
+
+```python
+import asyncio
+from indusagi.llmgateway import stream, Conversation, UserTurn, TextBlock
+from indusagi.llmgateway import TextEmission, DoneEmission
+
+async def main():
+    convo = Conversation(turns=(UserTurn(blocks=(TextBlock(text="hello"),)),))
+    channel = stream("claude-sonnet-4", convo)   # no I/O yet
+    async for emission in channel:                # I/O happens here
+        if isinstance(emission, TextEmission):
+            print(emission.delta, end="")
+        elif isinstance(emission, DoneEmission):
+            print("\nstop:", emission.reply.stop)
+
+asyncio.run(main())
+```
+
+`get_card(id)` reaches beyond the curated cards (`claude-opus-4`, `claude-sonnet-4`,
+`gpt-4o`, `o3`, `gemini-2.5-pro`, `kimi-k2`, `mock-1`, …) into the full generated
+catalog as a fallback; unknown ids raise an `unsupported` `GatewayError`. The
+`models()` fluent query (`.by_provider(...)`, `.by_api(...)`, `.reasoning(...)`,
+`.all()`, `.find(id)`) lists what is available.
+
+If you prefer the old-vocabulary (camelCase) facade — `Model`, `AssistantMessage`,
+`stream`/`complete` over message objects — use [`indusagi.ai`](/python/facades/ai)
+instead; it is a thin shim over the same gateway core.
+
+## The pindusagi CLI quickstart
+
+`pindusagi` is the command-line front door. The runner is selected from your flags:
+`-p` for one-shot print, `--json` for the wire protocol, and a bare invocation for
+the interactive TUI. Set the provider key for the model you intend to run first.
+
+```bash
+export ANTHROPIC_API_KEY="sk-..."
+
+# Version and usage (rendered from the flag table)
+pindusagi --version          # prints: indusagi <version>
+pindusagi --help
+
+# One-shot: print a single answer and exit
+pindusagi -m claude-sonnet-4 -p "summarize the pyproject.toml in this repo"
+
+# Wire mode: line-delimited JSON protocol over stdio (also --rpc / --wire)
+pindusagi -m claude-sonnet-4 --json
+
+# Interactive Textual TUI (the default when attended; needs the [tui] extra)
+pindusagi -m claude-sonnet-4
+```
+
+The full flag vocabulary (the single source of truth is the `FLAG_SPECS` table):
+
+| Flag | Aliases | Kind | Purpose |
+|------|---------|------|---------|
+| `--model` | `-m` | string | Catalog model id (else `settings.default_model`, else `claude-sonnet-4`) |
+| `--print` | `-p` | boolean | One-shot print mode: stream the answer, then exit |
+| `--json` | `--rpc`, `--wire` | boolean | NDJSON wire protocol over stdio |
+| `--interactive` | `-i` | boolean | Force the interactive REPL/TUI |
+| `--cwd` | — | string | Working directory for tools |
+| `--system` | — | string | Override the system prompt |
+| `--no-tools` | — | boolean | Disable all built-in tools |
+| `--mcp` | — | string (repeatable) | Mount an MCP server (URL → SSE, else a stdio command) |
+| `--help` | `-h` | boolean | Render usage and exit |
+| `--version` | `-v` | boolean | Print the version and exit |
+
+The launcher derives one `RunnerMode` (`print` / `wire` / `repl` / `help` / `version`)
+via a fixed precedence ladder: help > version > json/wire > interactive > print >
+(attended ? repl : print). So an unattended pipe defaults to `print` and an attended
+terminal defaults to the interactive TUI.
+
+Attach external Model Context Protocol servers by repeating `--mcp` — an `http(s)`
+URL becomes an SSE server (id from hostname), anything else is split into a stdio
+command (id from basename):
+
+```bash
+pindusagi -m claude-sonnet-4 --mcp ./my-server --mcp https://tools.example.com -p "what tools do you have?"
+```
+
+You can also drive the CLI in-process from Python — `main(argv)` returns an exit code
+and never calls `sys.exit`:
+
+```python
+import asyncio
+from indusagi.shell_app import main
+
+# Equivalent to: pindusagi --print "explain this repo"
+exit_code = asyncio.run(main(["--print", "explain", "this", "repo"]))
+print("exited with", exit_code)
+```
+
+See [Shell App](/python/subsystems/shell-app) for the boot pipeline and runner
+internals, and [CLI reference](/python/reference/cli) for the complete flag and mode
+documentation.
+
+## Auth and credentials
+
+The `auth` subcommand bypasses flag parsing and manages stored credentials
+(`login` / `refresh` / `status`):
+
+```bash
+pindusagi auth login anthropic    # API-key first: prints an ANTHROPIC_API_KEY hint
+pindusagi auth login openai       # OAuth-capable provider (paste-based PKCE flow)
+pindusagi auth status             # show what is stored
+pindusagi auth refresh openai     # refresh an OAuth token
+```
+
+For Anthropic the simplest path is to set `ANTHROPIC_API_KEY` in the environment;
+`auth login anthropic` just prints that hint and exits. Other providers read their
+own env keys (`OPENAI_API_KEY`, `GEMINI_API_KEY`, etc.) through the gateway's
+`SECRET_TABLE`. Persisted credentials live under this build's own profile directory,
+`~/.pindusagi/auth.json` (override the home root with `INDUSAGI_HOME`).
+
+## Notes
+
+- Requires **Python 3.11+**; the package is `indusagi` on PyPI.
+- Two equivalent console scripts are installed: `pindusagi` and `indusagi` (both →
+  `indusagi.shell_app.cli:run`).
+- The interactive TUI needs the `[tui]` extra; MCP mounting needs `[mcp]`.
+- State (settings, sessions, auth, logs) lives under `~/.pindusagi/` by default;
+  set `INDUSAGI_HOME` to relocate it.
+- No vendor SDKs are required — every provider is reached over raw HTTP via `httpx`.
+- For the full namespace and subpath map, see
+  [Package Exports](/python/reference/package-exports).

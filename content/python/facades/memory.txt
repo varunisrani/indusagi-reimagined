@@ -1,0 +1,257 @@
+# Memory
+
+> `indusagi.memory` is a deliberately empty facade module — `import indusagi.memory`
+> succeeds but exports nothing. It exists only for import-path parity. The real
+> conversational-memory work lives in the runtime compaction engine
+> (`indusagi.runtime.memory`), and the framework's private cancellation and
+> environment plumbing lives in `indusagi._internal`. This page documents all three.
+
+The "memory" label sits on three unrelated things in this codebase, and conflating
+them is the most common mistake. `indusagi.memory` (the facade) is a stub with zero
+symbols. `indusagi._internal` is the foundational shared-utility layer (cooperative
+cancellation, env-var registry, state directory). `indusagi.runtime.memory` is the
+actual context-condensation engine that keeps a conversation under the model's
+window. Each section below is honest about what it is and is not.
+
+## Table of Contents
+
+- [The memory facade is a stub](#the-memory-facade-is-a-stub)
+- [Internal cancellation](#internal-cancellation)
+- [Internal environment registry](#internal-environment-registry)
+- [The runtime memory engine](#the-runtime-memory-engine)
+- [Token estimation](#token-estimation)
+- [Compaction](#compaction)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## The memory facade is a stub
+
+`src/indusagi/memory.py` is a phantom module. Its entire body is:
+
+```python
+from __future__ import annotations
+
+__all__: list[str] = []
+```
+
+`import indusagi.memory` resolves and the module loads, but it has no exports. It is
+*not* re-exported by the package's top-level `__init__.py`. It exists purely so code
+written against the package layout keeps importing — the corresponding upstream
+facade was likewise an empty value-level module (only a type was declared on it).
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `__all__` | const | `memory.py` | An empty `list[str]`. The module exports nothing. |
+
+The module docstring is explicit: **do not add symbols to this module.** Agent
+memory is the runtime compaction engine described below, in a different package. If
+you are looking for where conversations get summarized, skip to
+[The runtime memory engine](#the-runtime-memory-engine).
+
+## Internal cancellation
+
+`indusagi._internal.cancel` provides cooperative cancellation for the whole
+framework. It is a queryable, multi-listener, chainable token — used in place of a
+raw OS/asyncio task abort. Cancellation is *cooperative*: holders poll a property or
+register a callback; nothing is forcibly killed. This is deliberate, so a tool can
+observe cancellation and still return a typed `is_error` result rather than having
+its coroutine torn down mid-flight.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `CancelToken` | class | `_internal/cancel.py` | One-shot, thread-safe, slots-based cancellation token shared across subsystems. |
+| `CancelledByToken` | class | `_internal/cancel.py` | The exception `raise_if_cancelled()` raises; carries `.reason`. |
+| `Callback` | type | `_internal/cancel.py` | `Callable[[], None]` — the listener signature. |
+
+`CancelToken` surface:
+
+| Member | Semantics |
+|--------|-----------|
+| `.cancelled` | `bool` property — has this token been cancelled. |
+| `.reason` | `str \| None` property — the reason passed to `cancel()`, if any. |
+| `cancel(reason=None)` | Flip the token once (idempotent), then fan out to listeners. |
+| `add_callback(cb) -> unsubscribe` | Register a listener; returns a disposer. Registering on an already-cancelled token fires `cb` immediately and returns a no-op disposer. |
+| `child() -> CancelToken` | A new token cancelled when this one is, but not vice versa. |
+| `raise_if_cancelled()` | Raise `CancelledByToken(reason)` if cancelled, else return. |
+
+```python
+from indusagi._internal.cancel import CancelToken, CancelledByToken
+
+token = CancelToken()
+stop = token.add_callback(lambda: print("aborting work"))
+
+# ... later, from any thread:
+token.cancel("user pressed esc")   # prints "aborting work"
+print(token.cancelled, token.reason)   # True 'user pressed esc'
+
+# Cooperative check inside a long loop:
+try:
+    token.raise_if_cancelled()
+except CancelledByToken as e:
+    print("stopped:", e.reason)
+
+child = token.child()   # propagates cancellation downward only
+stop()                  # disposer is safe to call any time
+```
+
+Two design points matter. First, `CancelledByToken` subclasses plain `Exception`,
+**not** `asyncio.CancelledError` — framework code never swallows real task
+cancellation, so the two are kept distinct. Second, exceptions raised by listeners
+during the `cancel()` fan-out are swallowed by design: one bad listener can never
+break the cancellation broadcast to the others.
+
+## Internal environment registry
+
+`indusagi._internal.env` is the single sanctioned place to read environment
+variables. Subsystems do not touch `os.environ` directly — they go through these
+helpers so every branded variable is resolved one way.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `env_name` | function | `_internal/env.py` | Brand a suffix into an `INDUSAGI_`-prefixed name: `env_name("home") -> "INDUSAGI_HOME"`. |
+| `read_env` | function | `_internal/env.py` | Read the branded var for a suffix: `os.environ.get(env_name(suffix))`. |
+| `read_raw` | function | `_internal/env.py` | Escape hatch for non-branded names (e.g. `AWS_REGION`). |
+| `indusagi_home` | function | `_internal/env.py` | The framework state directory as a `Path`. |
+| `ENV_PREFIX` | const | `_internal/env.py` | `"INDUSAGI"` — the brand prefix `env_name` applies. |
+
+`env_name` uppercases the suffix and replaces `-` with `_` before prefixing.
+`indusagi_home()` returns `$INDUSAGI_HOME` (expanded) when set, otherwise
+`~/.pindusagi`:
+
+```python
+from indusagi._internal.env import env_name, read_env, read_raw, indusagi_home
+
+print(env_name("agent-dir"))   # "INDUSAGI_AGENT_DIR"
+log_level = read_env("log")    # reads INDUSAGI_LOG, or None
+region = read_raw("AWS_REGION")  # non-branded, literal name
+state_dir = indusagi_home()    # Path("~/.pindusagi") or $INDUSAGI_HOME
+```
+
+The Python build's state directory is `~/.pindusagi`, intentionally separate from any
+other install's state directory — the Python build owns it and never reads or writes a
+different layout's store. The `auth.json` *format* remains byte-compatible, but the
+store itself is no longer shared.
+
+## The runtime memory engine
+
+`indusagi.runtime.memory` is where conversational memory actually happens. When a
+history's estimated footprint approaches the model's context window, the engine
+replaces the oldest stretch of turns with a single distilled summary turn while
+keeping a verbatim tail of recent turns. The barrel exposes a cheap token estimator
+plus the four-part condensation flow: decide, locate, distill, stitch.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `estimate_context_tokens` | function | `runtime/memory/estimate.py` | Coarse token estimate of a turn sequence. |
+| `should_compact` | function | `runtime/memory/compactor.py` | Decide whether history warrants condensation. |
+| `find_cut_point` | function | `runtime/memory/compactor.py` | Locate the tool-safe prefix/tail boundary. |
+| `summarize` | async function | `runtime/memory/compactor.py` | Distill a stretch of turns into one synthetic turn. |
+| `compact` | async function | `runtime/memory/compactor.py` | Top-level condensation: returns `(summary, *tail)`. |
+
+Import directly from the subpackage — the `runtime/__init__.py` barrel does not
+re-export these:
+
+```python
+from indusagi.runtime.memory import (
+    estimate_context_tokens,
+    should_compact,
+    find_cut_point,
+    summarize,
+    compact,
+)
+```
+
+## Token estimation
+
+`estimate_context_tokens(messages)` returns a non-negative `int` approximating the
+token footprint of a `Sequence[Turn]`. It is a heuristic, not a real tokenizer: a
+provider-specific tokenizer is costly to run on every turn, so this sums the
+character counts of every block, divides by `CHARS_PER_TOKEN` (4) via `math.ceil`,
+and adds `TURN_OVERHEAD_TOKENS` (4) per turn for role/message framing.
+
+Per-block character counts: `TextBlock`/`ThinkingBlock` contribute their prose
+length; `ToolCallBlock` contributes its name plus serialized arguments;
+`ToolResultBlock` contributes its serialized output; `ImageBlock` contributes its
+base64 payload length; unrecognized blocks contribute nothing. Non-string values are
+serialized with compact separators and `ensure_ascii=False` so the character count
+stays consistent.
+
+```python
+from indusagi.runtime.memory import estimate_context_tokens
+
+tokens = estimate_context_tokens(conversation_turns)
+print(tokens)   # e.g. 5120
+```
+
+The estimate intentionally leans toward over-triggering condensation slightly rather
+than overflowing the window.
+
+## Compaction
+
+`should_compact(messages, model, cfg=None)` returns `True` when the estimate reaches
+`model.context_window * policy.trigger_ratio`. It returns `False` for a non-positive
+context window (nothing meaningful to compare against), and falls back to
+`DEFAULT_POLICY` when `cfg` is `None`.
+
+`DEFAULT_POLICY` is `CompactionPolicy(trigger_ratio=0.8, keep_recent=8)` — condense
+at 80% of the window, keep the 8 most recent turns verbatim. `CompactionPolicy` is a
+frozen dataclass from the runtime contract.
+
+`find_cut_point(messages, keep_recent)` returns the index of the first turn that
+survives verbatim. The tail nominally starts at `len - keep_recent`, but the boundary
+is then nudged *forward* (shrinking the tail, enlarging the condensed prefix) while
+the candidate first-kept turn carries a `ToolResultBlock` — so a `tool_call` and its
+`tool_result` are never split across the boundary. `0` means condense nothing; `len`
+means condense everything.
+
+`summarize(messages, invoke)` is the distillation step. It renders the turns into a
+role-prefixed transcript, builds a `Conversation` whose system preamble is the
+distillation instruction and whose single user turn is that transcript, invokes the
+injected `ModelInvoker`, drains the streamed `Channel`, and returns one synthetic
+turn. The summary is filed under the **`user`** role (not assistant or system) so it
+stays valid input regardless of which provider runs next, and is prefixed with the
+`SUMMARY_HEADING` `[condensed earlier context]`.
+
+`compact(messages, model, cfg, invoke)` is the top-level entry point:
+
+```python
+from indusagi.runtime.memory import compact
+
+# `invoke` is a ModelInvoker: Callable[[Conversation, StreamOptions], Channel]
+new_history = await compact(messages, model, cfg=None, invoke=invoke)
+# Returns (summary, *tail) when there is a prefix worth condensing,
+# otherwise the original history unchanged.
+```
+
+`compact` resolves the policy (falling back to `DEFAULT_POLICY`), finds the tool-safe
+cut, summarizes the prefix, and returns `(summary, *tail)`. When the cut point is
+`<= 0` it returns the input unchanged, so it is safe to call unconditionally. The
+`model` argument is accepted for signature parity and is immediately discarded
+(`del model`); only the policy and invoker drive the work.
+
+A note on the live caller: the conductor in [Runtime](/python/subsystems/runtime)
+guards against an infinite compaction loop by only invoking the costly summarizer when
+`find_cut_point > 1`. Once a history is already minimal there is nothing left to
+condense. The condensation gate reads the live conversation snapshot, not a captured
+payload — a deliberately preserved behavior.
+
+## Relationship to neighbors
+
+The three pieces have very different fan-out.
+
+`indusagi.memory` (the stub) is a leaf with no dependencies and no dependents.
+
+`indusagi._internal` is foundational and consumed broadly. `CancelToken` threads
+through the [Agent Facade](/python/facades/agent), [MCP](/python/facades/mcp) clients,
+[Connectors](/python/subsystems/connectors), gateway streaming, the
+[Capabilities](/python/subsystems/capabilities) tools, and [Runtime](/python/subsystems/runtime)
+dispatch. The `env` helpers feed [Shell App](/python/subsystems/shell-app) discovery,
+agent sessions, API-key resolution, credentials, and the cloud connectors.
+
+`indusagi.runtime.memory` depends *upward* on the [LLM Gateway](/python/subsystems/llm-gateway)
+contract (`Block`/`Turn`/`Conversation`/`ModelCard`/`StreamOptions`/`Channel` and the
+emission types) and on the runtime contract (`CompactionPolicy` and the `ModelInvoker`
+type alias `Callable[[Conversation, StreamOptions], Channel]`). Its only consumers are
+the [Runtime](/python/subsystems/runtime) conductor — the live compaction gate — and
+the [Interop](/python/subsystems/interop) protocol bridge.
+
+Back to the [Architecture overview](/python/architecture).

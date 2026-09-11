@@ -1,0 +1,294 @@
+# Testing
+
+> The `induscode` rebuild ships a 703-test, network-free `pytest` suite under
+> `tests/`. Run it with `.venv/bin/python -m pytest`. Every test runs against a
+> mock connector and the Textual `Pilot` driver — no LLM calls, no real home
+> directory, no sleeps.
+
+## Table of Contents
+
+- [Running the suite](#running-the-suite)
+- [Hermetic discipline](#hermetic-discipline)
+- [Layout: one directory per subsystem](#layout-one-directory-per-subsystem)
+- [Coverage map](#coverage-map)
+- [The two root guards](#the-two-root-guards)
+- [Three layers of fidelity](#three-layers-of-fidelity)
+- [The console end-to-end harness](#the-console-end-to-end-harness)
+- [Key fixtures and helpers](#key-fixtures-and-helpers)
+- [The 703 vs 683 gap](#the-703-vs-683-gap)
+- [Framework as a test dependency](#framework-as-a-test-dependency)
+
+## Running the suite
+
+There is no `conftest.py` and no shared-fixtures module — every test file
+defines its own fakes inline. All configuration lives in `pyproject.toml`
+under `[tool.pytest.ini_options]`:
+
+```toml
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+```
+
+`asyncio_mode = "auto"` means the ~240 `async def test_*` functions (mostly the
+Textual `Pilot` drives) run under `pytest-asyncio` with no per-test marker.
+`testpaths = ["tests"]` pins collection to the `tests/` tree.
+
+```bash
+cd induscode-python-rebuild
+
+# the whole suite — 703 tests, mock connector + Textual Pilot
+.venv/bin/python -m pytest
+```
+
+Run one subsystem, or one file:
+
+```bash
+# 110 catalog/matcher/serialize/submit/queue/fork cases
+.venv/bin/python -m pytest tests/conductor/
+
+# the scripted Pilot end-to-end scenarios over the real ConsoleApp
+.venv/bin/python -m pytest tests/console/test_e2e_pilot.py
+```
+
+Reproduce the per-directory collected count yourself:
+
+```bash
+.venv/bin/python -m pytest --collect-only -q \
+  | grep '::' \
+  | sed -E 's#tests/([^/]+)/.*#\1#' \
+  | sort | uniq -c | sort -rn
+# 324 console, 110 conductor, 36 console_slash, 34 launch, 34 capability_deck, 33 boot, ...
+```
+
+## Hermetic discipline
+
+The whole suite is sealed off from the outside world along three axes:
+
+| Axis | Rule | How it is enforced |
+|------|------|--------------------|
+| No network | Nothing talks to a real model | A mock connector / `ScriptedConductor` stands in for the LLM and streams deterministic deltas |
+| No real home | No test touches `~/.pindusagi/` | Every disk test runs under `tmp_path`, with `BRAND.env_profile_dir` (`INDUSAGI_CODING_AGENT_DIR`) pinned beneath it and `INDUSAGI_HOME` deleted |
+| No sleeps | No wall-clock timing | Textual `Pilot.pause()`, the bounded `wait_until()` poller, and `app.workers.wait_for_complete()` synchronize against the message pump instead |
+
+This makes the suite deterministic and fast (full collection in ~1s) — and it
+makes streaming and abort moments observable without races, because the
+[Conductor](/python-cli/subsystems/conductor) fake can park mid-stream rather
+than depending on real latency.
+
+## Layout: one directory per subsystem
+
+`tests/` mirrors `src/induscode/` one-to-one: `tests/<subsystem>/test_*.py`
+maps to `src/induscode/<subsystem>/`. Two flat files at the `tests/` root guard
+the package as a whole (see [the two root guards](#the-two-root-guards)).
+
+```
+tests/
+├── test_public_api.py        # frozen-contract / lazy-barrel guard
+├── test_scaffold.py          # M0 version, BRAND identity, Workspace paths
+├── console/                  # 13 files — the interactive surface
+├── conductor/                # catalog, submit, queue/fork, contract+hub+skill
+├── console_slash/            # the framework-backed slash registry
+├── launch/                   # the flag table, usage, package command
+├── capability_deck/          # the tooling layer + MCP bridge ledger
+├── boot/                     # the launch orchestrator
+├── runtime_bridge/           # external-runtime provider routing
+├── addons/                   # the addon host pipeline
+├── settings/                 # the PreferenceStore
+├── window_budget/            # context-window budgeting
+├── kit/                      # leaf helpers
+├── briefing/                 # system-prompt composition
+├── sessions/                 # the SessionLibrary
+├── insight/                  # the tracing wrapper
+├── transcript_export/        # markdown/highlight export
+└── channels/                 # the non-interactive channels
+```
+
+## Coverage map
+
+The 703 collected tests break down by top-level directory as follows. Each
+file's docstring names the source area it exercises.
+
+| Directory | Tests | What it covers |
+|-----------|------:|----------------|
+| `console/` | 324 | Reducer, input/intents/chords/completion, theme, banner + chrome, overlays (`ModalKind` router), startup survey, the slash handler + command groups (dynamic / integrations / transcript / workbench), and the two Pilot files (`test_console_app.py`, `test_e2e_pilot.py`). See [Console overview](/python-cli/console/overview). |
+| `conductor/` | 110 | `catalog_store` (tolerant catalog gate, `ModelMatcher` scoring constants, transcript-tree append/branch/fork, NDJSON serialize round-trip), submit/resume behavior, queue + fork, and contract + signal-hub + skill-parse. See [Conductor](/python-cli/subsystems/conductor). |
+| `console_slash/` | 36 | The framework-backed slash registry (`build_registry`, `Handled`) exercised end-to-end with no TUI and no real conductor. See [Slash commands](/python-cli/console/slash-commands). |
+| `launch/` | 34 | The flag table and `read_invocation` parser, usage renderer, plus the package command. See [Launch](/python-cli/subsystems/launch). |
+| `capability_deck/` | 34 | The contract + bridge-ledger (pure, `python-ulid` keys) and card provisioning / novel cards. See [Capability Deck](/python-cli/subsystems/capability-deck). |
+| `boot/` | 33 | `tokenize_invocation` flag→mode mapping, `--help`/`--version` short-circuit, workspace resolution, idempotent `apply_upgrades`, `run_stages` `BootContext`, `select_runner`; plus the invocation projection, the `--resume` picker seam, and session-persist integration. See [Boot](/python-cli/subsystems/boot). |
+| `runtime_bridge/` | 18 | External-runtime provider routing. See [Runtime Bridge](/python-cli/subsystems/runtime-bridge). |
+| `addons/` | 14 | The addons host pipeline (no real import, no disk for host-pipeline cases). See [Addons](/python-cli/subsystems/addons). |
+| `settings/` | 11 | The `PreferenceStore`. See [Settings](/python-cli/configuration/settings). |
+| `window_budget/` | 10 | Context-window budgeting incl. the condense-scope branch digest. See [Window Budget](/python-cli/subsystems/window-budget). |
+| `kit/` | 10 | The leaf helper kit. |
+| `briefing/` | 10 | System-prompt composition. See [Briefing](/python-cli/subsystems/briefing). |
+| `sessions/` | 9 | The `SessionLibrary`. See [Sessions](/python-cli/subsystems/sessions). |
+| `insight/` | 9 | The tracing wrapper over the framework. See [Insight](/python-cli/subsystems/insight). |
+| `transcript_export/` | 8 | The markdown/highlight transcript export (`markdown-it-py` + `pygments`). See [Transcript Export](/python-cli/subsystems/transcript-export). |
+| `channels/` | 8 | The non-interactive channels. See [Channels](/python-cli/subsystems/channels). |
+| `test_public_api.py` | 7 | The frozen-contract / lazy-barrel guard. |
+| `test_scaffold.py` | 17 | The M0 version / brand / workspace gate. |
+
+## The two root guards
+
+Two flat files sit at the root of `tests/` and verify the package as a whole
+rather than any one subsystem.
+
+### `tests/test_public_api.py` — the frozen-contract guard
+
+This file proves the public surface stays frozen and the lazy barrel stays
+lazy. See [Package exports](/python-cli/reference/package-exports) for the
+contract it enforces.
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `EXPECTED_SUBSYSTEMS` | const | The 17-name tuple (`addons`, `boot`, `briefing`, `capability_deck`, `channels`, `conductor`, `console`, `console_slash`, `insight`, `kit`, `launch`, `runtime_bridge`, `sessions`, `settings`, `transcript_export`, `window_budget`, `workspace`) the top-level barrel must lazily re-export. |
+| `test_all_modules_import` | function | Walks every module under `induscode` via `pkgutil.walk_packages` and imports each — the import-can't-fail gate. |
+| `test_declared_exports_resolve` | function | For every module's `__all__`, asserts the list is sorted and every named symbol resolves — the frozen-contract discipline. |
+| `test_barrel_reexports_every_subsystem` | function | Asserts each `EXPECTED_SUBSYSTEMS` name resolves through the barrel and re-exports the matching `induscode.<name>` package. |
+| `test_barrel_subsystems_match_packages` | function | Cross-checks `EXPECTED_SUBSYSTEMS` against both the on-disk packages and `induscode._SUBSYSTEMS`. |
+| `test_bare_import_is_side_effect_free` | function | Runs `import induscode` in a clean subprocess and asserts no `textual.*` and no `induscode` subsystem (beyond `workspace`/`brand`/`locator`) got eagerly loaded — proves the PEP 562 lazy barrel. |
+
+`EXPECTED_SUBSYSTEMS` is hardcoded here on purpose — kept in the test, not
+imported from the barrel, so a regression that silently drops a subpackage is
+caught. Adding or removing a subpackage requires editing this tuple, or several
+of these tests fail.
+
+### `tests/test_scaffold.py` — the M0 gate
+
+This file pins identity and path resolution:
+
+- **Version single-sourcing.** It reads the version from
+  `importlib.metadata.version("induscode")` with *no* hardcoded literal, so a
+  version bump in `pyproject.toml` never requires a test edit. It asserts
+  `induscode.__version__ == induscode.VERSION == metadata.version("induscode")`.
+- **Frozen `BRAND` identity.** `BRAND.name == "induscode"`,
+  `BRAND.profile_dir_name == ".pindusagi"` (the flat root — state lives at
+  `~/.pindusagi/`), `BRAND.bin_names == ("pindus", "induscode")`, and
+  `BRAND.env_profile_dir == "INDUSAGI_CODING_AGENT_DIR"`.
+- **Sandboxed `Workspace` path resolution** and the 15-key `LAYOUT`, asserted
+  against `induscode.workspace.LAYOUT`, the `Workspace` dataclass fields, and
+  the verbatim basenames.
+
+```python
+TS_LAYOUT_KEYS = (...)   # 15 layout keys, snake-cased
+# asserted against induscode.workspace.LAYOUT and Workspace dataclass fields
+```
+
+## Three layers of fidelity
+
+Tests come in three layers of increasing integration:
+
+1. **Pure-data unit tests** over dependency-free reducers, folds, and matchers.
+   `tests/console/test_reducer.py` folds events through `console_reducer`
+   asserting purity and no-op identity; `tests/conductor/test_catalog_store.py`
+   pins `ModelMatcher` scoring constants and NDJSON serialize round-trips.
+
+   ```python
+   from induscode.console import init_console_state, console_reducer, RowsAppend, ViewRow
+
+   state = init_console_state()
+   nxt = console_reducer(state, RowsAppend(row=ViewRow(id="r1", kind="answer", text="hi")))
+   assert nxt is not state and len(state.rows) == 0   # input state untouched
+   ```
+
+2. **Protocol / seam tests** over injected stubs — `CatalogSource` stubs, the
+   `memory_backend` / `fs_backend` stores, and the `SessionConductor` protocol
+   faked by `ScriptedConductor`.
+
+3. **Full Textual end-to-end drives** in `tests/console/test_e2e_pilot.py` and
+   `tests/console/test_console_app.py` that mount the real `ConsoleApp` via
+   `app.run_test(size=...)` and drive it through `Pilot`.
+
+## The console end-to-end harness
+
+The e2e files mount the actual `ConsoleApp` and drive it the way a user would —
+typing keys, clicking, escaping — then synchronize against the message pump.
+
+```python
+app, scripted = build_app(tmp_path)
+async with app.run_test(size=(100, 40)) as pilot:
+    await pilot.pause()
+    await pilot.press("h", "i", "enter")
+    await app.workers.wait_for_complete()
+    assert scripted.submitted == ["hi"]
+```
+
+These tests go further than buffer checks: they read
+`app.screen._compositor.render_strips()` to assert against the actually-painted
+terminal cells (and caret visibility). That is a deliberate fix — a regression
+where the prompt box drew its border but the content row stayed blank slipped
+past buffer-only checks (`editor.get_text()`) and only a rendered-cell assertion
+caught it. Several e2e classes are explicit regression pins with long
+explanatory docstrings:
+
+| Test class | Bug it pins |
+|------------|-------------|
+| `TestEditorRendersTypedText` | The prompt box drew its border but the content row was blank — asserts against rendered cells. |
+| `TestEditorKeyboardFocus` | Text could not be typed into the composer — documents the non-focusable-scroll-containers fix. |
+
+## Key fixtures and helpers
+
+Because there is no `conftest.py`, the same fake patterns recur per-file. The
+central console e2e helpers in `tests/console/test_e2e_pilot.py`:
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `ScriptedConductor` | class | A deterministic fake satisfying the `SessionConductor` protocol (~25 methods implemented inline). `submit()` streams scripted `TextSignal` deltas and can park mid-stream (`hold_turn_end` / hang) so a Pilot test observes the live tail or aborts at a precise point. |
+| `build_app` | function | Assembles a real `ConsoleApp` over a fresh `ScriptedConductor` with the live transcript + workbench slash groups; returns `(app, scripted)` for `app.run_test()` drives. |
+| `wait_until` | async function | A bounded message-pump poll helper (a `pilot.pause` loop, default 100 tries) — the no-sleep synchronization primitive used throughout the console e2e tests. |
+| `make_services` | function | Builds an `OverlayServices` wiring a `PreferenceStore.at_paths`, a `SessionLibrary`, a `FakeVault`, and stubbed login callbacks over `tmp_path` for overlay scenarios. |
+
+The boot sandbox fixture in `tests/boot/test_boot.py`:
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `sandbox_home` | fixture | Gives a fresh `tmp_path` home with `BRAND.env_profile_dir` pinned beneath it and `INDUSAGI_HOME` deleted, so `boot()` resolves a hermetic workspace. |
+
+And the reducer exhaustiveness pin in `tests/console/test_reducer.py`:
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `_REPRESENTATIVES` | const | One `ConsoleEvent` per discriminant fed through `console_reducer` — the analogue of union-exhaustiveness, asserted to cover all `CONSOLE_EVENT_TYPES`. |
+
+## The 703 vs 683 gap
+
+The headline count is **703 collected tests** (confirmed by `pytest
+--collect-only`), while there are 683 raw `def test_` declarations. The 20-test
+gap is `@pytest.mark.parametrize` expansion — there are exactly three
+parametrize sites in the whole suite, two in
+`tests/conductor/test_catalog_store.py` and one in
+`tests/console/test_console_app.py`.
+
+## Framework as a test dependency
+
+The suite imports from both the package under test and the upstream `indusagi`
+framework it builds on — 21 test files import `from indusagi...`. That makes
+the suite an integration boundary, not a closed unit. Framework imports cluster
+on:
+
+| Framework area | Files | Used for |
+|----------------|------:|----------|
+| `indusagi.ai` | 11 | `AssistantMessage`, `UserMessage`, `TextContent`, `ToolCall`, `create_zero_usage`, … |
+| `indusagi.react_ink` | 9 | `ModelDialog`, `StatusMessage`, `UiDisplayBlock`, and the `components.editor.PromptEditor` / `components.messages.list.MessageList` / `components.display_block.DisplayBlockView` used in the Pilot e2e |
+| `indusagi.agent` | 3 | The custom message kinds `BashExecutionMessage` / `BranchSummaryMessage` / `CompactionSummaryMessage` / `CustomMessage` |
+| `indusagi.tui.*` | — | Editor / keybindings / keys / autocomplete primitives |
+| `indusagi.llmgateway.credentials.oauth` | — | OAuth credential seam |
+
+Two consequences follow. First, the input tests in
+`tests/console/test_input.py` explicitly verify that editor verbs were
+*absorbed* by the framework's editor defaults rather than reimplemented, and
+the reducer's dropped buffer/caret/history event families are asserted *absent*
+because they moved into the framework editor core. See the framework's
+[react-ink](/python/ui/react-ink) and [TUI](/python/ui/tui) pages for those
+primitives.
+
+Second, the suite tests against the live framework source (an editable-installed
+`indusagi[mcp,tui]>=0.1.2`), so a framework change can break these tests even
+with no `induscode` change. The framework has its own
+[test suite](/python/reference/testing); this one sits on top of it.
+
+For the milestone-by-milestone parity ledger this suite encodes — most test-file
+docstrings carry explicit case counts like "all 16 cases" — see
+[Parity](/python-cli/reference/parity).

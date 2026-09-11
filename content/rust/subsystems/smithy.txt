@@ -1,0 +1,587 @@
+# Smithy
+
+> `indusagi::smithy` is the agent-builder meta-tool of the Rust edition — a config-driven and interactive "forge" that interviews a user, merges the answers over a starter profile into a validated `AgentBlueprint`, and instantiates it as a runnable runtime `Agent`. It is a `pub mod` inside the merged `indusagi` crate, re-exported from `crates/indusagi/src/smithy/mod.rs`.
+> Instead of shipping a family of near-identical `create_*_agent` factories, Smithy ships one data-driven generator: starter profiles supply partial blueprints, `define_agent` merges a spec over a profile and validates it, and `to_agent_config` bridges the finished blueprint onto the runtime's `AgentConfig` plus a real `ToolBox`. The `Forge` build session wires the five internal layers — config, persona, knowledge, runtime ledger, ui transcript — into one drivable interview behind a terminal-free `ForgeView` seam, so the whole flow is scriptable and testable with no real I/O.
+
+## Table of Contents
+
+- [Module layout](#module-layout)
+- [Public exports](#public-exports)
+- [Blueprints and tool collections](#blueprints-and-tool-collections)
+- [Validation and serialization](#validation-and-serialization)
+- [Starter profiles](#starter-profiles)
+- [The merge generator](#the-merge-generator)
+- [The runtime bridge](#the-runtime-bridge)
+- [The Forge build session](#the-forge-build-session)
+- [CLI flags](#cli-flags)
+- [The knowledge pack](#the-knowledge-pack)
+- [The tool ledger](#the-tool-ledger)
+- [The transcript projector and view seam](#the-transcript-projector-and-view-seam)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Module layout
+
+Smithy mirrors the clean-room TypeScript `smithy/` subsystem layer-for-layer. The
+tree under `crates/indusagi/src/smithy/` is six modules plus the forge conductor:
+
+| Path | Holds |
+|------|-------|
+| `smithy/config/flag_reader.rs` | The `FlagReader` finite-state machine, `SmithyConfig`, `FlagSpec`, `FLAG_TABLE`; reads Smithy's own CLI argv slice |
+| `smithy/persona/blueprint.rs` | `AgentBlueprint` shape + hand-rolled validation, the `ToolCollectionName` enum, and the (de)serialization helpers |
+| `smithy/persona/profiles.rs` | The `PROFILES` starter table (`coder`/`researcher`/`reviewer`) and its lookup helpers |
+| `smithy/persona/define_agent.rs` | The single `define_agent` merge generator and the `to_agent_config` runtime bridge |
+| `smithy/knowledge/loader.rs` | `load_knowledge` over the `include_dir!`-embedded `manifest.json` + `guides/*.md` |
+| `smithy/runtime/tool_ledger.rs` | The `ToolLedger` append-only account of tool executions and its summary types |
+| `smithy/ui/transcript.rs` | The `TranscriptModel` visitor, the sanitizers, and the `ForgeView`/`ConsoleForgeView` text seam |
+| `smithy/forge.rs` | The `Forge` build session conducting all of the above |
+
+Each `mod.rs` (`config`, `persona`, `knowledge`, `runtime`, `ui`) re-exports its
+leaf module's public surface; `smithy/mod.rs` flattens all of them so a consumer
+writes `use indusagi::smithy::{Forge, define_agent, …}`.
+
+## Public exports
+
+Almost everything below is flattened into `smithy/mod.rs` — the single import site
+for the subsystem, so a consumer writes `use indusagi::smithy::{Forge, …}`. The one
+exception is `FLAG_TABLE`, which `smithy/mod.rs` does *not* re-export; it is public
+from the `config` submodule only (`use indusagi::smithy::config::FLAG_TABLE`).
+
+### config — the flag FSM
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `FlagReader` | struct | `config/flag_reader.rs` | An explicit 3-state (`ExpectFlag`/`ExpectValue`/`Done`) FSM that reads Smithy's argv slice into a `SmithyConfig`; pure, no env/fs/process access |
+| `read_flags` | fn | `config/flag_reader.rs` | Convenience: read an argv slice into a `SmithyConfig` with a fresh `FlagReader` |
+| `SmithyConfig` | struct | `config/flag_reader.rs` | Resolved launch config: `profile`, `out`, `model`, `non_interactive`, `answers` |
+| `FlagSpec` | struct | `config/flag_reader.rs` | One row of the recognised-flag table: public `name` (a `SmithyFlagName`) and `spellings`, plus a private `kind` (`Switch`/`Single`/`Pair`) |
+| `FLAG_TABLE` | const | `config/flag_reader.rs` | The single source of recognised flags (public from `config`, *not* flattened into `smithy/mod.rs`) |
+| `SmithyFlagName` | enum | `config/flag_reader.rs` | `Profile` / `Out` / `Model` / `NonInteractive` / `Answer` |
+| `FlagError` | struct | `config/flag_reader.rs` | `thiserror`-derived error raised when an argv slice cannot be read into a valid `SmithyConfig` |
+
+### persona — blueprint, profiles, generator
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `AgentBlueprint` | struct | `persona/blueprint.rs` | The validated agent spec: `name` (kebab-case), `description`, `system_prompt` (serde `systemPrompt`), `tool_collection` (serde `toolCollection`), `model`, optional `tags` |
+| `BlueprintError` | struct | `persona/blueprint.rs` | Raised when a candidate fails validation; carries `issues: Vec<String>` of `path: message` strings |
+| `ToolCollectionName` | enum | `persona/blueprint.rs` | `ReadOnly` / `Coding` / `All` — the granted tool surface, kebab-case on the wire |
+| `validate_blueprint` | fn | `persona/blueprint.rs` | Validate a `serde_json::Value` as a blueprint, collecting every issue into a `BlueprintError` |
+| `try_validate_blueprint` | fn | `persona/blueprint.rs` | Non-`Result` variant: returns `Option<AgentBlueprint>` |
+| `serialize_blueprint` | fn | `persona/blueprint.rs` | Serialize to canonical, fixed-key-order, 2-space JSON (camelCase keys); omits `tags` when empty |
+| `deserialize_blueprint` | fn | `persona/blueprint.rs` | Parse JSON text back into a validated blueprint; bad JSON and schema failures both surface as `BlueprintError` |
+| `AgentSpec` | struct | `persona/define_agent.rs` | The minimum a caller supplies (`name` required; everything else `Option`) |
+| `define_agent` | fn | `persona/define_agent.rs` | The single generator: merge `AgentSpec` over a named profile over a baseline, then validate into an `AgentBlueprint` |
+| `to_agent_config` | fn | `persona/define_agent.rs` | Project a validated blueprint onto the runtime `AgentConfig`, resolving the tool collection into a real `ToolBox` |
+| `PROFILES` | fn | `persona/profiles.rs` | Returns the interned starter-profile table `&[(ProfileName, AgentProfile)]` |
+| `PROFILE_NAMES` | const | `persona/profiles.rs` | `[ProfileName; 3]` in order, for menus and validation |
+| `AgentProfile` | struct | `persona/profiles.rs` | A partial blueprint with `name` removed; every field `Option` |
+| `ProfileName` | enum | `persona/profiles.rs` | `Coder` / `Researcher` / `Reviewer` |
+| `get_profile` | fn | `persona/profiles.rs` | Look up a profile by name, returning `Option<AgentProfile>` |
+| `is_profile_name` | fn | `persona/profiles.rs` | Whether a string names a known profile |
+
+### knowledge — the embedded guide pack
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `load_knowledge` | fn | `knowledge/loader.rs` | Read the `include_dir!`-embedded `manifest.json` + markdown guide bodies into a `KnowledgePack` |
+| `KnowledgePack` | struct | `knowledge/loader.rs` | The pack: `version` + `Vec<Guide>`, with a `guide(id)` lookup |
+| `Guide` | struct | `knowledge/loader.rs` | A fully-loaded guide: manifest metadata plus the markdown `body` |
+| `GuideManifestEntry` | struct | `knowledge/loader.rs` | One guide's manifest entry before its body is attached |
+| `KnowledgeManifest` | struct | `knowledge/loader.rs` | Parsed shape of `manifest.json`: `version` + `Vec<GuideManifestEntry>` |
+| `KnowledgeError` | struct | `knowledge/loader.rs` | Raised when the pack cannot be loaded or fails its shape check |
+
+### runtime — session bookkeeping
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `ToolLedger` | struct | `runtime/tool_ledger.rs` | Append-only account of tool executions: `record`, `entries`, `summary`, `size`, `reset` |
+| `ToolEvent` | struct | `runtime/tool_ledger.rs` | A single invocation to remember: `tool`, `input`, `output`, `ok` |
+| `LedgerEntry` | struct | `runtime/tool_ledger.rs` | A settled row: the event fields plus stamped `seq` (1-based) and `at` (epoch ms) |
+| `LedgerSummary` | struct | `runtime/tool_ledger.rs` | Point-in-time digest: `total`/`ok`/`failed`/`tools` rollups plus a `by_tool` map of `ToolTally` |
+| `ToolTally` | struct | `runtime/tool_ledger.rs` | Per-tool slice: `calls`/`ok`/`failed` |
+
+### ui — the render seam
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `TranscriptModel` | struct | `ui/transcript.rs` | Table-driven visitor: `accept(turns)` sanitizes and projects gateway `Turn`s into a `RenderTranscript`; stateless |
+| `ForgeView` | trait | `ui/transcript.rs` | The terminal-free text seam: `show(line)` and async `ask(question)` |
+| `ConsoleForgeView` | struct | `ui/transcript.rs` | Default view: writes lines to stdout, reads a line off stdin per `ask` |
+| `format_transcript` | fn | `ui/transcript.rs` | Format a `RenderTranscript` into flat labelled lines for a `ForgeView::show` pipe |
+| `RenderTranscript` | struct | `ui/transcript.rs` | Result of `accept`: a `turns: Vec<RenderTurn>` plus a `redaction_count` |
+| `RenderTurn` | struct | `ui/transcript.rs` | A projected turn: a `RenderRole` plus its surviving `RenderBlock`s |
+| `RenderBlock` | struct | `ui/transcript.rs` | One sanitized fragment: `kind`, `label`, `text`, `redacted` |
+| `SanitizeOptions` | struct | `ui/transcript.rs` | Tunable thresholds: `max_length` (default 2000) and extra `secret_patterns` |
+| `DEFAULT_SANITIZE_OPTIONS` | fn | `ui/transcript.rs` | Default options used when a caller passes none |
+| `default_visitors` | fn | `ui/transcript.rs` | The default `VisitorTable` — one pure visitor per block kind |
+| `VisitContext` | struct | `ui/transcript.rs` | Per-block context: a `&SanitizeOptions` and the turn's `RenderRole` |
+| `BlockVisitor` | type | `ui/transcript.rs` | `Box<dyn Fn(&Block, &VisitContext) -> Option<RenderBlock> + Send + Sync>` |
+| `VisitorTable` | struct | `ui/transcript.rs` | The dispatch table: one `BlockVisitor` per block kind |
+| `RenderBlockKind` | enum | `ui/transcript.rs` | `Text` / `Thinking` / `ToolCall` / `ToolResult` / `Image` / `Command` |
+| `RenderRole` | enum | `ui/transcript.rs` | `User` / `Assistant` / `Tool` |
+
+### forge — the build session
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `Forge` | struct | `forge.rs` | The build-session conductor: `build_interactive`, `build_from_config`, `instantiate`, plus `ledger()` and `transcript()` |
+| `create_forge` | fn | `forge.rs` | Thin factory returning a `Forge`; takes `ForgeOptions` |
+| `ForgeOptions` | struct | `forge.rs` | Injectable collaborators: a full `Arc<dyn ForgeView>`, or an `ask`-only `AskFn` override |
+| `AskFn` | type | `forge.rs` | `Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = String> + Send>> + Send + Sync>` — the boxed async prompt seam |
+| `InterviewKey` | enum | `forge.rs` | `Name` / `Purpose` / `Tools` / `Model` — the interview answer keys |
+| `InterviewAnswers` | struct | `forge.rs` | Collected interview answers, one `Option<String>` per key |
+
+## Blueprints and tool collections
+
+An `AgentBlueprint` is the small declarative spec that fully determines a generated
+agent. It is *data plus validation* — the TS used a zod schema; the Rust port keeps
+the shape as a `serde`-derived struct and validates by hand. The wire shape is
+camelCase via `#[serde(rename = …)]`:
+
+```rust
+pub struct AgentBlueprint {
+    pub name: String,                          // kebab-case, 1..=64 chars
+    pub description: String,
+    #[serde(rename = "systemPrompt")]
+    pub system_prompt: String,
+    #[serde(rename = "toolCollection")]
+    pub tool_collection: ToolCollectionName,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tags: Option<Vec<String>>,
+}
+```
+
+`name` must match `^[a-z0-9][a-z0-9-]*$` and be 1–64 characters. The tool surface a
+blueprint grants is the three-variant `ToolCollectionName`, named to match — and
+kept intentionally identical to — the collections the [Capabilities layer](/rust/subsystems/capabilities)
+publishes:
+
+| Variant | Wire string (`as_str`) | Grants |
+|---------|------------------------|--------|
+| `ToolCollectionName::ReadOnly` | `"read-only"` | Observe the workspace and the web; never mutate |
+| `ToolCollectionName::Coding` | `"coding"` | Read-only plus write/edit/bash/todo/process |
+| `ToolCollectionName::All` | `"all"` | Every registered tool |
+
+The enum serializes via `#[serde(rename_all = "kebab-case")]`, so a blueprint's JSON
+matches the TS edition byte-for-byte.
+
+## Validation and serialization
+
+`validate_blueprint(candidate: &serde_json::Value) -> Result<AgentBlueprint, BlueprintError>`
+is the single gate everything downstream trusts. Like the original zod schema, it
+**collects every issue before returning** — an empty `name`, for instance, surfaces
+both the min-length and the kebab-case violation — and renders each in `path: message`
+form. Unknown keys are stripped (zod `z.object` semantics), an absent or explicit
+JSON `null` `tags` maps to `None`, and a non-object candidate reports `(root): …` and
+stops.
+
+```rust
+use indusagi::smithy::{validate_blueprint, BlueprintError};
+use serde_json::json;
+
+let bp = validate_blueprint(&json!({
+    "name": "code-reviewer",
+    "description": "Reviews code.",
+    "systemPrompt": "You review code.",
+    "toolCollection": "read-only",
+    "model": "claude-sonnet-4",
+}))?;
+assert_eq!(bp.tool_collection, indusagi::smithy::ToolCollectionName::ReadOnly);
+# Ok::<(), BlueprintError>(())
+```
+
+`BlueprintError` is a `thiserror`-friendly struct whose `Display` is
+`invalid agent blueprint: {issues joined by "; "}`. The serde helpers round-trip
+through canonical JSON:
+
+- `serialize_blueprint` emits keys in a fixed order (`name`, `description`,
+  `systemPrompt`, `toolCollection`, `model`, then `tags` *only when non-empty*) with
+  2-space indent, so two equal blueprints always produce byte-identical text.
+- `deserialize_blueprint` parses JSON text and runs it through `validate_blueprint`;
+  malformed JSON surfaces as a single `not valid JSON: …` issue, schema failures as
+  the usual `path: message` issues.
+- `try_validate_blueprint` is the `Option`-returning variant for callers that prefer
+  to branch.
+
+## Starter profiles
+
+A `AgentProfile` is a named *partial* blueprint with `name` removed — the one field a
+profile never decides on the caller's behalf. Every other field is `Option`, and an
+absent field falls through to the `define_agent` baseline. Three ship in the
+`PROFILES()` table:
+
+| Profile (`ProfileName`) | Tool collection | Model | For |
+|-------------------------|-----------------|-------|-----|
+| `Coder` (`"coder"`) | `Coding` | `claude-sonnet-4` (`BALANCED_MODEL`) | Reads, edits, and writes code; runs commands to land changes |
+| `Researcher` (`"researcher"`) | `ReadOnly` | `claude-sonnet-4` (`BALANCED_MODEL`) | Gathers, cross-checks, and summarises from files and the web |
+| `Reviewer` (`"reviewer"`) | `ReadOnly` | `claude-opus-4` (`HEAVY_MODEL`) | Inspects changes for correctness and quality, reports findings |
+
+Each profile pins a tool collection, a baseline model, a multi-line starter system
+prompt, a description, and tags. The reviewer is the one profile backed by the heavy
+model. The table is interned once behind a `OnceLock`; `PROFILES()` and the private
+`profiles()` hand back the *same* slice. Adding a new starter agent is a single entry
+here, not a new function.
+
+```rust
+use indusagi::smithy::{get_profile, is_profile_name, PROFILE_NAMES, ToolCollectionName};
+
+assert!(is_profile_name("coder"));
+let coder = get_profile("coder").unwrap();
+assert_eq!(coder.tool_collection, Some(ToolCollectionName::Coding));
+assert_eq!(PROFILE_NAMES.len(), 3);
+```
+
+`get_profile` is case-sensitive and does no trimming (`get_profile("CODER")` and
+`get_profile("coder ")` both return `None`), and `is_profile_name` agrees with it on
+every input.
+
+## The merge generator
+
+`define_agent` is the one generator. It merges three sources highest-first — the
+caller's `spec`, then the named `profile`'s defaults, then a module `baseline()` — and
+funnels everything through the single `validate_blueprint` gate.
+
+```rust
+pub fn define_agent(
+    spec: &AgentSpec,
+    profile: Option<&str>,
+) -> Result<AgentBlueprint, BlueprintError>;
+```
+
+The precedence chain is implemented with a `first_string(a, b, fallback)` helper (and
+`pick_collection` for the enum) that mirrors the TS `??` chain: **only a `None` field
+falls through.** A `Some("")` from the spec *wins* the merge and is then rejected by
+the validation gate — deliberate and predictable. `spec.tags` *replace* (do not merge
+with) the profile's tags (`spec.tags.as_ref().or(seed.tags.as_ref())`). The
+`AgentSpec` carries only `name` mandatorily:
+
+```rust
+pub struct AgentSpec {
+    pub name: String,
+    pub description: Option<String>,
+    pub system_prompt: Option<String>,
+    pub tool_collection: Option<ToolCollectionName>,
+    pub model: Option<String>,
+    pub tags: Option<Vec<String>>,
+}
+```
+
+A missing profile (`None` or `Some("")`) seeds an empty `AgentProfile::default()`; an
+unknown *non-empty* profile name is reported as a `BlueprintError` with the single
+issue `unknown profile "{name}"` — not a separate error type — so callers handle one
+failure shape. The baseline supplies `description = "A general-purpose agent."`,
+`tool_collection = ReadOnly`, `model = "claude-sonnet-4"`, and a four-line
+general-purpose system prompt.
+
+```rust
+use indusagi::smithy::{AgentSpec, define_agent, serialize_blueprint, ToolCollectionName};
+
+// Seed from the 'coder' profile; the spec wins on any field it sets.
+let mut spec = AgentSpec::new("code-reviewer");
+spec.model = Some("claude-opus-4".to_string());
+let bp = define_agent(&spec, Some("coder")).unwrap();
+
+assert_eq!(bp.name, "code-reviewer");
+assert_eq!(bp.tool_collection, ToolCollectionName::Coding); // from profile
+assert_eq!(bp.model, "claude-opus-4");                      // from spec
+println!("{}", serialize_blueprint(&bp));                   // canonical JSON
+```
+
+## The runtime bridge
+
+`to_agent_config` is the second half of persona: it projects a validated blueprint
+onto the runtime's `AgentConfig`.
+
+```rust
+pub fn to_agent_config(blueprint: &AgentBlueprint, cwd: Option<String>) -> AgentConfig;
+```
+
+It maps `system_prompt` to the config's `system` preamble, passes `model` through,
+and resolves the named `tool_collection` into a runnable toolbox: the capabilities
+`tool_box(collection, cwd)` is wrapped by the runtime `CapabilitiesToolBox` bridge
+and stored as `Arc<dyn ToolBox>` on `AgentConfig::tools`. `cwd` roots the resulting
+tools at a working directory (defaulting to the process cwd inside `tool_box`). The
+returned config's toolbox advertises exactly the chosen collection's descriptors —
+a `Coding` blueprint exposes `read`, `edit`, `bash`, and so on. See
+[Runtime](/rust/subsystems/runtime) for `AgentConfig` and `ToolBox`.
+
+## The Forge build session
+
+`Forge` is the conductor that wires every sibling layer into one drivable build
+session. Construct it with `create_forge(options: ForgeOptions)` (or `Forge::new`),
+then drive it in one of two modes and instantiate the result.
+
+```rust
+pub struct ForgeOptions {
+    pub view: Option<Arc<dyn ForgeView>>,
+    pub ask: Option<AskFn>,
+}
+```
+
+`build_interactive(seed_profile: Option<&str>)` walks a fixed four-step interview
+(`Name`, `Purpose`, `Tools`, `Model`) through the view's `show` + `ask`. For each step
+it records the prompt and answer as a `user`/`assistant` dialogue turn pair **and**
+files one `ToolLedger` `interview.ask` event (whose `ok` is `!answer.is_empty()`),
+then `assemble` maps the answers into an `AgentSpec` and calls `define_agent`, logging
+a final `blueprint.define` event. The session **resets** its ledger and dialogue at
+the start of each call. It is `async` and returns `Result<AgentBlueprint, BlueprintError>`.
+
+`build_from_config(cfg: &SmithyConfig)` does the same assembly with answers pulled
+from `cfg.answers`, the profile from `cfg.profile`, and an explicit `cfg.model`
+overriding any answer-supplied one — with zero I/O and no `async`.
+
+`instantiate(blueprint, cwd)` calls `create_agent(to_agent_config(blueprint, cwd), AgentDeps::default())`
+to mint a runnable `Agent`.
+
+```rust
+use indusagi::smithy::{create_forge, ForgeOptions, SmithyConfig};
+use std::collections::BTreeMap;
+
+let forge = create_forge(ForgeOptions::default());
+let mut answers = BTreeMap::new();
+answers.insert("name".into(), "doc-finder".to_string());
+answers.insert("purpose".into(), "Find and summarise docs".to_string());
+answers.insert("tools".into(), "read-only".to_string());
+
+let cfg = SmithyConfig {
+    profile: Some("researcher".to_string()),
+    answers: Some(answers),
+    ..Default::default()
+};
+let bp = forge.build_from_config(&cfg)?;
+let agent = forge.instantiate(&bp, Some("/repo".to_string())); // -> runtime Agent
+# Ok::<(), indusagi::smithy::BlueprintError>(())
+```
+
+The view (and its lone `ask`) is **injected**, never constructed inside the builder.
+`resolve_view` uses an explicit `view` as-is; an `ask`-only option is wrapped in an
+`AskView` whose `show` is a no-op; with neither, a real `ConsoleForgeView` over stdio
+backs the session. That makes the whole interview scriptable with canned answers and
+no terminal or network — the `AskFn` is a shared, `Send + Sync`, boxed async closure
+so a Forge can be driven across `.await` points and threads:
+
+```rust
+use indusagi::smithy::{create_forge, ForgeOptions, AskFn};
+use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::pin::Pin;
+
+let script = Arc::new(Mutex::new(0usize));
+let answers = ["my-agent", "Audit the build", "coding", ""];
+let ask: AskFn = Arc::new(move |_q: String| {
+    let cursor = Arc::clone(&script);
+    Box::pin(async move {
+        let mut i = cursor.lock().unwrap();
+        let a = answers.get(*i).copied().unwrap_or_default().to_string();
+        *i += 1;
+        a
+    }) as Pin<Box<dyn Future<Output = String> + Send>>
+});
+
+let mut forge = create_forge(ForgeOptions { ask: Some(ask), ..Default::default() });
+// forge.build_interactive(Some("coder")).await
+// -> blueprint.name == "my-agent"; forge.ledger().summary().total == 5
+```
+
+The ledger total is `5`: one `interview.ask` event per question (four) plus the final
+`blueprint.define` event. The `Tools` answer is interpreted by `as_tool_collection`,
+which lowercases and trims the free text and matches it against the three collection
+names (blank or unrecognised answers fall through to the profile default).
+
+## CLI flags
+
+`FlagReader` is a strict three-state finite-state machine
+(`ExpectFlag` → `ExpectValue` → `Done`) that walks Smithy's own argv slice
+token-by-token against the data-driven `FLAG_TABLE`. It is pure — no env, no
+filesystem, no process access — accumulates a `SmithyConfig`, and is reusable (each
+`read` call resets its internal state). It supports long and short spellings,
+glued `--flag=value`, a `--` terminator (after which Smithy ignores all positionals),
+and rejects a trailing value-flag missing its value, an unrecognised flag, a switch
+given a glued value, and a malformed/empty-keyed `--answer` pair.
+
+```rust
+pub fn read_flags<S: AsRef<str>>(argv: &[S]) -> Result<SmithyConfig, FlagError>;
+```
+
+| Canonical (`SmithyFlagName`) | Spellings | Kind |
+|------------------------------|-----------|------|
+| `Profile` | `--profile`, `-p` | single |
+| `Out` | `--out`, `--output`, `-o` | single |
+| `Model` | `--model`, `-m` | single |
+| `NonInteractive` | `--non-interactive`, `--batch`, `-y` | switch |
+| `Answer` | `--answer`, `-a` | pair (repeatable `key=value`) |
+
+```rust
+use indusagi::smithy::read_flags;
+
+let cfg = read_flags(&[
+    "--profile", "coder", "-o", "out/agent.json",
+    "--answer", "name=fixer", "-a", "purpose=fix bugs", "-y",
+])?;
+assert_eq!(cfg.profile.as_deref(), Some("coder"));
+assert_eq!(cfg.out.as_deref(), Some("out/agent.json"));
+assert_eq!(cfg.non_interactive, Some(true));
+// cfg.answers == { "name": "fixer", "purpose": "fix bugs" }
+# Ok::<(), indusagi::smithy::FlagError>(())
+```
+
+A `single` flag is last-spelling-wins (overwrite). An `--answer` value may itself
+contain `=` (it splits on the first separator only). A slice that cannot be read into
+a valid config returns a `FlagError` whose `Display` is the bare message, e.g.
+`flag "--profile" expects a value.`. See [CLI](/rust/reference/cli) for how Smithy's
+argv slice is sourced.
+
+## The knowledge pack
+
+The authoring guides Smithy consults are externalised data, not inline constants —
+diffable markdown that travels with the binary. Where the TS read the pack off disk at
+runtime, the Rust port **embeds the whole directory at compile time** with
+`include_dir!("$CARGO_MANIFEST_DIR/src/smithy/knowledge")`, so `load_knowledge()` takes
+no path and never touches the filesystem.
+
+```rust
+pub fn load_knowledge() -> Result<KnowledgePack, KnowledgeError>;
+```
+
+It reads and shape-checks `manifest.json` (a non-empty `version` string plus a
+`guides` array whose entries each carry non-empty `id`, `title`, `file`, `summary`),
+then resolves each guide's body from the embedded tree (paths are relative to the
+manifest root, e.g. `guides/authoring-an-agent.md`). A listed-but-missing or
+malformed input surfaces as a `KnowledgeError` (`Display` is the bare message). The
+shipped pack is version `1.0.0` with four guides:
+
+| Guide id | Title | Covers |
+|----------|-------|--------|
+| `authoring-an-agent` | Authoring an agent | The order of decisions: start from a profile, name it like a file, write a description, let `define_agent` merge and validate |
+| `choosing-tools` | Choosing tools | The three nested tool collections, picking the narrowest, why read-only is a real guarantee |
+| `writing-system-prompts` | Writing system prompts | Lead with the role, prefer sharp rules, state access, say what to do when stuck |
+| `model-selection` | Model selection | Matching a catalog model id to a workload, spending deliberately, right-sizing |
+
+```rust
+use indusagi::smithy::load_knowledge;
+
+let pack = load_knowledge()?;
+assert_eq!(pack.version, "1.0.0");
+let guide = pack.guide("choosing-tools").expect("present");
+assert_eq!(guide.title, "Choosing tools");
+assert!(guide.body.contains("read-only"));
+# Ok::<(), indusagi::smithy::KnowledgeError>(())
+```
+
+`KnowledgePack::guide(id)` is the lookup index over `guides`.
+
+## The tool ledger
+
+`ToolLedger` is the stateful, append-only account of what a build session did. It
+keeps an append-only `log: Vec<LedgerEntry>` and a set of **derived aggregates** that
+are advanced incrementally on each append rather than re-folded — so `summary()` reads
+already-settled numbers. `record(event, at)` stamps a `LedgerEntry` with a 1-based
+`seq` and an epoch-ms `at` (defaulting via `crate::core::now_ms()` when `None`),
+returns it, and advances both the per-tool `counters` (an insertion-ordered
+`IndexMap`, mirroring the TS `Map` order) and the session rollups. `reset()` returns
+the ledger to its just-constructed state and restarts `seq` numbering.
+
+```rust
+use indusagi::smithy::{ToolLedger, ToolEvent, ToolTally};
+use serde_json::json;
+
+let mut ledger = ToolLedger::new();
+ledger.record(ToolEvent {
+    tool: "read".to_string(),
+    input: Some(json!({ "path": "/etc/hosts" })),
+    output: Some(json!({ "bytes": 42 })),
+    ok: true,
+}, None);
+ledger.record(ToolEvent { tool: "bash".to_string(), input: None, output: None, ok: false }, None);
+
+let s = ledger.summary();
+assert_eq!(s.total, 2);
+assert_eq!(s.ok, 1);
+assert_eq!(s.failed, 1);
+assert_eq!(s.tools, 2);
+assert_eq!(s.by_tool["read"], ToolTally { calls: 1, ok: 1, failed: 0 });
+```
+
+`LedgerSummary` carries `total`/`ok`/`failed`/`tools` plus a `by_tool: BTreeMap<String, ToolTally>`,
+where each `ToolTally`'s `failed` is always `calls - ok`. `entries()` returns a
+detached clone of the log (oldest-first) so a caller cannot mutate the ledger's
+history, and a `summary()` snapshot is independent of later records.
+
+## The transcript projector and view seam
+
+`TranscriptModel` is a table-driven, **stateless** visitor over a build transcript —
+an ordered list of gateway `Turn`s, each a bag of typed `Block`s. `accept(turns)`
+visits every turn in order, dispatches each block through a `VisitorTable` (one
+`BlockVisitor` per `Block` kind), and returns a `RenderTranscript` (a `Vec<RenderTurn>`
+plus a `redaction_count`). A visitor returning `None` drops its block, but a turn is
+kept even when all its blocks drop, so the speaker sequence is preserved.
+
+Each block's salient text runs through `sanitize_body`, a fixed three-stage pipeline:
+
+1. **Mask secrets first** (so the mask itself is never length-measured or
+   whitespace-split): built-in regexes cover vendor-prefixed keys (`sk-`/`pk-`/`rk-`),
+   `gh[opsu]_` GitHub tokens, `xox[baprs]-` Slack tokens, `AKIA…` AWS keys, `AIza…`
+   Google keys, `Bearer …` auth headers, and `KEY=value` / `"api_key": "…"` style
+   assignments. Matches become `‹redacted-secret›`. A caller's extra
+   `SanitizeOptions.secret_patterns` run on top.
+2. **Collapse whitespace**: fold CRLF to `\n`, runs of spaces/tabs to one space,
+   newline-hugging spaces away, 3+ blank lines to two, then trim the JS WhiteSpace
+   set (spelled explicitly to match ECMAScript, not Rust's wider Unicode set).
+3. **Length cap**: a body over `SanitizeOptions.max_length` (default `2000`, measured
+   in **UTF-16 code units** for JS `String.length` parity) is replaced by
+   `‹redacted blob — {n} chars omitted›`.
+
+A fragment is `redacted: true` if a secret was masked or the body was truncated.
+Images never carry their bytes into the projection — they become a stable descriptor
+(`‹image/png image — {n} bytes omitted›`) and are always redacted. Labels are derived:
+a text block's label is its turn role, a tool call is `tool → {name}`, a result is
+`result · {ok|error}`, a command is `command · {command}`.
+
+`format_transcript(&RenderTranscript)` flattens the result into labelled lines (a `⚠`
+marker on redacted blocks, a blank line between turns, no trailing blank), ready for
+`ForgeView::show`.
+
+```rust
+use indusagi::smithy::TranscriptModel;
+use indusagi::llmgateway::contract::{Turn, Block};
+
+let turns = vec![Turn::User {
+    blocks: vec![Block::Text { text: "key sk-ABCDEFGHIJ1234567890 done".into() }],
+}];
+let rendered = TranscriptModel::default().accept(&turns);
+assert_eq!(rendered.redaction_count, 1); // secret masked
+```
+
+`ForgeView` is the two-method async trait (`fn show(&self, line: &str)` +
+`async fn ask(&self, question: &str) -> String`) the builder talks through, declared
+with `#[async_trait::async_trait]`; `ConsoleForgeView` is the stdio default (it
+`println!`s shown lines and reads one line off stdin per `ask`). No terminal toolkit
+is imported in this layer — a richer view (a TUI, a web pane) is slotted in later by
+implementing the trait.
+
+## Relationship to neighbors
+
+Smithy is a leaf subsystem of the merged `indusagi` crate and a downstream
+**consumer**, not a dependency, of the other layers. It imports:
+
+- `ToolCollection` and `tool_box` from the [Capabilities](/rust/subsystems/capabilities)
+  layer, and `AgentConfig`, `CapabilitiesToolBox`, `ToolBox`, `Agent`, `AgentDeps`, and
+  `create_agent` from [Runtime](/rust/subsystems/runtime) — the conductor's
+  instantiation target and the toolbox bridge. (Note the two `ToolBox`es: the
+  capabilities `tool_box` returns the OS-backed `capabilities::kernel::ToolBox`, which
+  `to_agent_config` wraps in a `CapabilitiesToolBox` to satisfy the runtime's
+  `runtime::contract::ToolBox` trait.) `ToolCollectionName` is a local enum kept
+  identical to the named collections so the blueprint schema validates standalone.
+- the conversation types `Block` and `Turn` (with their variants — `Block::Text`,
+  `Thinking`, `ToolCall`, `ToolResult`, `Image`, `Command`; `Turn::User`,
+  `Assistant`, `Tool`) from the [LLM Gateway](/rust/subsystems/llm-gateway) contract,
+  which `TranscriptModel` visits.
+- `crate::core::now_ms` from [Core](/rust/subsystems/core) for the ledger's default
+  `at` stamp.
+
+No other `indusagi` area imports Smithy. Within the subsystem, `forge.rs` depends on
+all five sibling layers, `persona/define_agent` bridges persona into runtime and
+capabilities, and `ui` depends only on the gateway contract. For the broader layering
+and how this maps onto the [Python](/python/subsystems/smithy) and TS editions, see
+[Architecture](/rust/architecture).

@@ -1,0 +1,316 @@
+# Link / JSON-RPC Protocol
+
+> Drive a headless agent from a parent process: `indus --json` speaks a JSON-RPC 2.0 line protocol over stdin/stdout.
+
+The **link** channel is the long-lived, bidirectional way to talk to a session
+from outside the interactive terminal. It is a JSON-RPC 2.0 server that
+dispatches framed requests through a declarative operation registry, streams
+uncorrelated event signals back, and round-trips interactive dialogs. Use it to
+embed the agent in another application, an IDE, or a language-agnostic client.
+
+**Node.js / TypeScript users:** if you are in the same process, prefer embedding
+the agent directly via the package barrel rather than spawning a subprocess —
+see the [SDK](sdk.md). The link is for process isolation and cross-language
+clients.
+
+## Table of Contents
+
+- [Starting the link](#starting-the-link)
+- [Framing (NDJSON)](#framing-ndjson)
+- [Envelope (JSON-RPC 2.0)](#envelope-json-rpc-20)
+- [Operations](#operations)
+- [Snapshots](#snapshots)
+- [Signals](#signals)
+- [Dialogs (ask / tell)](#dialogs-ask--tell)
+- [Error codes](#error-codes)
+- [Example client (Python)](#example-client-python)
+
+## Starting the link
+
+```bash
+indus --json [options]
+```
+
+`--json` (alias `--rpc`) resolves to the `rpc` output mode, which dispatches to
+the link runner (`src/boot/runners/link-runner.ts`). The runner assembles a
+`SessionConductor` for the invocation and serves the `SESSION_OPS` registry over
+`process.stdin` / `process.stdout` via `createLinkServer`. It resolves exit code
+`0` once the inbound stream ends.
+
+Options that configure the session apply here too (parsed in
+`src/launch/invocation/flags.ts`):
+
+| Flag | Effect |
+|------|--------|
+| `--model <id>` / `-m` | Bind a specific model (provider-qualified or bare). |
+| `--account <name>` | Authenticate with a named stored credential account. |
+| `--thinking <level>` | Reasoning effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. |
+| `--cwd <path>` | Scope the session to a working directory. |
+| `--system <text>` / `--append-system <text>` | Replace / extend the system prompt. |
+| `--tools <a,b>` / `--no-tools` | Restrict or disable built-in tools. |
+| `--mcp <a,b>` | Attach external MCP server endpoints. |
+
+> There is no `--no-session` or `--session-dir` flag. Persistence is automatic:
+> the conductor writes a per-cwd transcript under the workspace `sessions/`
+> directory (`sessionScopeDir()` in `src/boot/runners/session.ts`).
+
+## Framing (NDJSON)
+
+The transport is **NDJSON**: one JSON value per line, each terminated by a single
+`\n`. The framer (`src/channels/framer.ts`) escapes the two Unicode line
+separators U+2028 and U+2029 — legal inside a JSON string but fatal to a naive
+line splitter — so any value round-trips exactly. The decoder splits strictly on
+`\n` and tolerates a trailing unterminated final line.
+
+Three frame shapes travel **from** the server to the client:
+
+- a correlated **reply** (`{ jsonrpc, id, result | error }`),
+- an uncorrelated **signal** (`{ type: "signal", name, body }`),
+- a dialog **ask** (`{ type: "ask", id, kind, payload }`) or **tell** (`{ type: "tell", kind, payload }`).
+
+Two travel **to** the server:
+
+- a **request** (`{ jsonrpc, id?, method, params? }`),
+- a dialog **answer** (`{ type: "answer", id, value }`).
+
+## Envelope (JSON-RPC 2.0)
+
+Every request and reply carries `"jsonrpc": "2.0"` (the `PROTOCOL_VERSION`
+constant). The shapes are pinned in `src/channels/contract.ts`.
+
+A request:
+
+```json
+{"jsonrpc": "2.0", "id": "lnk-1", "method": "submit", "params": {"input": "Hello"}}
+```
+
+- `id` correlates the eventual reply. **A request without an `id` is a
+  notification** — it is dispatched for its effect and never replied to.
+- `method` selects the operation by its wire name.
+- `params` carries the operation payload (absent when the op takes none).
+
+A successful reply:
+
+```json
+{"jsonrpc": "2.0", "id": "lnk-1", "result": { ... }}
+```
+
+A failed reply:
+
+```json
+{"jsonrpc": "2.0", "id": "lnk-1", "error": {"code": -32601, "message": "Unknown op: foo", "data": {"method": "foo"}}}
+```
+
+Discriminate by the presence of the `result` vs `error` key. The driver mints
+string ids prefixed with `lnk-` (`REQUEST_ID_PREFIX`).
+
+## Operations
+
+The full operation set is the declarative `SESSION_OPS` registry in
+`src/channels/session-ops.ts`. Every op delegates to the `SessionConductor`; the
+server dispatches by a map lookup, and the typed client method set is exactly
+these keys.
+
+| Method | Params | Result | Effect |
+|--------|--------|--------|--------|
+| `submit` | `{ input: string }` | `LinkSnapshot` | Run a user turn to settlement, reply with a snapshot. |
+| `abort` | — | `LinkSnapshot` | Cancel the in-flight turn, reply with a snapshot. |
+| `snapshot` | — | `LinkSnapshot` | Read the current state, projected to a snapshot. |
+| `resume` | `{ sessionId: string }` | `LinkSnapshot` | Restore a persisted session, reply with a snapshot. |
+| `listModels` | — | `ModelEntry[]` | List the model bound to the session (the active entry). |
+| `cycleModel` | `{ modelId: string }` | `LinkSnapshot` | Rotate the active model, reply with a snapshot. |
+
+A `ModelEntry` is `{ id: string, active: boolean }`.
+
+### submit
+
+Run one user turn to settlement. While the turn streams, the server pushes
+[signals](#signals); when the turn settles the request gets its correlated
+snapshot reply.
+
+```json
+{"jsonrpc": "2.0", "id": "lnk-1", "method": "submit", "params": {"input": "List the files in src"}}
+```
+
+If a turn is already in flight, the conductor enqueues the input as a follow-up
+rather than dropping it, and `submit` resolves immediately with the current
+snapshot (see `SessionConductor.submit` in `src/conductor/contract.ts`).
+
+### abort
+
+```json
+{"jsonrpc": "2.0", "id": "lnk-2", "method": "abort"}
+```
+
+Cancels the in-flight turn; an `aborted` fault signal is emitted and the reply
+carries the post-abort snapshot.
+
+### resume
+
+```json
+{"jsonrpc": "2.0", "id": "lnk-3", "method": "resume", "params": {"sessionId": "01J..."}}
+```
+
+### cycleModel
+
+```json
+{"jsonrpc": "2.0", "id": "lnk-4", "method": "cycleModel", "params": {"modelId": "anthropic/claude-haiku-4-5"}}
+```
+
+`cycleModel` on the conductor is optional, so a session assembly that does not
+support mid-session model changes leaves the bound model unchanged; the reply
+still carries the current snapshot.
+
+## Snapshots
+
+Every state-bearing op replies with a `LinkSnapshot` — a flat, serializable
+projection of the conductor's internal `ConductorState`, shaped for the wire
+(`projectSnapshot()` in `src/channels/session-ops.ts`):
+
+```json
+{
+  "model": "anthropic/claude-sonnet-4-5",
+  "thinking": "off",
+  "streaming": false,
+  "condensing": false,
+  "faulted": false,
+  "sessionId": "01J...",
+  "sessionFile": "/path/to/--slug--/01J....ndjson",
+  "autoCondense": true,
+  "messageCount": 0,
+  "queuedCount": 0,
+  "usage": { "input": 100, "output": 50, "totalTokens": 150, "cost": 0.001 }
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `model` | Canonical id of the bound model. |
+| `thinking` | Active reasoning effort. |
+| `streaming` | An assistant turn is producing output (phase `streaming` or `tooling`). |
+| `condensing` | The transcript is being condensed (phase `condensing`). |
+| `faulted` | The most recent turn ended in a fault (phase `faulted`). |
+| `sessionId` | Stable identifier of the active session. |
+| `sessionFile` | On-disk transcript file (omitted when not persisted). |
+| `autoCondense` | Whether auto-condense is engaged. |
+| `messageCount` | Nodes on the active transcript branch. |
+| `queuedCount` | Inputs queued behind the in-flight turn. |
+| `usage` | Cumulative token / cost spend so far (framework `Usage`). |
+
+## Signals
+
+As a turn progresses, the server streams uncorrelated **signal** frames (no
+`id`). Each wraps a `SessionSignal` from `src/conductor/contract.ts`:
+
+```json
+{"type": "signal", "name": "text", "body": {"kind": "text", "delta": "Hello"}}
+```
+
+The `name` is the signal `kind`; the `body` is the verbatim signal. The signal
+kinds are:
+
+| `name` | `body` fields | Meaning |
+|--------|---------------|---------|
+| `prompt` | `text` | The user turn was committed. |
+| `text` | `delta` | A chunk of assistant answer text. |
+| `thinking` | `delta` | A chunk of reasoning text. |
+| `tool_start` | `id`, `name` | A tool invocation began (correlate by `id`). |
+| `tool_end` | `id`, `ok` | A tool invocation finished (`ok` = no error). |
+| `turn_end` | `usage` | The assistant turn settled. |
+| `persisted` | `entryId` | The latest node was committed to the transcript. |
+| `compacted` | — | The transcript was condensed. |
+| `fault` | `fault` | A typed `ConductorFault` (`kind`, `message`, `cause?`). |
+| `queue` | `count` | The pending-input queue depth changed. |
+| `idle` | — | No in-flight work; ready for input. |
+
+A client tells signals from replies by the `type: "signal"` discriminant — a
+reply has no `type` field and carries an `id` plus `result`/`error`.
+
+## Dialogs (ask / tell)
+
+When the agent (or an extension it hosts) needs interaction, the server emits a
+dialog frame (`src/channels/link/dialog.ts`):
+
+- **ask** — a blocking round-trip. The server suspends until a matching `answer`
+  arrives or the dialog deadline (`dialogMs`, default 90s) lapses, in which case
+  it resolves with a fallback.
+
+  ```json
+  {"type": "ask", "id": "ask-1", "kind": "confirm", "payload": {"message": "Delete file?"}}
+  ```
+
+  Answer it by posting an `answer` frame with the same `id`:
+
+  ```json
+  {"type": "answer", "id": "ask-1", "value": true}
+  ```
+
+- **tell** — a one-way notice, no answer expected:
+
+  ```json
+  {"type": "tell", "kind": "status", "payload": {"text": "Indexing..."}}
+  ```
+
+The interaction `kind` is one of the rows in `DIALOG_TABLE`: the round-trip kinds
+are `select`, `confirm`, `input`, `editor`; the fire-and-forget kinds are
+`notify`, `status`, `title`. A client that does not answer an `ask` lets it time
+out to its fallback (`null` for `select`/`input`/`editor`, `false` for
+`confirm`), so a non-interactive driver never wedges the server.
+
+## Error codes
+
+The closed set of error codes (`OP_ERROR` in `src/channels/contract.ts`):
+
+| Code | Name | Meaning |
+|------|------|---------|
+| `-32700` | parse | The framed line was not valid JSON. |
+| `-32600` | invalidRequest | The frame was not a well-formed request. |
+| `-32601` | unknownOp | No operation is registered under the `method`. |
+| `-32602` | invalidParams | The `params` failed the operation schema. |
+| `-32000` | handlerFailed | The operation handler threw. |
+
+## Example client (Python)
+
+```python
+import subprocess, json, itertools
+
+proc = subprocess.Popen(
+    ["indus", "--json"],
+    stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE,
+    text=True,
+)
+
+ids = (f"lnk-{n}" for n in itertools.count(1))
+
+def send(method, params=None):
+    frame = {"jsonrpc": "2.0", "id": next(ids), "method": method}
+    if params is not None:
+        frame["params"] = params
+    proc.stdin.write(json.dumps(frame) + "\n")
+    proc.stdin.flush()
+
+# Submit a prompt; the reply (a snapshot) arrives once the turn settles.
+send("submit", {"input": "List the files in src and summarise them"})
+
+for line in proc.stdout:
+    msg = json.loads(line)
+    if msg.get("type") == "signal":
+        if msg["name"] == "text":
+            print(msg["body"]["delta"], end="", flush=True)
+        elif msg["name"] == "idle":
+            print()
+            break
+    elif "result" in msg:
+        # A correlated reply to one of our requests (e.g. the submit snapshot).
+        pass
+    elif msg.get("type") == "ask":
+        # Answer a blocking dialog so the agent can proceed.
+        answer = {"type": "answer", "id": msg["id"], "value": None}
+        proc.stdin.write(json.dumps(answer) + "\n")
+        proc.stdin.flush()
+```
+
+To build a typed client in-process, use `createLinkDriver` from the package
+barrel — see the [SDK](sdk.md). For one-shot scripting without the bidirectional
+protocol, use [print / JSON mode](json.md).

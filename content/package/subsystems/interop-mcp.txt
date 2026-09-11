@@ -1,0 +1,102 @@
+# Interop / MCP
+
+> `src/interop` is the L3 External layer that bridges the agent to the Model Context
+> Protocol ecosystem. The agent can act as a *client* of external MCP servers and as
+> a *provider host* that publishes its own tools. Imported as `indusagi/interop`, or
+> as the `interop` namespace from `indusagi`.
+
+As a client, the bridge connects to external MCP servers, enumerates their tools,
+and grafts those remote tools into the agent's own kernel. As a provider host, it
+stands up an MCP server that exposes the agent's built-in tools to outside clients.
+The implementation re-derives the protocol from the spec and the official
+`@modelcontextprotocol/sdk`.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-directories](#sub-directories)
+- [Client side: endpoints and fleets](#client-side-endpoints-and-fleets)
+- [Provider host](#provider-host)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+From `src/interop/index.ts` (re-exported from `protocol-bridge`):
+
+| Export | Kind | Purpose |
+|--------|------|---------|
+| `createServerEndpoint`, `ServerEndpointImpl` | fn / class | One connection to one external MCP server |
+| `startServerFleet`, `ServerFleetImpl` | fn / class | A fleet of endpoints under one lifecycle |
+| `mountProtocolBridge` | function | Graft remote tools into the kernel |
+| `createProviderHost` | function | Expose our tools to external MCP clients |
+| `ProtocolFault`, `protocolFault`, `isProtocolFault` | class/fn | The bridge's fault value vocabulary |
+| `isUsablePhase`, `isTerminalPhase` | functions | Endpoint-phase predicates |
+| `QUALIFIER`, `qualifyToolName` | const/fn | Namespacing of remote tool names |
+| `normalizeSchema` | function | Normalize a remote tool's JSON Schema |
+
+Behavioural interface types: `ServerEndpoint`, `ServerFleet`, `ProviderHost`,
+`ProviderHostInfo`, `MountedProtocolBridge`. Contract types: `FaultKind`,
+`EndpointPhase`, `StdioServerConfig`, `SseServerConfig`, `ServerConfig`,
+`TransportKind`, `BridgeConfig`, `RemoteToolRef`, `RemoteTool`, `RemoteCallResult`,
+`EndpointStatus`, `FleetStatus`, `MountedBridge`.
+
+## Sub-directories
+
+The entire subsystem lives under `protocol-bridge/`:
+
+| File | Holds |
+|------|-------|
+| `contract.ts` | The value + type vocabulary: faults, phases, `ServerConfig`, `QUALIFIER`, phase predicates |
+| `endpoint.ts` | `ServerEndpointImpl` / `createServerEndpoint` — one client connection |
+| `fleet.ts` | `ServerFleetImpl` / `startServerFleet` — many endpoints, one lifecycle |
+| `bridge.ts` | `mountProtocolBridge` — graft remote tools into the kernel |
+| `host.ts` | `createProviderHost` — publish our tools as an MCP server |
+| `schema.ts` | `normalizeSchema` — remote-schema normalization |
+| `index.ts` | The barrel |
+
+## Client side: endpoints and fleets
+
+A `ServerConfig` is either a `StdioServerConfig` (spawn a server over stdio) or an
+`SseServerConfig` (connect over SSE), discriminated on its `kind` (`"stdio"` /
+`"sse"`); a `BridgeConfig` is `{ servers: ServerConfig[] }`. An endpoint is one
+connection; a fleet manages many under one lifecycle and reports a `FleetStatus`.
+`mountProtocolBridge` takes a `BridgeConfig`, starts its own fleet, and grafts every
+usable server's tools into a fresh `ToolRegistry`:
+
+```ts
+import { startServerFleet, mountProtocolBridge } from "indusagi/interop";
+
+const config = {
+  servers: [{ kind: "stdio", command: "my-mcp-server", args: [] }],
+};
+
+// Just connect a fleet and inspect which servers came up.
+const fleet = await startServerFleet(config);
+
+// Or: connect AND graft every remote tool into a kernel registry.
+const mounted = await mountProtocolBridge(config);
+```
+
+`qualifyToolName` namespaces a remote tool with the `QUALIFIER` so grafted tools do
+not collide with built-ins, and `normalizeSchema` reconciles a remote tool's JSON
+Schema with the kernel's expectations. `isUsablePhase` / `isTerminalPhase` classify
+an endpoint's `EndpointPhase`; failures surface as a `ProtocolFault`.
+
+## Provider host
+
+`createProviderHost` runs the other direction — it stands up an MCP server that
+publishes the agent's own built-in tools to outside clients, reporting a
+`ProviderHostInfo`.
+
+## Relationship to neighbors
+
+Mounted remote tools land in a [Capabilities](/docs/subsystems/capabilities)
+`ToolRegistry`, so they reach the [Runtime](/docs/subsystems/runtime) through the
+same `ToolBox` surface as built-ins. The [Shell App](/docs/subsystems/shell-app)
+wires this layer up via the repeatable `--mcp` flag, closing fleets on teardown.
+
+This layer is distinct from the `indusagi/mcp` facade: `interop` is the clean-room
+protocol bridge (`src/interop`), while `indusagi/mcp` re-exports the
+`src/facade/mcp-core` client/server stack. See [Package Exports](/docs/package-exports).
+
+Back to the [Architecture overview](/docs/architecture).

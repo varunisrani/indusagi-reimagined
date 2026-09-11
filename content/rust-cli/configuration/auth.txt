@@ -1,0 +1,589 @@
+# Authentication
+
+> How the Rust `induscode` agent resolves a provider key — environment variables for the quick path, and the `indus signin` / `indus signout` commands for stored credentials (masked api-key entry or paste-based browser sign-in / OAuth). The command and the 14-provider directory live in [`induscode::launch::credentials`](/rust-cli/subsystems/launch); the registry plus the three browser flows in `induscode::launch::oauth`; the disk vault (`DiskAuthVault`) writes `auth.json` under `~/.indusagi/agent/`. Secrets are wrapped in a redacting `SecretString` so a token never reaches a log line.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [The fastest path: environment variables](#the-fastest-path-environment-variables)
+- [indus signin](#indus-signin)
+- [indus signin --list](#indus-signin---list)
+- [indus signout](#indus-signout)
+- [auth status, login, logout](#auth-status-login-logout)
+- [Provider directory](#provider-directory)
+- [Browser sign-in (OAuth / PKCE)](#browser-sign-in-oauth--pkce)
+- [Stored accounts and the disk vault](#stored-accounts-and-the-disk-vault)
+- [Where credentials live](#where-credentials-live)
+- [Secret redaction](#secret-redaction)
+- [Typed faults](#typed-faults)
+- [Console overlays](#console-overlays)
+- [Programmatic surface](#programmatic-surface)
+- [Notes](#notes)
+
+## Overview
+
+A run needs exactly one thing from this subsystem: a usable api-key string for the
+provider that backs the model you are running. There are three ways to supply it,
+in increasing order of persistence:
+
+1. **Environment variable** — export `ANTHROPIC_API_KEY` (or the provider's own
+   key) and you are done; nothing is stored on disk.
+2. **`indus signin` with an api key** — paste a key once (echo muted on a TTY);
+   it is validated and written to the vault under a named account.
+3. **`indus signin` with browser sign-in (OAuth)** — for the providers that
+   support it, complete a paste-based PKCE authorization-code flow (or, for GitHub
+   Copilot, a device grant) and store the resulting tokens.
+
+The crate ships two cargo `[[bin]]` targets — `indusr` (primary) and `indusagir`
+— that share one `async fn main() -> ExitCode` in `src/bin/main.rs`. The
+*user-facing* command name (the brand `resolve_brand` reports, from `BIN_NAMES`)
+is `indus` (primary) or `indusagi`, matched against the basename of `argv[0]`;
+anything else (including the raw `indusr` target name) falls back to
+`BIN_NAMES[0]` = `indus`. This page writes commands as `indus …`; the help banner,
+the examples below, and the api-key tip all print `indus`. The `signin` /
+`signout` verbs are *no-session* commands the CLI owns: `route` short-circuits
+them in `main.rs` (via `is_credential_verb`) before the
+[boot](/rust-cli/subsystems/boot) handoff, because boot would otherwise fall them
+through to the interactive REPL. The command itself,
+`run_credential_command(argv, &dyn AuthVault, &dyn CredentialIo, &dyn OAuthSeam)
+-> CredentialResult`, returns `handled: false` only when the leading token is not
+a credential verb, so a normal prompt falls straight through.
+
+```rust
+/// The outcome of `run_credential_command` (`credentials.rs`).
+pub struct CredentialResult {
+    pub handled: bool,
+    pub verb: Option<CredentialVerb>,
+    pub provider: Option<String>,
+    pub fault: Option<CredentialFault>,
+}
+```
+
+See [Launch](/rust-cli/subsystems/launch) for the dispatch order and the flag
+reader. For the Python and TypeScript editions of the same flow, see
+[python-cli auth](/python-cli/configuration/auth) and the [TS CLI](/cli).
+
+## The fastest path: environment variables
+
+Every provider in the directory has a conventional environment variable. Set it
+and the provider is authenticated for the process — no `signin` required:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+indus -p "explain this repo"
+```
+
+The api-key `signin` flow consults the env var *first* through `env_api_key`: if
+your key is already exported it offers to store that value rather than asking you
+to re-type it.
+
+```rust
+/// Read a provider api key already exported in the environment
+/// (the env-first shortcut, `credentials.rs`).
+fn env_api_key(entry: &ProviderEntry) -> Option<String> {
+    std::env::var(entry.env_key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+```
+
+| Provider | `id` | Environment variable |
+|----------|------|----------------------|
+| Anthropic (Claude) | `anthropic` | `ANTHROPIC_API_KEY` |
+| OpenAI | `openai` | `OPENAI_API_KEY` |
+| Google Gemini | `google` | `GEMINI_API_KEY` |
+| xAI (Grok) | `xai` | `XAI_API_KEY` |
+| Groq | `groq` | `GROQ_API_KEY` |
+| Cerebras | `cerebras` | `CEREBRAS_API_KEY` |
+| Mistral | `mistral` | `MISTRAL_API_KEY` |
+| OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
+| MiniMax | `minimax` | `MINIMAX_API_KEY` |
+| Kimi (Moonshot) | `kimi` | `MOONSHOT_API_KEY` |
+| Sarvam | `sarvam` | `SARVAM_API_KEY` |
+| Krutrim | `krutrim` | `KRUTRIM_API_KEY` |
+| NVIDIA | `nvidia` | `NVIDIA_API_KEY` |
+| Z.ai | `zai` | `ZAI_API_KEY` |
+
+## indus signin
+
+`signin` resolves a provider, then either runs a browser sign-in or stores an api
+key. Naming a provider is optional — omit it and the command prints the merged
+sign-in directory and asks you to pick by number.
+
+```bash
+indus signin                                   # interactive: pick from the menu
+indus signin anthropic                         # provider as a bare positional
+indus signin --provider openai --method api-key
+indus signin --provider anthropic --account work   # name the stored account
+indus login anthropic                          # `login` is an alias for `signin`
+```
+
+`as_verb` accepts `login` / `logout` as natural-language aliases of
+`signin` / `signout`. The verb tail is parsed by `read_verb_flags`:
+
+| Flag | Effect |
+|------|--------|
+| `--provider <id>` | Provider to sign in to (also accepted as a bare positional) |
+| `--account <name>` | Account label to store under (default: `default`) |
+| `--method oauth` / `--oauth` | Force browser sign-in |
+| `--method api-key` / `--api-key` / `--apikey` | Force api-key entry |
+| `--list` / `--ls` | List stored accounts read-only (see below) |
+
+When a provider supports browser sign-in and you do not request a method, the
+browser path is preferred (`do_signin`: `use_oauth = method == Some(Oauth) ||
+(method.is_none() && target.oauth_capable)`). An explicit `--method` always wins.
+
+**Default-to-api-key (the CLI default):** the shipped OAuth client ids are
+unconfigured sentinels out of the box, so a bare `indus signin <provider>` would
+otherwise land on an inert browser path. The CLI's `default_signin_to_api_key`
+appends `--method api-key` to a `signin` argv *only* when the user has not already
+named a method (detected by `argv_picks_method`, which looks for `--method` /
+`--oauth` / `--api-key` / `--apikey`), so the api-key prompt is the easy path;
+`--oauth` / `--method oauth` are preserved untouched.
+
+The first account stored for a provider becomes its default. Validation runs
+before any write:
+
+```rust
+const MIN_KEY_LENGTH: usize = 20;
+const MAX_ACCOUNT_LENGTH: usize = 50;
+// placeholder markers rejected as not-a-real-key:
+const PLACEHOLDER_MARKERS: &[&str] =
+    &["your-api-key", "your_api_key", "xxxx", "placeholder", "changeme", "<"];
+
+pub fn validate_api_key(key: &str) -> Option<CredentialFault>;
+pub fn validate_account_name(name: &str) -> Option<CredentialFault>;
+```
+
+A key must be non-empty, at least 20 characters, and free of placeholder markers;
+an account name must be non-empty, at most 50 characters, and match
+`^[A-Za-z0-9_-]+$`. Storing under a name that already exists is a `NameCollision`
+fault — pick a different `--account` or `signout` first.
+
+## indus signin --list
+
+`--list` (alias `--ls`) is a read-only switch on `signin` that short-circuits the
+verb: `do_list_accounts` walks the merged sign-in directory (de-duplicating
+providers that appear in both halves), queries the vault for each provider, and
+prints one line per stored account — tagging the provider default and whether the
+record is a `[browser]` (OAuth) or `[api key]` record (an unrecognised record
+reads `[unknown]`). It writes nothing.
+
+```bash
+indus signin --list
+```
+
+```
+Saved accounts:
+  Anthropic (Claude) (anthropic):
+    - default (default) [browser]
+  OpenAI (openai):
+    - work [api key]
+```
+
+When no provider holds a saved account it prints a single `(none)` line. `--list`
+is honoured on `signin` only; it is meaningless for `signout`.
+
+## indus signout
+
+`signout` (alias `logout`) removes stored credentials. Name an `--account` to
+remove one, or omit it to remove every account for the provider:
+
+```bash
+indus signout --provider anthropic --account work   # remove one account
+indus signout --provider anthropic                  # remove all anthropic credentials
+indus logout openai                                 # `logout` is an alias
+```
+
+Removing a provider/account that holds nothing is a `NotFound` fault. When the
+removed account was the provider default and survivors remain, the first survivor
+is promoted to default (`DiskAuthVault::remove`); when the last account is
+removed, the provider key is dropped from the file entirely.
+
+## auth status, login, logout
+
+The CLI also owns an `auth` subcommand, intercepted in `route` *before* the global
+`--help` / `--version` short-circuit so `auth --help` reaches auth-specific help.
+`classify_auth_verb` dispatches the sub-verb:
+
+| Sub-verb | Route | What runs |
+|----------|-------|-----------|
+| `auth status [provider]` | `AgentStatus` | The agent's own vault reader (`run_agent_status`) |
+| `auth logout [...]` | `AgentLogout` | The agent's `signout` over `auth.json` (`run_agent_logout`) |
+| `auth login` / `refresh` / `help` / unknown | `Framework` | The framework `run_auth_command` (`indusagi::shell_app::auth_cli`) |
+
+```bash
+indus auth status               # show which providers are signed in
+indus auth status anthropic     # filter to one provider
+indus auth login anthropic      # framework PKCE browser flow (where configured)
+indus auth logout               # agent multi-account logout
+```
+
+`auth status` exists because of a real reconciliation gap: the framework
+`auth status` reader understands only the top-level single-record
+`{ provider: StoredCredential }` shape and folds the agent's nested multi-account
+vault to empty — so after `indus signin anthropic` it would report nothing. The
+agent-owned reader (`DiskAuthVault::status_entries`) reads BOTH shapes and reports
+every stored sign-in, api-key and browser alike:
+
+```rust
+pub struct AuthStatusEntry {
+    pub provider: String,
+    pub account: String,
+    pub kind: AuthKind,        // ApiKey | Oauth
+    pub is_default: bool,
+    pub refreshable: bool,     // true only for an OAuth record carrying a refresh token
+    pub freshness: String,     // "no expiry recorded" | "expired" | "valid for ~N min"
+}
+```
+
+OAuth freshness follows the framework wording: `no expiry recorded` when no
+deadline is stored, `expired` once the deadline passes, else `valid for ~N min`
+(rounded to the nearest minute, `+30_000` ms before the `/60_000` divide). `auth
+login <provider>` prints a one-line tip pointing at the working api-key path
+(`Tip: to log in with an API key instead, run: indus signin <provider>`) before
+handing off, because a default build's OAuth client ids are unconfigured
+sentinels.
+
+## Provider directory
+
+`PROVIDER_DIRECTORY` is the 14-provider api-key directory — every provider the
+sign-in surface can store a key for. Each `ProviderEntry` carries the facts the
+prompts print and validate against:
+
+```rust
+pub struct ProviderEntry {
+    pub id: &'static str,        // stable provider id, e.g. "anthropic"
+    pub label: &'static str,     // human-facing menu label
+    pub env_key: &'static str,   // conventional api-key env var
+    pub docs_url: &'static str,  // page where a user obtains a key
+}
+
+pub const PROVIDER_DIRECTORY: &[ProviderEntry] = &[ /* 14 entries */ ];
+pub fn find_provider(id: &str) -> Option<&'static ProviderEntry>;  // case-insensitive
+```
+
+`find_provider` is the case-insensitive lookup by id. The api-key directory and
+the OAuth registry are merged by `list_login_providers` into the menu `signin`
+shows, browser-sign-in providers first; a provider that appears in both halves is
+listed twice so the user can pick either path.
+
+## Browser sign-in (OAuth / PKCE)
+
+The OAuth registry plus the three real browser flows live in
+`induscode::launch::oauth` (behind the `oauth` cargo feature). The Rust framework
+ships only the OAuth *transport* primitives
+(`indusagi::llmgateway::{create_pkce_pair, build_auth_url, exchange_code,
+refresh_token}`) — not the high-level provider registry — so the agent owns:
+
+- the [`OAuthProvider`] trait (`id` / `name` / `login` / `refresh_token` /
+  `get_api_key`) and the stored `OAuthCredentials` shape;
+- the process-global `OAuthProviderRegistry` (a `OnceLock`-backed `RwLock<IndexMap>`)
+  and `register_built_in_oauth_providers`, an idempotent explicit boot-time prime
+  (Rust has no import-time side effects);
+- the three flows — **Anthropic** (`anthropic`), **OpenAI Codex** (`openai-codex`),
+  and **GitHub Copilot** (`github-copilot`).
+
+### The paste-based authorization-code flow
+
+There is no local callback HTTP server anywhere in this build. The shared
+`paste_code_login` choreography is:
+
+1. resolve the real client id from the per-provider env var, or refuse
+   (`resolve_client_id`);
+2. mint a PKCE pair (`create_pkce_pair(64)`, `S256`) and a fresh CSRF `state`;
+3. build the authorization URL (`build_auth_url`) and open it
+   (`open_login_url`, which accepts only `http`/`https` schemes);
+4. read the pasted authorization code — a bare code, a `code#state` fragment, or
+   the whole redirect URL — and extract the `code` query param (`extract_code`);
+5. exchange the code for tokens (`exchange_code`) and persist them through the
+   vault.
+
+```rust
+pub fn extract_code(pasted: &str) -> String;   // bare code | code#state | full redirect URL
+
+pub async fn start_oauth_login(
+    provider_id: &str,
+    callbacks: &dyn OAuthLoginCallbacks,
+    vault: &dyn OAuthVaultSink,
+    account: &str,
+) -> Result<OAuthLoginResult, OAuthError>;
+```
+
+`start_oauth_login` looks the provider up, applies the sentinel gate up front so a
+doomed consent flow never opens, runs `provider.login`, and stores under `account`
+(the first account stored becomes default).
+
+### The client-id sentinel gate
+
+No real client ids ship in source. Each of the three providers has a parity-locked
+env var and `<UNREGISTERED-…>` sentinel; the gate reads the env var *live* (so a
+deployer who exports it before `/login` is honoured) and refuses an inert flow
+naming the exact variable:
+
+| Provider | Env var | Sentinel |
+|----------|---------|----------|
+| `anthropic` | `INDUSAGI_ANTHROPIC_OAUTH_CLIENT_ID` | `<UNREGISTERED-ANTHROPIC-OAUTH-APP>` |
+| `openai-codex` | `INDUSAGI_OPENAI_CODEX_CLIENT_ID` | `<UNREGISTERED-OPENAI-CODEX-APP>` |
+| `github-copilot` | `INDUSAGI_GITHUB_COPILOT_CLIENT_ID` | `<UNREGISTERED-COPILOT-APP>` |
+
+```rust
+pub fn oauth_client_id_env_var(provider_id: &str) -> Option<&'static str>;
+pub fn has_registered_oauth_client_id(provider_id: &str) -> bool;
+```
+
+A provider with no known wiring is treated as registered (only the three
+sentinel-shipped providers are gated).
+
+### GitHub Copilot device flow (RFC 8628)
+
+GitHub Copilot uses the OAuth device-authorization grant instead of a redirect:
+the user enters a code at a verification URL while the driver polls the token
+endpoint. The poll FSM is pure and unit-tested, modelled on the framework
+connectors-saas `ConnectAction` rule table:
+
+```rust
+pub enum PollStatus { Authorized, Pending, SlowDown, Denied, Expired }
+pub fn classify_poll(error: Option<&str>) -> PollStatus;
+
+pub enum PollDecision {
+    Done,
+    Poll { wait_ms: u64, slowed: bool },
+    Expired,
+    Failed { reason: String },
+}
+pub fn plan_poll(status: PollStatus, base_interval_ms: u64) -> PollDecision;
+```
+
+`slow_down` bumps the interval by 5s per RFC 8628 §3.5; unknown error codes are
+treated as a terminal failure. The live device-code exchange runs at the
+interactive console seam, not in a headless context.
+
+### The browser launcher
+
+`open_login_url` refuses any scheme that is not `http`/`https` (a security gate)
+and then tries an ordered list of platform launch strategies — `open` on macOS,
+`cmd /c start` on Windows, `xdg-open` / `x-www-browser` / `google-chrome` /
+`chromium` on Linux — spawning and detaching the first that succeeds.
+
+## Stored accounts and the disk vault
+
+The vault surface the command depends on is the `AuthVault` trait
+(object-safe + `async`, so both the CLI and the console overlays hold a
+`&dyn AuthVault`):
+
+```rust
+#[async_trait]
+pub trait AuthVault: Send + Sync {
+    async fn list_accounts(&self, provider: &str) -> Vec<String>;
+    async fn default_account(&self, provider: &str) -> Option<String>;
+    async fn put_api_key(&self, provider: &str, account: &str,
+                         api_key: &SecretString, make_default: bool) -> Result<(), VaultError>;
+    async fn put_oauth(&self, provider: &str, account: &str,
+                       credentials: &OAuthCredentials, make_default: bool) -> Result<(), VaultError>;
+    async fn auth_kind(&self, provider: &str, account: &str) -> Option<AuthKind>;
+    async fn read_usable_key(&self, provider: &str, account: &str) -> Option<SecretString>;
+    async fn remove(&self, provider: &str, account: Option<&str>) -> bool;
+}
+```
+
+The concrete implementation is `DiskAuthVault::new(path)`, keyed
+provider → account → record. Each on-disk `AuthRecord` is a discriminated enum
+serialized with a `"kind"` tag:
+
+```rust
+#[serde(tag = "kind", rename_all = "camelCase")]
+enum AuthRecord {
+    ApiKey { key: SecretString, #[serde(rename = "isDefault")] is_default: bool },
+    Oauth  { #[serde(flatten)] credentials: OAuthCredentials,
+             #[serde(rename = "isDefault")] is_default: bool },
+}
+```
+
+The OAuth record's wire fields are flattened `OAuthCredentials`
+(`access` / `refresh` / `expires` / `issuedAt` / `provider`, all camelCase). The
+file is `IndexMap`-ordered so the serialized bytes stay stable, written as pretty
+JSON with a trailing newline and `0o600` permissions on Unix. The vault reads the
+whole file each call (it is tiny and operations are interactive) and is robust to
+three input shapes:
+
+- the agent's nested `{ provider: { account: record } }` shape;
+- the legacy pre-discriminant `{ apiKey, isDefault }` record (no `kind`), coerced
+  by `normalise_record`;
+- a framework-written single-record `{ provider: StoredCredential }` file
+  (`accessToken` / `refreshToken` / `expiresAt` / `updatedAt`), upgraded to one
+  `default` OAuth account per provider (`upgrade_framework_record`).
+
+A missing or malformed file reads as empty rather than wedging the store.
+`read_usable_key` returns an api key verbatim; for an OAuth record the bare disk
+vault returns the stored access token, while the console wiring supplies a
+refreshing variant that exchanges an expired token via the registry.
+
+## Where credentials live
+
+The agent nests its state one level deeper than the framework `Locator`: the
+profile root is `<home>/.indusagi/agent` (the framework's own root is
+`<home>/.indusagi`), and the credential store is `auth.json` under it. The path is
+resolved by `induscode::core::workspace` into `Workspace::auth_path`:
+
+| Variable | Role |
+|----------|------|
+| `INDUSAGI_CODING_AGENT_DIR` | Agent profile-directory override (highest precedence) |
+| *(default)* | `~/.indusagi/agent` |
+
+```rust
+// brand.rs — the single source of identity truth
+profile_dir_name:  ".indusagi"
+state_dir_name:    "agent"
+env_prefix:        "INDUSAGI"
+env_profile_dir:   "INDUSAGI_CODING_AGENT_DIR"
+env_debug:         "INDUSAGI_DEBUG"
+// auth_path = <profile_root>/auth.json
+```
+
+So a default install stores credentials at `~/.indusagi/agent/auth.json`. See
+[Settings](/rust-cli/configuration/settings) and the [boot](/rust-cli/subsystems/boot)
+pipeline for directory materialisation and the legacy-oauth-file migration.
+
+## Secret redaction
+
+Every bearer secret (api key, access/refresh token) is wrapped in `SecretString`,
+whose `Debug` and `Display` redact the value so no secret can leak into a `tracing`
+span, a `{:?}` log line, or a panic message. The cleartext is reachable only via
+`SecretString::expose`:
+
+```rust
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct SecretString(String);
+
+impl SecretString {
+    pub fn new(value: impl Into<String>) -> Self;
+    pub fn expose(&self) -> &str;      // the only path that yields the real bytes
+    pub fn is_empty(&self) -> bool;
+}
+// {:?} → SecretString("<redacted>")   |   {} → <redacted>
+```
+
+`OAuthCredentials` likewise has a custom `Debug` that prints `<redacted>` for its
+`access`/`refresh` fields. On a TTY the api-key prompt mutes echo via crossterm raw
+mode (`read_secret_raw`); a piped stdin falls through to a plain line read so the
+flow stays scriptable.
+
+## Typed faults
+
+Every failure is a typed `CredentialFault`, never a string sentinel or a bare
+`process::exit`. `format_credential_fault(&fault)` renders the single human-facing
+message (label, message, and an optional hint on a second indented line) the caller
+prints before exiting non-zero. The seven kinds:
+
+```rust
+pub enum CredentialFaultKind {
+    UnknownProvider, InvalidKey, InvalidAccount,
+    NameCollision, NotFound, Vault, Aborted,
+}
+```
+
+| Kind | `label()` | Meaning |
+|------|-----------|---------|
+| `UnknownProvider` | Unknown provider | A named provider is not in the directory / registry |
+| `InvalidKey` | Invalid api key | The api key is empty, too short, or a placeholder |
+| `InvalidAccount` | Invalid account name | The account name is empty, too long, or malformed |
+| `NameCollision` | Account already exists | An account by that name already exists for the provider |
+| `NotFound` | Nothing to remove | `signout` found nothing to remove |
+| `Vault` | Credential store error | The credential store (or browser sign-in) failed |
+| `Aborted` | Cancelled | The interactive provider pick was cancelled |
+
+A vault I/O failure is a separate `VaultError(String)` that the command folds into
+a `Vault` fault (`to_vault_fault`). The command never panics for an expected
+failure — it surfaces as `result.fault`, which `run_agent_credential` maps to
+`ExitCode::FAILURE` after printing the message to stderr.
+
+## Console overlays
+
+Inside the interactive ratatui console, three leaf modules under
+`console/overlays/` route credential management onto the framework's `LoginDialog`
+and `OAuthDialog` widgets (see [Dialogs](/rust-cli/console/dialogs)):
+
+| Module | Modal | Role |
+|--------|-------|------|
+| `signin.rs` | `ModalKind::SignIn` | The merged-directory picker (`LoginMode::Login`); `resolve_direct_route` skips the picker for `/login <provider>`; routes each entry by `AuthKind` to the entry overlay |
+| `signout.rs` | `ModalKind::SignOut` | The saved-account picker (`LoginMode::Logout`); accounts are pre-fetched before the push (a synchronous `handle_key` cannot `await` the vault) |
+| `oauth.rs` | `ModalKind::Oauth` | The in-flight browser/api-key entry overlay; seeds `OAuthOverlayState`, then drives the live flow over a channel |
+
+Because the framework `Dialog::handle_key` is synchronous, the live OAuth flow runs
+on a spawned task and reports back over a `tokio::sync::mpsc` channel:
+`OverlayCallbacks` implements `OAuthLoginCallbacks` by sending `OAuthProgress`
+events (`Auth` / `Prompt` / `Progress`) that the host folds into the open dialog
+with `apply_progress`. A manual-code prompt parks a `oneshot::Sender<String>` the
+dialog's Enter fulfils. `entry_mode_for(AuthKind)` maps a chosen provider to the
+entry body (`OAuthMode::Oauth` vs `OAuthMode::ApiKey`); `build_api_key_save`
+produces the vault-write for a submitted key; `provider_model_rule` binds the
+provider's *newest* catalog model after sign-in (early entries 404).
+
+## Programmatic surface
+
+The whole flow is `async` and its I/O is injectable (`CredentialIo` for the
+console seam, `OAuthSeam` for the browser registry, `AuthVault` for the store), so
+it can be driven over in-memory stand-ins with no real terminal, network, or disk.
+
+| Name | Kind | Module | Purpose |
+|------|------|--------|---------|
+| `run_credential_command` | async fn | `launch::credentials` | The `signin`/`signout` command; returns `CredentialResult` with `handled`/`fault` |
+| `PROVIDER_DIRECTORY` | const | `launch::credentials` | The 14-provider api-key directory |
+| `find_provider` | fn | `launch::credentials` | Case-insensitive provider lookup by id |
+| `validate_api_key` / `validate_account_name` | fn | `launch::credentials` | Format validators returning `Option<CredentialFault>` |
+| `format_credential_fault` | fn | `launch::credentials` | Render a `CredentialFault` as one human-facing message |
+| `DiskAuthVault` | struct | `launch::credentials` | The on-disk `provider→account→record` vault; `status_entries` for `auth status` |
+| `AuthVault` | trait | `launch::credentials` | The vault surface the command depends on |
+| `SecretString` | struct | `launch::credentials` | Redacting wrapper for a bearer secret |
+| `CredentialFault` / `CredentialFaultKind` | struct / enum | `launch::credentials` | Typed failure record (7 kinds) and its discriminant |
+| `register_built_in_oauth_providers` | fn | `launch::oauth` | Idempotent registry prime (anthropic, openai-codex, github-copilot) |
+| `start_oauth_login` | async fn | `launch::oauth` | Drive a browser sign-in and persist through the vault |
+| `list_login_providers` | fn | `launch::oauth` | The merged sign-in directory, tagged by `AuthKind` |
+| `is_oauth_capable` / `has_registered_oauth_client_id` | fn | `launch::oauth` | Registry-capability and sentinel-gate predicates |
+| `open_login_url` / `extract_code` | fn | `launch::oauth` | `http(s)`-only browser launcher and pasted-code extractor |
+| `OAuthCredentials` | struct | `launch::oauth` | Stored browser-sign-in tokens (`access`/`refresh`/`expires`) with redacting `Debug` |
+
+```rust
+use induscode::launch::credentials::{
+    run_credential_command, format_credential_fault, DiskAuthVault,
+};
+use induscode::launch::oauth::register_built_in_oauth_providers;
+
+let _ = register_built_in_oauth_providers();     // explicit prime; idempotent
+let vault = DiskAuthVault::new(workspace.auth_path.clone());
+let result = run_credential_command(
+    &["signin".into(), "openai".into(), "--method".into(), "api-key".into()],
+    &vault, &io, &oauth_seam,
+).await;
+if let Some(fault) = result.fault {
+    eprintln!("{}", format_credential_fault(&fault));   // exit non-zero
+}
+```
+
+A non-verb leading token short-circuits cleanly:
+
+```rust
+let res = run_credential_command(&["explain".into(), "this".into()], &v, &io, &o).await;
+assert!(!res.handled);   // the orchestrator falls through to a normal run
+```
+
+## Notes
+
+- `signin` / `signout` accept `login` / `logout` as natural-language aliases.
+- The CLI appends `--method api-key` to a bare `signin` (no method chosen), since
+  the default-build OAuth client ids are unconfigured sentinels; pass `--oauth` to
+  force the browser flow.
+- The env var is consulted before prompting, so an already-set `ANTHROPIC_API_KEY`
+  can be stored without re-typing it.
+- Browser sign-in is paste-based: there is no local callback server. Approve in the
+  browser, then paste the code (or the full redirect URL) back.
+- `auth status` reads BOTH the agent's nested vault AND a framework single-record
+  file, so an api-key sign-in is always visible.
+- State lives under `~/.indusagi/agent/` by default; relocate it with
+  `INDUSAGI_CODING_AGENT_DIR`.
+- For the underlying provider abstraction and the OAuth transport primitives, see
+  the framework [LLM gateway](/rust/subsystems/llm-gateway); for picking a model
+  once authenticated, see the [launch subsystem](/rust-cli/subsystems/launch).

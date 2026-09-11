@@ -1,0 +1,454 @@
+# Channels (Headless)
+
+> The non-interactive driver surface of the Rust `induscode` agent (`indusr` / `indusagir`): a frozen JSON-RPC 2.0 / NDJSON wire contract plus two channels that drive the product [Conductor](/rust-cli/subsystems/conductor) from outside the ratatui console. The **one-shot** channel runs prompts to settlement and writes either clean final text (the `-p`/`--print` path, `OneshotShape::Text`) or a streamed NDJSON event log (`OneshotShape::Ndjson`, built and tested but not yet wired to a CLI flag); the **link** channel is a long-lived JSON-RPC 2.0 server over stdio (the `--json`/`--rpc` path) that a driving parent process steers turn by turn. Everything rides one separator-safe NDJSON framer and one declarative op registry; every transport is an injected `LineSink` / `LineSource` seam, so the whole subsystem tests over in-memory pipes with zero real stdio.
+
+The `channels` module (`induscode::channels`, the merged crate's `pub mod`) is how the agent talks to a [`Conductor`](/rust-cli/subsystems/conductor) when no console is attached. It declares **one** contract — a JSON-RPC 2.0 envelope, the U+2028/U+2029-safe NDJSON framer, a data-driven operation registry, ask/tell dialog primitives, and a flat wire snapshot — and two channels written against it. The protocol is a single op registry consumed by **both** the server (data-driven dispatch, no `match` ladder) and the wire (the [Boot](/rust-cli/subsystems/boot) `LinkRunner`'s read loop), so the served method set and the dispatch path can never drift. The crate is **headless** by design: it carries no `tui` dependency, so a `--no-default-features` build keeps the print/JSON path standing alone with the console absent.
+
+## Table of Contents
+
+- [Reaching the Channels](#reaching-the-channels)
+- [The One-Shot Channel (print mode)](#the-one-shot-channel-print-mode)
+- [The Link Channel (NDJSON wire)](#the-link-channel-ndjson-wire)
+- [The Wire Contract](#the-wire-contract)
+- [The Operation Registry](#the-operation-registry)
+- [Session Ops and the Snapshot](#session-ops-and-the-snapshot)
+- [NDJSON Framing](#ndjson-framing)
+- [The Dialog Bridge](#the-dialog-bridge)
+- [Signal to Frame Mapping](#signal-to-frame-mapping)
+- [Public API](#public-api)
+- [Design Notes](#design-notes)
+- [Source Files](#source-files)
+
+## Reaching the Channels
+
+The two channels back two of the launcher's three runners. [Boot](/rust-cli/subsystems/boot) derives an `OutputMode` from your flags — the launch parser's `derive_mode` returns `Rpc` when `--json`/`--rpc` is set, `Json` when `--print`/`-p` rides without `--interactive`, else `Text` — and the boot pipeline's `map_invocation` maps that mode onto a `RunnerId` (`Rpc → Link`, `Json → Oneshot`, `Text → Repl`). The registry `[repl, oneshot, link]` then first-accepts the runner whose `accepts` matches `inv.mode` (`boot::runners`):
+
+| CLI invocation | `OutputMode` → `RunnerId` | Runner | Channel |
+|----------------|---------------------------|--------|---------|
+| `indusr -p "…"` | `Json` → `RunnerId::Oneshot` | `OneShotRunner` | one-shot, `OneshotShape::Text` |
+| `indusr --json` | `Rpc` → `RunnerId::Link` | `LinkRunner` | link server over stdin/stdout |
+| `indusr -p --json "…"` | `Rpc` → `RunnerId::Link` | `LinkRunner` | link server (`--json` wins over `-p`) |
+
+The `OneShotRunner` builds a `ChannelContext` over a `StdoutSink` (`LineSink`) + `inert_dialog()` and calls `run_oneshot`. The output shape comes from `oneshot_shape(&inv)`, which **unconditionally returns `OneshotShape::Text`** at this milestone — the boot `Invocation` does not yet carry a structured-output flag, so the one-shot NDJSON shape is built and tested but is not wired to any CLI flag (the M-launch deferral; the runner switches to `OneshotShape::Ndjson` once the launch projection threads the indicator). The `LinkRunner` assembles a `session_ops()` registry and pumps each framed line off the boot `InputSource` through `handle_link_line`, framing one correlated reply per request.
+
+```bash
+export ANTHROPIC_API_KEY=sk-ant-...
+
+indusr -p "summarise what changed on this branch"   # clean final text (one-shot, Text)
+indusr --json                                        # JSON-RPC line protocol (parent-driven, link)
+```
+
+`channels` owns no session or agent logic of its own — every operation delegates to the conductor on the context, and the two channels just emit a conductor's results. See [Conductor](/rust-cli/subsystems/conductor) for the session loop and [Sessions](/rust-cli/subsystems/sessions) for persistence. Signals ultimately originate from the framework agent loop ([`indusagi::runtime`](/rust/subsystems/runtime)), but a channel only ever switches on the conductor's own typed `SessionSignal` vocabulary, never a raw framework `RunEvent`.
+
+## The One-Shot Channel (print mode)
+
+`run_oneshot(ctx: &ChannelContext, opts: &OneshotRequest) -> i32` runs one non-interactive request to settlement and returns a process exit code (`0` clean / `1` faulted). The output shape is not a branch through the runner body — it is a **strategy object** selected by `strategy_for(shape)`. Each `OneshotStrategy` supplies an optional `on_start`, an optional `on_signal`, an optional `set_fallback`, and a mandatory `finish(state, ctx) -> i32`:
+
+```rust
+// crates/induscode/src/channels/contract.rs
+pub trait OneshotStrategy: Send + Sync {
+    fn on_start(&self, _ctx: &ChannelContext) {}
+    fn on_signal(&self, _signal: &SessionSignal, _ctx: &ChannelContext) {}
+    fn set_fallback(&self, _text: String) {}
+    fn finish(&self, state: &ConductorState, ctx: &ChannelContext) -> i32;
+}
+```
+
+The runner is shape-agnostic: it subscribes the strategy to `conductor.subscribe(...)`, runs `on_start`, seeds `state` with the current snapshot, submits each prompt in order via `conductor.submit(...)`, hands the final `ConductorState` to `finish`, and always tears the subscription down before returning.
+
+| Shape | `on_start` | `on_signal` | `finish` writes |
+|-------|-----------|-------------|-----------------|
+| `OneshotShape::Text` | — | accumulates each `SessionSignal::Text { delta }` | one clean final line (the accumulated answer, or the snapshot fallback) |
+| `OneshotShape::Ndjson` | a `{"type":"signal","name":"start","body":{}}` frame | frames every signal via `signal_to_frame` | a `{"type":"signal","name":"end","body":{phase,usage,fault}}` frame |
+
+The `OneshotRequest` carries the shape, an ordered `Vec<String>` of prompts, and optional `images`:
+
+```rust
+// crates/induscode/src/channels/contract.rs
+pub struct OneshotRequest {
+    pub shape: OneshotShape,        // Text | Ndjson
+    pub prompts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ChannelImage>,  // mediaType + dataBase64, ride the first prompt
+}
+```
+
+### Text shape
+
+`TextStrategy` collects every `SessionSignal::Text { delta }` into a `Mutex<String>` accumulator and emits the answer **once, clean** in `finish` — so a caller capturing stdout gets the final answer rather than a token-by-token dribble. Thinking deltas, tool frames, and bookkeeping signals are ignored. Two behaviours mirror the framework [`OneShotRunner`](/rust/subsystems/runtime) so `-p` is never silently empty and never silently failing:
+
+- **Snapshot fallback.** When nothing streamed (the accumulator is empty) and the run settled cleanly, `run_oneshot` resolves the final assistant text off the conductor (`ctx.conductor.final_assistant_text().await`) and installs it via `set_fallback` before `finish` runs. The accumulator wins when non-empty; otherwise `finish` emits the fallback. This async read cannot live in the sync `finish`, so it happens in the runner.
+- **Fault report.** When the settled state is `ConductorPhase::Faulted`, `finish` writes a single `run failed: <message>` line to the **error** sink (`LineSink::write_error`, routed to stderr), so the user learns *why* the run failed, then still returns the fault exit code (`1`).
+
+### NDJSON shape
+
+`NdjsonStrategy` streams every conductor signal as one framed line. (At this milestone the shape is reachable only by constructing an `OneshotRequest { shape: OneshotShape::Ndjson, … }` directly — see the Rust example below — not from a CLI flag, since `--json` routes to the link channel and `oneshot_shape` always returns `Text`.) When driven, the strategy emits:
+
+```text
+{"type":"signal","name":"start","body":{}}
+{"type":"signal","name":"text","body":{"kind":"text","delta":"…"}}
+{"type":"signal","name":"tool_start","body":{"kind":"tool_start","id":"…","name":"bash"}}
+… {"type":"signal","name":"end","body":{"phase":"…","usage":{…},"fault":null}}
+```
+
+`on_start` emits the opening `start` frame; `on_signal` frames each `SessionSignal` through `signal_to_frame` (separator-safe `encode_line`); `finish` emits the closing `end` frame whose `body` carries the settled `phase`, cumulative `usage`, and `fault` (`null` when there was none). Every line is separator-safe by construction.
+
+Driven directly from Rust:
+
+```rust
+use induscode::channels::{ChannelContext, OneshotRequest, OneshotShape};
+use induscode::channels::protocol::{run_oneshot, inert_dialog};
+
+let ctx = ChannelContext {
+    conductor: my_conductor,           // Arc<Conductor>
+    out: my_line_sink,                 // Arc<dyn LineSink>
+    dialog: inert_dialog(),            // headless: ask -> fallback, tell dropped
+};
+let request = OneshotRequest {
+    shape: OneshotShape::Text,
+    prompts: vec!["fix the failing test".into()],
+    images: vec![],
+};
+let exit_code = run_oneshot(&ctx, &request).await;   // 0 clean, 1 faulted
+```
+
+`inert_dialog()` is the shared `DialogBridge` for headless runs: every `ask()` resolves immediately with the caller's fallback and every `tell()` is dropped, so the agent never wedges on a prompt with no driver attached.
+
+## The Link Channel (NDJSON wire)
+
+The link channel is a long-lived, bidirectional JSON-RPC 2.0 conversation. The `LinkRunner` serves the `session_ops()` registry over stdin/stdout; a driving parent process writes framed requests and reads framed replies:
+
+```text
+-> {"jsonrpc":"2.0","id":"lnk-1","method":"submit","params":{"input":"hi"}}
+<- {"jsonrpc":"2.0","id":"lnk-1","result":{"model":"…","streaming":false,"sessionId":"…","usage":{…}}}
+```
+
+### The read loop
+
+`LinkRunner::run` builds one `Conductor`, mints the `session_ops()` registry once, and pumps complete framed request lines off the boot `InputSource` seam in arrival order. The seam already splits on `\n`, reassembling a request that straddled raw chunks, so the runner reads whole lines:
+
+```rust
+// crates/induscode/src/boot/runners.rs (LinkRunner::run)
+while let Some(line) = ctx.io.input.next_line().await {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        continue;                 // ignore blank lines
+    }
+    handle_link_line(&registry, &channel, trimmed).await;
+}
+EXIT_OK                           // EOF ends the loop with a success exit code
+```
+
+Each line is handled to settlement **before** the next is read, so per-request replies stay contiguous (the framework `WireRunner`'s serialized read-loop discipline). This is a sequential pump: the M-channels link path drives one request at a time off the runner loop. (The TS `ChannelContext` doc-comment notes a concurrent `inflight` discipline where a server hands a fresh context into each dispatched handler; the Rust crate ships no such standalone server — the only link path is this sequential `LinkRunner` loop.)
+
+### Dispatching one line
+
+`handle_link_line(registry, channel, line)` mirrors the framework `WireRunner::handle_line` and is the lone wire dispatch:
+
+- A **malformed** line is reported once as a single `Reply::Err` carrying `op_error::PARSE` (`-32700`) with the message `"malformed JSON request line"` and an empty-string id (`RequestId::Str(String::new())`, since no id could be parsed); the loop continues.
+- A well-formed `OpRequest` has its `params` extracted (`request.params.clone().unwrap_or(Value::Null)`) and is dispatched through `dispatch(registry, &request.method, params, channel)`.
+- A request with an `id` gets **exactly one** correlated reply — `Reply::Ok` on success, `Reply::Err` (carrying the handler's `OpError`) on failure — framed through `encode_line`.
+- A request with **no** `id` is a notification: dispatched for effect and never replied to.
+
+```rust
+// crates/induscode/src/boot/runners.rs (handle_link_line)
+let params = request.params.clone().unwrap_or(serde_json::Value::Null);
+let outcome = dispatch(registry, &request.method, params, channel).await;
+let Some(id) = request.id else { return; };          // notification: no reply
+let reply = match outcome {
+    Ok(result) => Reply::Ok(ReplyOk { jsonrpc: PROTOCOL_VERSION.to_string(), id, result }),
+    Err(error) => Reply::Err(ReplyErr { jsonrpc: PROTOCOL_VERSION.to_string(), id, error }),
+};
+channel.out.write(&encode_line(&reply));
+```
+
+A malformed line, an unknown method, an invalid-params failure, or a handler error all keep the loop alive — the resilient continuation the framework `WireRunner` is built around. EOF (`next_line()` returns `None`) ends the loop with `EXIT_OK`.
+
+## The Wire Contract
+
+`channels::contract` is the **frozen type seam** — only shapes and inert pure constants, no I/O, no dispatch. The envelope is JSON-RPC 2.0: a request is an `OpRequest { jsonrpc, id?, method, params? }`, a reply is `Reply::Ok(ReplyOk { jsonrpc, id, result })` or `Reply::Err(ReplyErr { jsonrpc, id, error })`. The `Reply` enum is `#[serde(untagged)]`, so serde discriminates the arms by the presence of the `result` / `error` key — exactly the TS `isReplyOk` narrowing; `Reply::is_ok()` is the Rust accessor.
+
+```rust
+// crates/induscode/src/channels/contract.rs
+pub const PROTOCOL_VERSION: &str = "2.0";       // stamped on every framed envelope
+pub const REQUEST_ID_PREFIX: &str = "lnk-";     // driver mints lnk-<base36 now>-<seq>
+
+#[derive(Serialize, Deserialize)]
+pub struct OpRequest {
+    pub jsonrpc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<RequestId>,
+    pub method: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Value>,
+}
+```
+
+`RequestId` is `#[serde(untagged)]` over `Str(String)` / `Num(i64)`: a request with an id expects exactly one reply bearing the same id; a request without an id is a notification. The driver mints string ids; numeric ids are accepted on the wire and round-trip back to the same JSON scalar.
+
+The `op_error` module pins the closed JSON-RPC error code set:
+
+| Constant | Code | Meaning |
+|----------|------|---------|
+| `op_error::PARSE` | `-32700` | the framed line was not valid JSON |
+| `op_error::INVALID_REQUEST` | `-32600` | the frame was not a well-formed request |
+| `op_error::UNKNOWN_OP` | `-32601` | no operation registered under `method` |
+| `op_error::INVALID_PARAMS` | `-32602` | `params` failed the operation schema |
+| `op_error::HANDLER_FAILED` | `-32000` | the operation handler errored |
+
+An `OpError { code: i32, message: String, data: Option<Value> }` frames as `{code, message, data?}` (`data` omitted when absent). Typed dialog frames also cross the seam: `Ask` (`type:"ask"`, blocking agent→driver request), `AskAnswer` (`type:"answer"`, correlated reply), `Tell` (`type:"tell"`, one-way notice), and `Signal` (`type:"signal"`, uncorrelated server→driver event). Each carries a zero-variant tag enum (`AskTag::Ask`, `AnswerTag::Answer`, `TellTag::Tell`, `SignalTag::Signal`) so the `"type"` literal is type-pinned.
+
+`ChannelContext` bundles the conductor, the framed output sink, and the dialog bridge, and is handed to every op handler and shared by both channels:
+
+```rust
+// crates/induscode/src/channels/contract.rs
+#[derive(Clone)]                                  // cheap: every field is Arc-shared
+pub struct ChannelContext {
+    pub conductor: Arc<Conductor>,
+    pub out: Arc<dyn LineSink>,
+    pub dialog: Arc<dyn DialogBridge>,
+}
+```
+
+Unlike the TS contract, the Rust context does **not** carry a framer — framing is the pure `crate::core::ndjson` primitive (re-homed by `channels::framer`), so the sink only ever receives already-framed lines.
+
+### The injectable transport seams
+
+Pinning the dependency to a one-method trait is what lets a test capture output into a `Vec` while production passes the real process stdout. `LineSink` is the writable surface (the product analogue of the framework's `OutputSink`); `LineSource` is the pull-model readable surface (the analogue of `InputSource`):
+
+```rust
+// crates/induscode/src/channels/contract.rs
+pub trait LineSink: Send + Sync {
+    fn write(&self, chunk: &str);            // one already-framed, \n-terminated line
+    fn write_error(&self, chunk: &str) { /* default routes to process stderr */ }
+}
+
+#[async_trait::async_trait]
+pub trait LineSource: Send + Sync {
+    async fn next_chunk(&self) -> Option<String>;   // None at end-of-stream
+}
+```
+
+The production sink is `boot::runners::StdoutSink`, which implements `LineSink` over `print!` (the framer already terminated the line) and inherits the default `write_error` to stderr.
+
+`ChannelTimings` carries `Duration` budgets — `DEFAULT_CHANNEL_TIMINGS` is `startup` 1500 ms · `shutdown` 1200 ms · `request` 45 s · `dialog` 90 s — owned here and overridable by an embedder. (The TS carried these as milliseconds; the Rust seam holds them as `Duration`.)
+
+## The Operation Registry
+
+The protocol is **one data-driven operation registry**, not a hand-written dispatch ladder mirrored by hand-written client methods. An `Op` binds a wire `method` name to a typed async `handle`:
+
+```rust
+// crates/induscode/src/channels/protocol.rs
+pub struct Op {
+    pub method: &'static str,
+    pub handle: Box<
+        dyn for<'a> Fn(Value, &'a ChannelContext)
+            -> Pin<Box<dyn Future<Output = Result<Value, OpError>> + Send + 'a>>
+            + Send + Sync,
+    >,
+}
+
+pub type OpRegistry = HashMap<&'static str, Op>;
+```
+
+The registry is keyed by the same string used as each op's `method`, so server dispatch is one lookup and the served method set is exactly the keys. The runtime helpers:
+
+- `dispatch(registry, method, params, ctx) -> Result<Value, OpError>` — the lone dispatch path: a map lookup, then `await (op.handle)(params, ctx)`. An unregistered method returns `UnknownOpError::new(method).into_op_error()`, which carries `op_error::UNKNOWN_OP` (`-32601`) and `data: {"method": <name>}`.
+- `has_op(registry, method) -> bool` — membership test.
+- `methods_of(registry) -> Vec<&'static str>` — the sorted method names (the driver's deterministic method set).
+
+```rust
+// crates/induscode/src/channels/protocol.rs
+pub async fn dispatch(
+    registry: &OpRegistry, method: &str, params: Value, ctx: &ChannelContext,
+) -> Result<Value, OpError> {
+    match registry.get(method) {
+        Some(op) => (op.handle)(params, ctx).await,
+        None => Err(UnknownOpError::new(method).into_op_error()),
+    }
+}
+```
+
+`UnknownOpError` is a `thiserror::Error` carrying the offending `method`; `UnknownOpError::CODE` is the frozen `-32601`. Per-op params are deserialized through a private `parse_params::<P>(params)` helper that lowers a schema mismatch to an `op_error::INVALID_PARAMS` `OpError` — so a typed validation failure becomes a `Reply::Err`, never a panic.
+
+## Session Ops and the Snapshot
+
+`session_ops() -> OpRegistry` builds the concrete frozen registry the link serves; each op delegates to `ctx.conductor`:
+
+| Method | Conductor call | Params | Reply |
+|--------|----------------|--------|-------|
+| `submit` | `ctx.conductor.submit(p.input).await` | `SubmitParams { input }` | `LinkSnapshot` |
+| `abort` | `ctx.conductor.abort().await` | — | `LinkSnapshot` |
+| `snapshot` | `ctx.conductor.snapshot()` | — | `LinkSnapshot` |
+| `resume` | (params parsed; current snapshot) | `ResumeParams { sessionId }` | `LinkSnapshot` |
+| `listModels` | reads `ctx.conductor.model_id()` | — | `[{ "id", "active": true }]` |
+| `cycleModel` | `ctx.conductor.select_model(p.model_id)` | `CycleModelParams { modelId }` | `LinkSnapshot` |
+
+Method names and snapshot field casing are kept **verbatim** (`submit`, `listModels`, `cycleModel`, `sessionId`, `autoCondense`, `messageCount`, `queuedCount`, …) for cross-host compatibility — a foreign driver speaking to the TS or Python server must also speak to the Rust one. The param structs carry serde renames to pin the wire casing:
+
+```rust
+// crates/induscode/src/channels/contract.rs
+pub struct SubmitParams { pub input: String }
+pub struct ResumeParams { #[serde(rename = "sessionId")] pub session_id: String }
+pub struct CycleModelParams { #[serde(rename = "modelId")] pub model_id: String }
+pub struct ModelEntry { pub id: String, pub active: bool }
+```
+
+`listModels` currently returns only the single active model entry; `cycleModel` routes through the conductor's `select_model` (the TS `cycleModel`/`selectModel` share one path). `resume` parses its params for wire-validity but replies with the current snapshot at this milestone — when the conductor surfaces a resume that threads a session in, it slots through here unchanged.
+
+### The wire snapshot
+
+`project_snapshot(state: &ConductorState, extra: &SnapshotExtra) -> LinkSnapshot` reshapes a `ConductorState` into the flat wire `LinkSnapshot` — the link's own vocabulary, derived from the conductor state but shaped for the wire, not a passthrough:
+
+```rust
+// crates/induscode/src/channels/contract.rs
+pub struct LinkSnapshot {
+    pub model: String,
+    pub thinking: ThinkingLevel,
+    pub streaming: bool,
+    pub condensing: bool,
+    pub faulted: bool,
+    #[serde(rename = "sessionId")] pub session_id: String,
+    #[serde(rename = "sessionFile", default, skip_serializing_if = "Option::is_none")]
+    pub session_file: Option<String>,
+    #[serde(rename = "autoCondense")] pub auto_condense: bool,
+    #[serde(rename = "messageCount")] pub message_count: u64,
+    #[serde(rename = "queuedCount")] pub queued_count: u64,
+    pub usage: Usage,
+}
+```
+
+Busy flags are read off the coarse `ConductorPhase`: `streaming` is `Streaming | Tooling` (tooling counts as streaming on the wire), `condensing` is `Condensing`, `faulted` is `Faulted`. `thinking` defaults to `DEFAULT_THINKING = ThinkingLevel::Off` when the `SnapshotExtra` carries no reasoning effort. `auto_condense` defaults to `true`, counts to `0`. `usage` rides through as the framework [`indusagi::llmgateway::contract::Usage`](/rust/subsystems/llm-gateway). Field **order** is the serde struct order (with `serde_json`'s `preserve_order`), mirroring TS `JSON.stringify` — the byte-compat contract the golden tests pin. `sessionFile` is **omitted** (not nulled) when absent, exactly as `JSON.stringify` dropped the undefined field. `SnapshotExtra` supplies the fields the conductor does not surface on its bare state (`thinking`, `session_file`, `auto_condense`, `message_count`, `queued_count`).
+
+## NDJSON Framing
+
+Framing is one JSON value per line. `channels::framer` implements the separator-safe NDJSON transport — a pure encoder (`encode_line`) plus a stateful, cross-chunk decoder (`LineCodec` / `decode_lines`), both I/O-free seams over an injected stream, so the server, the one-shot channel, and the tests all share one correct implementation.
+
+The correctness pin: **U+2028 (LINE SEPARATOR)** and **U+2029 (PARAGRAPH SEPARATOR)** are legal inside a JSON string but break a naive line splitter, and `serde_json` (like TS `JSON.stringify`) emits them raw. `encode_line` rewrites both to their `\uXXXX` escapes; the decoder splits strictly on the line feed (U+000A) only — so any value the encoder emits round-trips through the decoder unchanged regardless of payload content.
+
+```rust
+// crates/induscode/src/channels/framer.rs
+pub fn encode_line<T: Serialize + ?Sized>(value: &T) -> String {
+    let json = serde_json::to_string(value).unwrap_or_else(|_| "null".to_string());
+    let mut line = escape_separators(&json).into_owned();   // U+2028/U+2029 ->  /
+    line.push('\n');                                          // exactly one terminator
+    line
+}
+```
+
+`encode_line` never panics: a serialization failure folds to a JSON `null` line so a framing call site stays infallible (mirroring the TS surface where `JSON.stringify` of a frame type cannot throw). The fast path is allocation-free — when neither separator is present, `escape_separators` returns the input borrowed untouched.
+
+`LineCodec` is the pull-model decoder: `push(chunk) -> Result<Vec<Value>, DecodeError>` buffers an incoming chunk and returns every complete line it now holds (parsed as `serde_json::Value`), retaining a partial trailing line until its newline arrives; `flush() -> Result<Option<Value>, DecodeError>` drains a final, newline-unterminated frame at end-of-stream so a non-`\n`-terminated last frame is not silently dropped. Whitespace-only lines are skipped; an invalid line short-circuits with a `DecodeError` carrying the offending line text. `decode_lines(source) -> Result<Vec<Value>, DecodeError>` drains a whole `LineSource` to its ordered values (the eager collector the tests run); a progressive caller drives a `LineCodec` directly. `NdjsonFramer` is the bundled zero-sized handle that proxies all three (`encode_line` / `codec` / `decode_lines`).
+
+> Note: at the M-channels milestone the one-shot NDJSON strategy carries a local, behaviour-identical `encode_line` inside `channels::protocol` (same escape-then-`\n` logic); it folds onto `channels::framer::encode_line` once the framer is the crate-of-record at every call site.
+
+## The Dialog Bridge
+
+The whole dialog surface the agent needs — multiple-choice, confirm, free-text, editor sessions, notifications, status, titles — reduces to two generic primitives on the `DialogBridge` trait:
+
+```rust
+// crates/induscode/src/channels/contract.rs
+pub trait DialogBridge: Send + Sync {
+    fn ask<'a>(
+        &'a self, kind: &'a str, payload: Option<Value>, fallback: Value,
+    ) -> Pin<Box<dyn Future<Output = Value> + Send + 'a>>;
+
+    fn tell(&self, kind: &str, payload: Option<Value>);
+}
+```
+
+`ask` is the round-trip primitive: it emits an `Ask` frame and resolves with the matching answer value, or its `fallback` on timeout / dismissal — so a disconnected or non-interactive driver never wedges the agent. `tell` is fire-and-forget (status updates, a flashed notification, a title change) and returns immediately. Every concrete dialog method (select, confirm, input, notify, set-status, …) is expressed in terms of these two, so there is no per-method choreography to repeat. The seam carries the value as a `Value`; the caller deserializes its `T`.
+
+The headless implementation is `InertDialog` (handed out by `inert_dialog() -> Arc<dyn DialogBridge>`): every `ask` resolves immediately with its caller-supplied fallback and every `tell` is dropped, so a one-shot run or a non-interactive link never writes dialog frames or blocks on a missing driver. When a console is attached, the interactive [Dialogs](/rust-cli/console/dialogs) supply a live bridge instead.
+
+## Signal to Frame Mapping
+
+`signal_to_frame(signal: &SessionSignal) -> Signal` projects a conductor signal onto a wire frame: `name` is the signal's `kind` discriminant and `body` is the whole serialized signal. The `SessionSignal` enum is `#[serde(tag = "kind", rename_all = "snake_case")]`, so the kind is read off the serde-tagged JSON the signal serializes to — the two can never drift:
+
+```rust
+// crates/induscode/src/channels/protocol.rs
+pub fn signal_to_frame(signal: &SessionSignal) -> Signal {
+    let body = serde_json::to_value(signal).unwrap_or(Value::Null);
+    let name = body.get("kind").and_then(Value::as_str).unwrap_or("").to_string();
+    Signal { frame: SignalTag::Signal, name, body }
+}
+```
+
+The eleven [`SessionSignal`](/rust-cli/subsystems/conductor) kinds that flow onto the wire (as both `name` and the body's `kind`):
+
+| `name` | Body fields | Meaning |
+|--------|-------------|---------|
+| `prompt` | `text` | the user's turn was accepted |
+| `text` | `delta` | a chunk of assistant answer text |
+| `thinking` | `delta` | a chunk of reasoning text |
+| `tool_start` | `id`, `name` | a tool invocation began |
+| `tool_end` | `id`, `name`, `ok`, `output?`, `diff?` | a tool invocation finished |
+| `turn_end` | `usage` | the assistant turn settled |
+| `persisted` | `entry_id` | the latest node was committed |
+| `compacted` | — | the transcript was condensed |
+| `fault` | `fault` | a typed `ConductorFault` occurred |
+| `queue` | `count` | the pending-input queue depth changed |
+| `idle` | — | the conductor is ready for input |
+
+The one-shot NDJSON shape streams these straight to the sink; the one-shot `start` / `end` frames are channel-synthesized (not conductor signals), carrying `body:{}` and `body:{phase,usage,fault}` respectively.
+
+## Public API
+
+The wire seam re-exports at the crate root (`induscode::channels::*`); the runtime face lives under `induscode::channels::protocol` and the framer under `induscode::channels::framer`.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `run_oneshot` | async fn | `protocol.rs` | run one request to settlement; returns the exit code |
+| `inert_dialog` | fn | `protocol.rs` | headless `DialogBridge`: ask→fallback, tell dropped |
+| `InertDialog` | struct | `protocol.rs` | the headless `DialogBridge` impl |
+| `OneshotRequest` | struct | `contract.rs` | `shape` + ordered `prompts` + optional `images` |
+| `OneshotShape` | enum | `contract.rs` | `Text` / `Ndjson` (serde lowercase) |
+| `OneshotStrategy` | trait | `contract.rs` | per-shape `on_start` / `on_signal` / `set_fallback` / `finish` |
+| `TextStrategy` / `NdjsonStrategy` | struct | `protocol.rs` | the two concrete one-shot strategies |
+| `ChannelImage` | struct | `contract.rs` | `mediaType` + `dataBase64`, rides the first prompt |
+| `encode_line` | fn | `framer.rs` | serialize one value to a separator-safe NDJSON line |
+| `decode_lines` | async fn | `framer.rs` | drain a `LineSource` into ordered JSON values |
+| `LineCodec` | struct | `framer.rs` | stateful cross-chunk line decoder (`push` / `flush`) |
+| `DecodeError` | struct | `framer.rs` | invalid framed line, carrying the bad text |
+| `NdjsonFramer` | struct | `framer.rs` | the bundled framer handle |
+| `ChannelContext` | struct | `contract.rs` | `conductor` + `out` (`LineSink`) + `dialog` |
+| `LineSink` / `LineSource` | trait | `contract.rs` | the injectable transport seams |
+| `DialogBridge` | trait | `contract.rs` | the `ask` / `tell` protocol |
+| `Op` / `OpRegistry` | struct / type | `protocol.rs` | a named op; the `HashMap<&str, Op>` |
+| `dispatch` | async fn | `protocol.rs` | the lone server dispatch path |
+| `has_op` / `methods_of` | fn | `protocol.rs` | membership test / sorted method names |
+| `UnknownOpError` | struct | `protocol.rs` | raised on an unregistered method (`-32601`) |
+| `session_ops` | fn | `protocol.rs` | build the concrete link op registry |
+| `project_snapshot` | fn | `protocol.rs` | `ConductorState` → flat `LinkSnapshot` |
+| `signal_to_frame` | fn | `protocol.rs` | `SessionSignal` → `Signal` wire frame |
+| `LinkSnapshot` | struct | `contract.rs` | the flat wire session projection |
+| `SnapshotExtra` | struct | `contract.rs` | the extra projection inputs (defaults) |
+| `OpRequest` | struct | `contract.rs` | the JSON-RPC request envelope |
+| `Reply` / `ReplyOk` / `ReplyErr` | enum / struct | `contract.rs` | the reply envelope (untagged) + arms |
+| `OpError` / `op_error` | struct / mod | `contract.rs` | a typed error; the frozen code set |
+| `RequestId` | enum | `contract.rs` | `Str` / `Num` (untagged) correlation id |
+| `Ask` / `AskAnswer` / `Tell` / `Signal` | struct | `contract.rs` | the typed wire frames |
+| `SubmitParams` / `ResumeParams` / `CycleModelParams` / `ModelEntry` | struct | `contract.rs` | the session-op param / result shapes |
+| `ChannelTimings` / `DEFAULT_CHANNEL_TIMINGS` | struct / const | `contract.rs` | the `Duration` budgets |
+| `PROTOCOL_VERSION` / `REQUEST_ID_PREFIX` | const | `contract.rs` | `"2.0"` / `"lnk-"` |
+
+## Design Notes
+
+- **One declarative registry.** `session_ops()` drives both wire dispatch (a map lookup, no `match` ladder) and the served method set (its keys). Adding a row adds a server-handled method for free; an unregistered name simply rejects with `unknownOp` (`-32601`).
+- **Headless by construction.** The channels crate carries no `tui` dependency. A `--no-default-features` build keeps the print/JSON path standing alone with the console absent — exactly what a CI driver or a parent process needs.
+- **Strategy objects, not branches.** The output shape is selected once by `strategy_for(shape)`; the runner body never branches on it. `OneshotStrategy` is the seam, `TextStrategy` / `NdjsonStrategy` the rows.
+- **Framer correctness.** U+2028/U+2029 are escaped because `serde_json` leaves them raw yet they break line splitters; `LineCodec` splits on `\n` only, holds a partial tail across `push` calls, and `flush` emits a final unterminated frame. `encode_line` cannot panic — a serialize failure folds to a `null` line.
+- **Resilience.** `inert_dialog()` dismisses every ask (returns the fallback) so a headless run never wedges the agent. `run_oneshot` always tears down its conductor subscription. The link read loop tolerates blank lines, malformed lines, unknown methods, invalid params, and handler errors — every one is a single framed reply (or a no-op) that keeps the loop alive.
+- **Print is never silently empty or silently failing.** The text strategy emits the snapshot-resolved final assistant text when nothing streamed, and writes a `run failed: <message>` line to stderr (`LineSink::write_error`) on a faulted settle while still returning exit `1` — parity with the framework `OneShotRunner`.
+- **Verbatim casing & dropped fields.** Wire field names/casing are pinned with serde renames for cross-host compatibility; `project_snapshot` omits `sessionFile` when absent and the NDJSON `end` frame carries `fault: null` rather than dropping it — the byte-golden corpus pins both.
+
+## Source Files
+
+| File | Holds |
+|------|-------|
+| `channels/mod.rs` | the module map + the crate-root re-export barrel |
+| `channels/contract.rs` | the frozen type seam: JSON-RPC envelope, `RequestId`, dialog frames, `Signal`, `LinkSnapshot`, one-shot shapes, session-op param shapes, `ChannelContext` + `LineSink` / `LineSource`, `ChannelTimings`, the constants |
+| `channels/framer.rs` | the separator-safe NDJSON framer: `encode_line`, `LineCodec` / `decode_lines`, `DecodeError`, `NdjsonFramer` |
+| `channels/protocol.rs` | the runtime face: `Op` / `OpRegistry` / `dispatch` / `has_op` / `methods_of` / `UnknownOpError`, `session_ops` + `project_snapshot`, the one-shot strategies + `run_oneshot` + `inert_dialog`, `signal_to_frame` |
+
+The runners that wire these into CLI modes live in `boot::runners` (`OneShotRunner` for `-p`/`--print`, `LinkRunner` + `handle_link_line` for `--json`) over the `StdoutSink` `LineSink` — see [Boot](/rust-cli/subsystems/boot). The channels are the headless siblings of the interactive [Console](/rust-cli/console/overview); the same agent surface in the other editions is documented at [`/python-cli/subsystems/channels`](/python-cli/subsystems/channels) (Python) and [`/cli`](/cli) (TypeScript).

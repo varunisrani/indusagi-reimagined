@@ -1,0 +1,138 @@
+# Capabilities
+
+> `src/capabilities` is the L3 Tools layer — the built-in tool set plus the kernel
+> that registers and runs it. Imported as `indusagi/capabilities`, or as the
+> `capabilities` namespace from `indusagi`.
+
+The layer ships a declarative tool-authoring kernel (`defineTool` + `ToolRegistry`),
+the concrete built-in tools, Node-backed filesystem/shell backends, and a one-call
+`toolBox` assembler that produces a runnable `ToolBox` for the runtime.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-directories](#sub-directories)
+- [The built-in tools](#the-built-in-tools)
+- [Assembling a toolbox](#assembling-a-toolbox)
+- [Authoring a tool](#authoring-a-tool)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+From `src/capabilities/index.ts`:
+
+| Export | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `defineTool` | function | `kernel/spec.ts` | The declarative tool-authoring adapter |
+| `clamp` | function | `kernel/output.ts` | Apply an `OutputBudget` window to tool output |
+| `ToolRegistry` | class | `kernel/registry.ts` | Registers tools and names collections |
+| `UnknownToolError` | class | `kernel/registry.ts` | Thrown on an unregistered tool name |
+| `nodeFs`, `nodeShell`, `makeNodeContext` | values/fn | `backends/node-backends.ts` | The real-Node `Fs`/`Shell` backends and context factory |
+| `builtinRegistry` | function | `registry.ts` | A fresh `ToolRegistry` with every built-in tool and three collections |
+| `toolBox` | function | `registry.ts` | Produce a runnable `ToolBox` for a named collection |
+| the tools | values | `files/`, `search/`, `shell/`, `planning/`, `web/` | The built-in tool singletons (below) |
+
+Authoring/type vocabulary is also re-exported: `ToolSpec`, `ToolResult`,
+`ToolContentBlock` (`TextContentBlock` / `JsonContentBlock`), `ToolContext`,
+`DefinedTool`, the `Fs`/`Shell` backend interfaces, `OutputBudget`/`ClipEnd`, the
+context-factory types, `ToolCollection`, and the todo types (`TodoItem`,
+`TodoStatus`).
+
+The two outward contracts — the runtime's `ToolCall`/`ToolOutcome`/`ToolBox`/
+`ToolRunner` and the gateway's `ToolDescriptor`/`JsonSchema` — are deliberately
+**not** re-exported here; import those from `indusagi/runtime` (or its `contract`)
+and `indusagi/llmgateway` respectively.
+
+## Sub-directories
+
+| Directory | Holds |
+|-----------|-------|
+| `kernel/` | `spec.ts` (`defineTool`), `registry.ts` (`ToolRegistry`), `output.ts` (`clamp`/`OutputBudget`), `context.ts`, `backends.ts` (the `Fs`/`Shell` interfaces) |
+| `backends/` | `node-backends.ts` — the real `nodeFs`, `nodeShell`, and `makeNodeContext` |
+| `files/` | `read.ts`, `write.ts`, `edit.ts`, `ls.ts`, plus `diff.ts` (used by edit) |
+| `search/` | `grep.ts`, `find.ts` |
+| `shell/` | `bash.ts`, `process.ts` |
+| `planning/` | `todo.ts` — the `todo_set` / `todo_read` pair and the `TodoStore` |
+| `web/` | `websearch.ts`, `webfetch.ts` |
+| `registry.ts` | Marries the generic kernel to the concrete tools: `builtinRegistry` + `toolBox` |
+
+## The built-in tools
+
+The barrel exports twelve tool singletons. They cover eleven capabilities — the
+`todo` capability is two distinct tools (`todoSetTool` and `todoReadTool`):
+
+| Symbol | Model-facing name | Group |
+|--------|-------------------|-------|
+| `readTool` | `read` | read-only |
+| `lsTool` | `ls` | read-only |
+| `grepTool` | `grep` | read-only |
+| `findTool` | `find` | read-only |
+| `webSearchTool` | `websearch` | read-only |
+| `webFetchTool` | `webfetch` | read-only |
+| `writeTool` | `write` | mutating |
+| `editTool` | `edit` | mutating |
+| `bashTool` | `bash` | mutating |
+| `todoSetTool` | `todo_set` | stateful |
+| `todoReadTool` | `todo_read` | stateful |
+| `processTool` | `process` | stateful |
+
+`planning/todo.ts` also exports the `todoStore` singleton, the `TodoStore` class,
+and `resetTodos`; `shell/process.ts` exports `resetProcessTable`.
+
+## Assembling a toolbox
+
+`builtinRegistry()` mints a fresh `ToolRegistry` populated with all twelve tools and
+three named collections:
+
+- **`read-only`** — tools that only observe the workspace and the web (`read`, `ls`,
+  `grep`, `find`, `websearch`, `webfetch`).
+- **`coding`** — `read-only` plus the mutating and stateful tools (`write`, `edit`,
+  `bash`, `todo_set`, `todo_read`, `process`).
+- **`all`** — every registered tool.
+
+`toolBox(collection, cwd?)` returns a runnable `ToolBox` backed by the real Node
+filesystem and shell. It advertises exactly the chosen collection's descriptors and
+mints a fresh `ToolContext` rooted at `cwd` (defaulting to `process.cwd()`) per
+dispatch:
+
+```ts
+import { toolBox } from "indusagi/capabilities";
+
+const tools = toolBox("coding");          // or "read-only" / "all"
+// pass to the runtime as AgentConfig.tools
+```
+
+## Authoring a tool
+
+A tool is declared with `defineTool` over a `ToolSpec` and runs against a
+`ToolContext` (which carries the `Fs`/`Shell` backends). Output is windowed with
+`clamp` against an `OutputBudget`:
+
+```ts
+import { defineTool, ToolRegistry } from "indusagi/capabilities";
+
+const myTool = defineTool({
+  name: "echo",
+  description: "Echo a string back",
+  parameters: { type: "object", properties: { text: { type: "string" } } },
+  async run(input, ctx) {
+    return { content: [{ kind: "text", text: String((input as any).text) }] };
+  },
+});
+
+const registry = new ToolRegistry();
+registry.registerAll([myTool]);
+```
+
+## Relationship to neighbors
+
+The capabilities layer is the [Runtime](/docs/subsystems/runtime)'s tool boundary —
+`toolBox` produces the `ToolBox` a host passes as `AgentConfig.tools`, and the
+runtime's scheduler invokes its `ToolRunner`. The kernel shares the gateway's
+`ToolDescriptor`/`JsonSchema` contract for tool schemas. The
+[SaaS](/docs/subsystems/connectors-saas) gateway and the
+[Interop](/docs/subsystems/interop-mcp) bridge both register their own
+`DefinedTool`s into a `ToolRegistry` from this layer, so remote tools and built-ins
+share one surface.
+
+Back to the [Architecture overview](/docs/architecture).

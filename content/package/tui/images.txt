@@ -1,0 +1,59 @@
+# TUI Images
+
+> This rebuild does not render images as pixels. There is no Kitty or iTerm2 image
+> protocol, no capability detection, and no image dimension math. Image content is
+> shown as a text placeholder, gated by a `showImages` flag.
+
+## How images are handled
+
+Image content parts (`ImageContent` from `indusagi/ai`) are rendered as the literal
+text `[image: <mimeType>]` when `showImages` is `true`, and omitted entirely when
+it is `false`. There is no separate image component — every message and tool-output
+path runs image parts through the same text-extraction helpers.
+
+## The `showImages` flag
+
+`showImages: boolean` threads from `MessageList` down through `MessageRow`,
+`AssistantMessageView`, `UserMessageView`, `CustomMessageView`, and `ToolResultBlock`
+into the formatting helpers. It controls whether image parts contribute a
+placeholder line or are dropped.
+
+## Placeholder formatting
+
+File: `src/react-ink/utils/message-groups.ts`
+
+The helpers that turn message content into displayable text emit the placeholder:
+
+- `formatUserContent(content, showImages)` — for an `ImageContent` part, pushes
+  `` `[image: ${part.mimeType}]` `` only when `showImages` is set.
+- `formatCustomContent(content, showImages)` — same placeholder for custom messages.
+- `extractToolText(value, showImages)` / `extractStructuredText(...)` — when walking
+  tool output, an `image`-typed record yields `` `[image: ${record.mimeType}]` ``
+  when `showImages` is set, and `[]` otherwise.
+
+File: `src/react-ink/utils/tool-display.ts`
+
+- `containsImage(value)` — detects whether a tool output contains any `type:
+  "image"` part. The `read` tool descriptor uses it: when the read result is an
+  image, the card summary becomes the first meaningful output line (or "Read
+  image") instead of a line count, and the raw body is shown unhighlighted.
+
+## What is NOT here
+
+The old docs described a `src/tui/terminal-image.ts` module with Kitty/iTerm2
+encoders, capability detection, and pixel-dimension helpers. None of that exists in
+the current source. Specifically, there is no:
+
+- `detectCapabilities()` / `getCapabilities()` / `resetCapabilitiesCache()`.
+- `encodeKitty(...)` / `encodeITerm2(...)` / `renderImage(...)`.
+- `deleteKittyImage(...)` / `deleteAllKittyImages()`.
+- `getImageDimensions` / `calculateImageRows` / `getCellDimensions` / `setCellDimensions`.
+- An `Image` component or any `maxWidthCells` / `maxHeightCells` / `imageId` props.
+
+If you need true in-terminal image rendering, it must be supplied by the host
+application; the framework only emits the text placeholder above.
+
+## Next Docs
+
+- [TUI Module](/docs/tui/README)
+- [TUI Components Reference](/docs/tui/components)

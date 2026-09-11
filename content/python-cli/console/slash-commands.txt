@@ -1,0 +1,352 @@
+# Slash Commands
+
+> The slash-command subsystem of the `pindus` / `induscode` interactive
+> console: a typed line like `/model`, `/resume`, or `/export out.html` is
+> parsed, resolved against an ordered registry, and run as a thin `async`
+> handler that acts only through an injected context. The pure framework lives
+> at `induscode.console_slash`; the ~26-command catalog lives at
+> `induscode.console.slash_commands`.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Two packages](#two-packages)
+- [Resolution pipeline](#resolution-pipeline)
+- [The command catalog](#the-command-catalog)
+- [Transcript and session control](#transcript-and-session-control)
+- [Workbench pickers, help, diagnostics](#workbench-pickers-help-diagnostics)
+- [Integrations: auth, MCP, memory, composio, IO](#integrations-auth-mcp-memory-composio-io)
+- [Dynamic rows: skills and templates](#dynamic-rows-skills-and-templates)
+- [Family commands](#family-commands)
+- [The registry as a value](#the-registry-as-a-value)
+- [How dispatch works](#how-dispatch-works)
+- [Public API](#public-api)
+- [Notes and parity](#notes-and-parity)
+
+## Overview
+
+When you type a line into the composer the console routes it in a fixed order:
+a leading `!`/`!!` is a shell escape; otherwise the line is resolved against the
+slash registry; otherwise it is submitted as a plain prompt. The slash layer
+owns that middle step — turning the raw string into a *discriminated outcome*
+(`NotSlash` / `Match` / `Miss`) and then `await`-ing the matched command's
+handler.
+
+The subsystem is deliberately split so the parsing/resolution machinery never
+depends on the live console. Handlers are uniform and thin: every one is
+
+```python
+async def run(ctx: SlashContext) -> SlashOutcome: ...
+```
+
+and reaches the terminal only through the `SlashContext` it is handed (open a
+modal, dispatch a reducer event, set a status toast, append a display block,
+request exit, or return a `Prompt` for the dispatcher to submit). That keeps
+handlers pure with respect to the TUI and trivially fakeable in tests.
+
+## Two packages
+
+| Package | Role | Depends on console? |
+|---------|------|---------------------|
+| `induscode.console_slash` | The pure framework: contracts, registry assembler + derived lookups, the line resolver, and the shared family/status toolkit. | No — a dependency-free leaf. |
+| `induscode.console.slash_commands` | The command catalog: the transcript / workbench / integration groups, the dynamic `/skill:` + `/<template>` rows, and the `build_catalog` assembler. | Yes — it is built on top of the framework. |
+
+The catalog imports `SlashCommand`, `SlashContext`, `HANDLED`, `info`, `warn`,
+`family_runner`, and `SubCommand` from `induscode.console_slash` and folds its
+rows through `build_registry`. The framework never imports the catalog (clean
+leaf direction).
+
+## Resolution pipeline
+
+Resolution is two pure functions over a string and a registry. None of it
+touches I/O, the conductor, or the TUI.
+
+1. **`parse_slash(line)`** decides whether the line is command-shaped and, if
+   so, splits it into a `SlashLine(name, args)`. A line qualifies only when —
+   after trimming leading blanks — it starts with `/` and the token matches
+   `^[a-zA-Z][a-zA-Z0-9:-]*`. A bare `/`, a `//comment`, and a `/usr/local/bin`
+   path are all rejected (the embedded slash breaks the token shape), so those
+   reach the prompt untouched. The token is lower-cased; the argument tail keeps
+   its interior spacing.
+2. **`resolve_slash(line, registry)`** parses the line, then looks the token up
+   in the registry index and returns a `SlashResolution`:
+
+| Outcome | Meaning | Dispatcher action |
+|---------|---------|-------------------|
+| `NotSlash` | not command-shaped | hand on as a normal prompt or `!`/`!!` escape |
+| `Match(command, args)` | a row owns the token | `await command.run(ctx)` |
+| `Miss(name)` | command-shaped but no row owns it | surface "Unknown command" |
+
+```python
+from induscode.console_slash import resolve_slash
+from induscode.console.slash_commands import DEFAULT_SLASH_REGISTRY
+
+res = resolve_slash("/branch since the refactor", DEFAULT_SLASH_REGISTRY)
+assert res.kind == "match"
+print(res.command.name, repr(res.args))  # 'branch' 'since the refactor'
+
+miss = resolve_slash("/nope", DEFAULT_SLASH_REGISTRY)
+assert miss.kind == "miss" and miss.name == "nope"
+
+not_cmd = resolve_slash("/usr/local/bin", DEFAULT_SLASH_REGISTRY)
+assert not_cmd.kind == "not-slash"  # embedded slash -> reaches the prompt
+```
+
+Resolution is case-insensitive on the command token, and an alias resolves to
+the same row as its canonical name (`/fork` resolves to `branch`).
+
+## The command catalog
+
+`build_catalog(cwd, home)` concatenates three static groups in listing order,
+then splices in the discovered dynamic rows:
+
+```
+transcript_commands (11)  ->  workbench_commands (7)  ->  build_integration_commands (8)
+                          ->  dynamic /skill:<name> + /<template-name> rows
+```
+
+There are roughly **26 static commands** (11 + 7 + 8), plus *N* discovered
+dynamic rows. Counting aliases as invokable tokens (`reset`, `condense`,
+`compact`, `sessions`, `fork`, `tree`, `models`, `scoped-models`, `?`,
+`hotkeys`, `changelog`) it is about 36 resolvable tokens.
+
+`cwd` and `home` are explicit arguments — there are no import-time filesystem
+scans. The process-default registry is built once by `build_default_registry()`
+from the real `os.getcwd()` / `~` and cached; `SLASH_COMMANDS` and
+`DEFAULT_SLASH_REGISTRY` are lazy module attributes (PEP 562 `__getattr__`)
+minted on first access. Building the default registry also installs it as the
+`/help` provider (see [Family commands](#family-commands)).
+
+## Transcript and session control
+
+The first group resets, renames, branches, inspects, or leaves the live
+session. Pickers open an overlay through `ctx.open_modal(...)`; the rest drive
+the [conductor](/python-cli/subsystems/conductor).
+
+| Command | Aliases | Args | What it does |
+|---------|---------|------|--------------|
+| `/clear` | `reset` | — | Wipe the view and start a new session (conductor `new_session()`). |
+| `/new` | — | — | Start a fresh session (identical to `/clear`). |
+| `/summarize-context` | `condense`, `compact` | yes | Condense the transcript to reclaim context window; trailing guidance is recorded first, then a parameterless `condense()` runs. |
+| `/resume` | `sessions` | — | Open the persisted-session list (`sessions` overlay). |
+| `/session` | — | — | Append a session-statistics display block (ids, counts, tokens, cost). |
+| `/branch` | `fork` | — | Branch the transcript from a prior turn (`userTurns` overlay). |
+| `/timeline` | `tree` | — | Navigate the transcript tree (`tree` overlay). |
+| `/name` | — | yes | Name the session, or with no argument report the current name. |
+| `/reload` | — | — | Re-read session resources (no-op tree navigation onto the current leaf). |
+| `/quit` | — | — | Leave the interactive console (`ctx.request_exit()`). |
+| `/exit` | — | — | Leave the interactive console. |
+
+`/clear` and `/new` both wipe the rendered view *and* call
+`conductor.new_session()` — the conductor reset is what actually empties the
+transcript, since the rendered conversation comes from `conductor.messages()`.
+
+## Workbench pickers, help, diagnostics
+
+The overlays a user reaches to inspect or retune the session, plus the live
+help and keymap surfaces. See [Theming](/python-cli/console/theming) for the
+scheme picker (reached via `/settings`, not a dedicated command).
+
+| Command | Aliases | Args | What it does |
+|---------|---------|------|--------------|
+| `/model` | `models` | — | Open the model picker overlay (`models`). |
+| `/models-for` | `scoped-models` | yes | Edit / show / reset per-scope model routing (a family; `scopedModels` overlay). |
+| `/settings` | — | — | Open the settings overlay (`settings`). |
+| `/help` | `?` | — | Append a display block listing every command and its summary. |
+| `/keys` | `hotkeys` | — | Append the keyboard-shortcut table (`HOTKEYS`). |
+| `/whats-new` | `changelog` | — | Render a `CHANGELOG.md` (or build highlights) as a display block. |
+| `/debug` | — | — | Write a JSONL session-diagnostics log to a temp file and toggle verbose view. |
+
+`/help` reads the *live* catalog through a late-bound provider, so it lists the
+dynamic `/skill:` and `/<template>` rows too. `/keys` renders the grounded
+chord/effect table — `Enter` (submit), `Shift+Enter` (soft newline),
+`Esc Esc` (tree navigator), `Ctrl+C` (interrupt), `Ctrl+L` (model picker),
+`Ctrl+R` (resume list), `! <cmd>` / `!! <cmd>` (shell escapes), and the rest.
+
+## Integrations: auth, MCP, memory, composio, IO
+
+The bridge group is minted by `build_integration_commands(runtime)` over one
+per-console `IntegrationsRuntime` holder (its `mcp_pool`, `composio_gateway`,
+`memory_enabled` flag, and tracked `tasks`). It builds on the
+[framework MCP facade](/python/facades/mcp) and
+[connectors](/python/subsystems/connectors).
+
+| Command | Args | Family | What it does |
+|---------|------|--------|--------------|
+| `/login` | yes | — | Sign in to a model provider (auth overlay). |
+| `/logout` | — | — | Sign out of a model provider. |
+| `/mcp` | yes | — | Manage MCP servers and their tools (`connect`, `reconnect`, `disconnect`, `tools`, `status`). |
+| `/memory` | yes | `memory` | Inspect and toggle the working-memory capability (`status`, `on`, `off`, `tools`). |
+| `/composio` | yes | `composio` | Connect and inspect Composio bridges (`status`, `accounts`, `tools`, `connect`, `enable`). |
+| `/copy` | — | — | Copy the last reply to the clipboard. |
+| `/export` | yes | — | Export the transcript to an HTML file (via `transcript_export`). |
+| `/share` | — | — | Share the session as a secret GitHub gist. |
+
+```bash
+# inside `pindus` / `induscode` interactive session
+/mcp connect             # build + connect the workspace MCP pool, show status
+/composio enable github  # hydrate a Composio toolkit's tools
+/export out.html         # render the live transcript to HTML
+/share                   # publish the transcript as a secret gist
+/copy                    # last reply -> clipboard
+```
+
+`/composio` needs `COMPOSIO_API_KEY` in the environment; without it the verbs
+surface a "Composio is not configured" status. See
+[MCP configuration](/python-cli/configuration/mcp) and
+[Transcript Export](/python-cli/subsystems/transcript-export).
+
+## Dynamic rows: skills and templates
+
+Two row shapes are *discovered*, not hand-written, by scanning `.indusagi/skills`
+and `.indusagi/commands` under the project (`cwd`) then user (`home`) roots
+(via the [briefing](/python-cli/subsystems/briefing) layer). Both return a
+`Prompt` outcome the dispatcher submits as a normal turn:
+
+- **`/skill:<name>`** — submits an Agent-Skills invocation block
+  `<skill name="..." location="...">body</skill>`, where the trailing argument
+  becomes the body. So `/skill:commit tidy the diff` runs the `commit` card
+  against "tidy the diff".
+- **`/<template-name>`** — expands the macro body against the trailing
+  arguments (single-pass `$arg` model) and submits the expansion.
+
+Discovery never raises (a missing root yields nothing), templates are deduped
+first-wins, and any dynamic token that collides with a reserved static token is
+dropped — so splicing dynamic rows can never make `build_registry` raise.
+
+## Family commands
+
+A command with sub-verbs (`/models-for`, `/memory`, `/composio`) is built from a
+`SubCommand` table via `family_runner`, never a hand-written `if`-ladder. The
+runner splits the leading verb, dispatches by dict lookup, and falls back to a
+usage toast assembled from the table's descriptions when the verb is missing or
+unknown.
+
+```python
+from induscode.console_slash import SlashCommand, SubCommand, family_runner, HANDLED, info
+
+async def _on(ctx, rest):
+    ctx.set_status(info("enabled"))
+    return HANDLED
+
+run = family_runner("demo", (SubCommand(verb="on", describe="turn on", run=_on),))
+cmd = SlashCommand(name="demo", summary="toggle demo", run=run, family="demo", takes_args=True)
+# bare '/demo' -> usage warn "on (turn on)"; '/demo on' -> _on
+```
+
+`FAMILY` (a `FamilyLabels` record) names the labels: `composio`, `memory`,
+`models-for` (scoped models), and `theme`. `theme` is declared for parity but no
+`/theme` command ships — the scheme picker is reached via `/settings`.
+
+`/help` sourcing uses the same pattern in reverse: instead of importing the
+catalog at call time (a cycle, since the catalog imports the help module),
+`set_help_registry_provider` late-binds the assembled registry at registry-build
+time. Until one is installed, `/help` falls back to the static transcript +
+workbench groups.
+
+## The registry as a value
+
+`SlashRegistry` is an immutable ordered command tuple plus a derived
+token-to-command index (`MappingProxyType`). Adding a command is appending a row
+to a group; resolution, completion, and grouping are all pure derivations:
+
+- `build_registry(commands)` folds the ordered list into the registry,
+  lower-casing every token (name + aliases). It raises `ValueError` on any
+  duplicate token — loud at assembly time, never silent shadowing.
+- `find_command(registry, token)` — exact lookup (canonical or alias,
+  leading slash optional).
+- `match_prefix(registry, partial)` — the completion candidate set, in registry
+  order; an empty partial returns the whole list.
+- `list_families(registry)` / `commands_in_family(registry, family)` — family
+  labels in first-seen order and the rows in a family, for `/help` grouping.
+
+```python
+from induscode.console_slash import build_registry, match_prefix
+from induscode.console.slash_commands import build_catalog
+
+catalog = build_catalog(cwd="/work/proj", home="/home/me")
+registry = build_registry(catalog)
+candidates = match_prefix(registry, "mo")  # /model, /models-for, ...
+print([c.name for c in candidates])
+```
+
+## How dispatch works
+
+The effectful dispatcher is *not* part of this subsystem — it lives in the
+`ConsoleApp` (`console/app.py`). On a submitted line the app follows the
+verbatim routing order:
+
+1. A leading `!` / `!!` escapes to `conductor.execute_bash`.
+2. Otherwise `resolve_slash(line, self._slash)` runs.
+3. On `Match`, the app constructs a `SlashContext` from its own callables
+   (`dispatch`, `_open_modal`, `close_modal`, `_request_exit`, `set_status`,
+   `_set_buffer`, `append_block`, plus the `SessionConductor`) and
+   `await`s `resolution.command.run(ctx)`. A `Prompt` outcome is fed to the
+   turn runner; `Handled` ends the line.
+4. On `Miss`, an "Unknown command" warning is surfaced.
+5. On `NotSlash`, the line becomes a normal prompt.
+
+`open_modal` kinds map to the console's `ModalKind` / `MODAL_KINDS` vocabulary
+(`settings`, `models`, `scopedModels`, `sessions`, `tree`, `userTurns`,
+`signIn`, `signOut`, `plugin`, ...). See [Console Overview](/python-cli/console/overview)
+for the surface and [Dialogs](/python-cli/console/dialogs) for the overlays.
+
+## Public API
+
+### `induscode.console_slash` (framework)
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `SlashCommand` | dataclass | `contract.py` | One registry row: `name`, `summary`, `run`, `aliases`, `family`, `takes_args`. |
+| `SlashContext` | dataclass | `contract.py` | The callables a handler acts through: `args`, `conductor`, `dispatch`, `open_modal`, `close_modal`, `request_exit`, `set_status`, `set_buffer`, `append_block`. |
+| `Handled` / `Prompt` / `Unknown` | dataclass | `contract.py` | The `SlashOutcome` union a handler returns. |
+| `SlashRun` | type | `contract.py` | `Callable[[SlashContext], Awaitable[SlashOutcome]]`. |
+| `SlashRegistry` | dataclass | `contract.py` | Resolved table: ordered `commands` + `index` (`MappingProxyType`). |
+| `OpenModal` | protocol | `contract.py` | `open_modal(kind: str, payload=None) -> None`. |
+| `build_registry` | function | `registry.py` | Fold a command list into a registry; raise on duplicate tokens. |
+| `find_command` / `match_prefix` / `list_families` / `commands_in_family` / `tokens_of` | function | `registry.py` | Pure derivations over a registry. |
+| `resolve_slash` | function | `resolve.py` | Parse a line then resolve to `NotSlash` / `Match` / `Miss`. |
+| `parse_slash` / `looks_like_slash` | function | `resolve.py` | Lexical front half; split into `SlashLine(name, args)`. |
+| `Match` / `Miss` / `NotSlash` / `SlashLine` / `SlashResolution` / `SLASH_PREFIX` | type | `resolve.py` | The resolution union and parsed shapes. |
+| `family_runner` | function | `shared.py` | Build a family `run` from a `SubCommand` table. |
+| `SubCommand` / `VerbSplit` / `split_verb` | — | `shared.py` | A family sub-verb and the verb/rest splitter. |
+| `FAMILY` / `FamilyLabels` | const | `shared.py` | Named family labels (`composio`, `memory`, `models-for`, `theme`). |
+| `HANDLED` / `info` / `warn` | const | `shared.py` | The shared `Handled()` singleton and status-toast minters. |
+
+### `induscode.console.slash_commands` (catalog)
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `build_catalog` | function | `builtins.py` | Assemble the ordered catalog (transcript → workbench → integrations → dynamic). |
+| `build_default_registry` / `reset_default_registry` | function | `builtins.py` | Cached process registry from real cwd/`~`; installs the `/help` provider. |
+| `discover_dynamic_sources` / `dynamic_roots` / `PROJECT_DIR` | function/const | `builtins.py` | Scan `.indusagi/skills` and `.indusagi/commands`; never raises. |
+| `SLASH_COMMANDS` / `DEFAULT_SLASH_REGISTRY` | const | `builtins.py` | Lazy module attributes minted on first access. |
+| `transcript_commands` | const | `transcript.py` | The 11 session-control rows. |
+| `workbench_commands` | const | `workbench.py` | The 7 picker/help/diagnostics rows. |
+| `set_help_registry_provider` / `HOTKEYS` | function/const | `workbench.py` | Late-bound `/help` source; the `/keys` chord table. |
+| `build_integration_commands` / `IntegrationsRuntime` | function/class | `integrations.py` | The 8 integration rows over one mutable runtime holder. |
+| `build_dynamic_commands` / `DynamicCommandSources` / `skill_invocation_block` | function | `dynamic.py` | Project skills/macros into `/skill:` and `/<template>` rows. |
+
+## Notes and parity
+
+- **Roughly 26 commands**, not "30+": 11 transcript + 7 workbench + 8
+  integration static rows, plus the discovered dynamic rows.
+- **No `/theme` command ships.** `FamilyLabels.theme` is declared for parity but
+  the scheme picker is reached via `/settings` only. `/export` is HTML only.
+- **Every handler is `async` and awaited.** Fire-and-forget bodies (the
+  `/clear` session reset, the Composio settle paths) ride tracked `asyncio`
+  tasks that swallow their own failures into a status warn — never bare tasks.
+- **`/summarize-context` with guidance** records the guidance via
+  `conductor.execute_bash(printf ...)` then runs the parameterless `condense()`
+  — the closest real action on this build.
+- **`/memory on|off`** only flips the `IntegrationsRuntime.memory_enabled`
+  reporting flag; it does not detach the memory tool from the live
+  [capability deck](/python-cli/subsystems/capability-deck).
+- **`build_registry` raises** on any duplicate token at assembly time;
+  `build_catalog` pre-reserves static tokens so a colliding discovered
+  skill/template is dropped rather than crashing the build.
+- The `/mcp status` text currently hints `.indusvx/mcp.json` while the dynamic
+  roots resolve under `.indusagi/` — a known stale-string inconsistency.
+
+This area is a clean-room rebuild of the TypeScript console-slash lineage; see
+[Parity](/python-cli/reference/parity) for the documented port deltas.

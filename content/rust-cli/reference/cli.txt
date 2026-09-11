@@ -1,0 +1,403 @@
+# CLI Reference
+
+> The complete `indus` / `indusagi` command line for the Rust edition: the single 18-row flag table, the three run modes (text / json / rpc), the `@file` attachment syntax, the `--` terminator, and the no-session subcommands (`auth`, `signin`/`signout`, `install`/`remove`/`update`/`list`/`config`). Both `[[bin]]` targets (`indusr` and `indusagir`, both `path = "src/bin/main.rs"`) share one `async fn main() -> ExitCode` in `crates/induscode/src/bin/main.rs`, which brands off `argv[0]` (against the `indus`/`indusagi` brand names), routes the tail, and adopts boot's exit code unchanged.
+
+## Table of Contents
+
+- [Synopsis](#synopsis)
+- [Process Branding](#process-branding)
+- [Flags](#flags)
+- [Run Modes](#run-modes)
+- [@file Attachments](#file-attachments)
+- [The -- Terminator](#the----terminator)
+- [Meta Short-Circuits](#meta-short-circuits)
+- [The auth Subcommand](#the-auth-subcommand)
+- [Credential Subcommands](#credential-subcommands)
+- [Package Subcommands](#package-subcommands)
+- [Dispatch Order](#dispatch-order)
+- [Unknown Flags and Usage Errors](#unknown-flags-and-usage-errors)
+- [Exit Codes](#exit-codes)
+- [Parsing the Command Line in Rust](#parsing-the-command-line-in-rust)
+
+## Synopsis
+
+```bash
+indusagi [options] [prompt] [@file ...]
+```
+
+The crate is `induscode` (the `indusagi-coding-agent` package) and it ships **two `[[bin]]` targets**, named `indusr` (primary) and `indusagir` in `Cargo.toml`, both compiled from the single `crates/induscode/src/bin/main.rs`. Those cargo target names are distinct from the two **brand / invocation names** users actually type — `indus` (primary) and `indusagi` — which come from `BIN_NAMES` (`["indus", "indusagi"]`, from `induscode::core::BRAND.bin_names`) and are the names `resolve_brand` matches `argv[0]` against (see [Process Branding](#process-branding)). Both targets launch the identical agent; the live brand is whichever name the OS launched under. The generated `--help` synopsis is rendered with the framework `indusagi::core::BRAND.bin_name` (`"indusagi"`), so the usage banner reads `Usage: indusagi …` regardless of which alias you invoked.
+
+A bare command line opens the interactive [console](/rust-cli/console/overview). A leading non-flag `prompt` positional becomes the first user message; later positionals accumulate as the tail. Everything runs through `async fn main() -> ExitCode`, the only place an exit code reaches the OS — returning `ExitCode` (rather than `process::exit`) lets the tokio runtime drain so the terminal's raw / alt-screen mode is restored on the way out.
+
+```bash
+indus                                       # interactive console (default)
+indus "refactor the auth module"            # interactive, prompt pre-filled
+indus -p "summarize this repo"              # one-shot print, then exit
+indus -i "start here"                       # force interactive even with a prompt
+indus -m anthropic/claude-sonnet-4-5 --thinking high "review this diff"
+```
+
+## Process Branding
+
+`main` reads `argv[0]`'s basename through `resolve_brand`, matches it against `BIN_NAMES` (`["indus", "indusagi"]`, from `induscode::core::BRAND.bin_names`), and falls back to the primary `BIN_NAMES[0]` (`"indus"`) when argv[0] is missing or is some other path (a renamed symlink, a test harness). A trailing `.exe` is stripped so a Windows launch still brands.
+
+```rust
+fn resolve_brand(argv0: Option<&str>) -> &'static str {
+    let basename = argv0
+        .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).trim_end_matches(".exe"))
+        .unwrap_or("");
+    BIN_NAMES.iter().copied().find(|&name| name == basename).unwrap_or(BIN_NAMES[0])
+}
+```
+
+`main` also installs a single idempotent `[MCP]` console-noise filter (`install_mcp_noise_filter`), a no-op when the brand debug env var (`INDUSAGI_DEBUG`, derived from `indusagi::core::env_name("debug")`) is set so diagnostics are never hidden. The marker is `const MCP_NOISE_MARKER: &str = "[MCP]"`. An off-by-default `mimalloc` feature can swap in a drop-in global allocator; the default build runs allocator-neutral.
+
+## Flags
+
+Every option is declared exactly **once** in a single declarative flag table — `induscode::launch::flags::flag_specs()`, **18 rows** filed under five render groups (Output / Model / Context / Tools / Meta). The tolerant parser (`induscode::launch::parser::read_invocation`) indexes that table, and the `--help` renderer (`induscode::launch::usage::render_usage`) walks the same rows, so the help text can never drift from what the parser accepts. A test pins the 18-row count and the canonical names so a contributor cannot accidentally edit the framework's 10-row routing table instead.
+
+Each row is a `FlagSpec`:
+
+```rust
+pub struct FlagSpec {
+    pub name: &'static str,            // canonical long spelling, e.g. "--model"
+    pub aliases: &'static [&'static str],
+    pub kind: FlagKind,                // Boolean | String | Number | List
+    pub group: FlagGroup,              // Output | Model | Context | Tools | Meta
+    pub describe: &'static str,
+}
+```
+
+`FlagKind::List` is the agent's superset over the framework `indusagi::shell_app::invocation::FlagKind{Boolean,String,Number}` — it adds the comma-split / repeat-accumulate behaviour for `--tools` and `--mcp`. An inline `--name=value` and a separated `--name value` are equivalent; a value flag whose next token is itself a flag binds the empty string (read back as absent). Clustered short booleans (`-pi`) expand to their component switches via `short_booleans()`.
+
+### Output
+
+| Flag | Alias | Kind | Purpose |
+|------|-------|------|---------|
+| `--print` | `-p` | Boolean | Run a single request, print only the result, and exit. |
+| `--json` | `--rpc` | Boolean | Speak the headless line protocol for a driving parent process. |
+| `--interactive` | `-i` | Boolean | Force the interactive session even when a prompt is supplied. |
+
+### Model
+
+| Flag | Alias | Kind | Purpose |
+|------|-------|------|---------|
+| `--model` | `-m` | String | Select the model, provider-qualified or bare (e.g. `provider/name`). |
+| `--fallback-model` | — | String | Model to switch to mid-turn when the selected model is overloaded (HTTP 529). |
+| `--account` | — | String | Authenticate the run with a named stored credential account. |
+| `--thinking` | — | String | Set the reasoning effort (one of: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`). |
+| `--list-models` | — | String | List the available models (optionally filtered by a substring) and exit. |
+
+The `--thinking` description is built once from `induscode::launch::contract::THINKING_EFFORTS`, so the enumerated rungs (`ThinkingEffort::{Off, Minimal, Low, Medium, High, XHigh}`) come from the same source the validator uses. `ThinkingEffort` is a superset-compatible widening of the framework `indusagi::llmgateway::ThinkingLevel` — it adds `Off`. An unrecognised value is silently ignored (treated as absent), not rejected. See [Models](/rust-cli/configuration/models) for the catalog and the framework [LLM Gateway](/rust/subsystems/llm-gateway) underneath.
+
+### Context
+
+| Flag | Alias | Kind | Purpose |
+|------|-------|------|---------|
+| `--cwd` | — | String | Scope the run to a working directory (default: the current directory). |
+| `--system` | — | String | Replace the built-in system prompt with the given text. |
+| `--append-system` | — | String | Append extra text after the system prompt. |
+| `--resume` | `-r` | Boolean | Pick a previous session to resume. |
+| `--continue` | `-c` | Boolean | Continue the most recent session in this directory. |
+
+`--resume` and `--continue` are honoured by the interactive runner and resolve through the [Sessions](/rust-cli/subsystems/sessions) store. `--cwd` resolves the run's working directory; `@file` references and the attachment gatherer resolve against it (`AttachmentOptions { cwd }`).
+
+### Tools
+
+| Flag | Alias | Kind | Purpose |
+|------|-------|------|---------|
+| `--tools` | — | List | Allow only the named built-in tools (comma-separated or repeated). |
+| `--no-tools` | — | Boolean | Disable every built-in tool for this run. |
+| `--mcp` | — | List | Attach an external MCP server endpoint (comma-separated or repeated). |
+
+`--tools` validates each name against the closed `induscode::launch::contract::ToolName` roster (`TOOL_NAMES`) via `ToolName::parse`; names that are not recognised are dropped. The roster is `read`, `write`, `edit`, `bash`, `grep`, `find`, `ls`, `task`, `todo_read`, `todo_write`, `web_fetch`, `web_search`, `composio`. `--mcp` endpoints are mounted through the framework MCP client — see [Capability Deck](/rust-cli/subsystems/capability-deck) and [Channels](/rust-cli/subsystems/channels).
+
+```bash
+indus --tools read,bash "list and read the config files"
+indus --no-tools "just explain how this code works"
+indus --mcp http://localhost:8931/sse "use the browser tools"
+indus --mcp a --mcp b           # repetition accumulates: ["a", "b"]
+indus --mcp "x,y,z"             # one token comma-splits: ["x", "y", "z"]
+```
+
+### Meta
+
+| Flag | Alias | Kind | Purpose |
+|------|-------|------|---------|
+| `--help` | `-h` | Boolean | Show this usage and exit. |
+| `--version` | `-v` | Boolean | Show the version and exit. |
+
+### Aliases and clusters
+
+The shared token index (`induscode::launch::flags::token_index()`) maps every canonical name **and** every alias to its owning row, so `-p`, `--rpc`, `-m`, `-r`, `-c`, `-h`, `-v` all normalise to their canonical flag. Single-letter boolean aliases (`-p`, `-i`, `-r`, `-c`, `-h`, `-v`) populate the `short_booleans()` set, which drives `-pi`-style cluster expansion; a cluster with any unknown letter (`-px`) is kept whole as one extension flag rather than partially applied.
+
+## Run Modes
+
+The output flags resolve to one of three modes, derived by `derive_mode` over the flag bag. The launch-level mode (`induscode::launch::contract::OutputMode`) selects the boot runner. This is the agent's own vocabulary — **not** the framework `indusagi::shell_app::invocation::Mode` (Print/Wire/Repl/Help/Version) — and it maps to a boot runner at the boot seam.
+
+| Output mode | Triggered by | Behavior |
+|-------------|--------------|----------|
+| `OutputMode::Text` | default (no `-p` / `--json`, or with `-i`) | The interactive ratatui [console](/rust-cli/console/overview): live REPL, slash commands, dialogs. |
+| `OutputMode::Json` | `-p` / `--print` (without `-i`) | One non-interactive request to settlement, then exit. |
+| `OutputMode::Rpc` | `--json` / `--rpc` | The long-lived headless line protocol over stdin/stdout for a driving parent process. |
+
+Derivation precedence (from `derive_mode`): `--json` / `--rpc` wins (→ `Rpc`); otherwise `--print` without `--interactive` → `Json`; otherwise `Text`. So `-p` alone is the one-shot print mode, `--json` on its own is the headless wire link, and `--json --print -i` is still `Rpc` because `--json` always wins.
+
+```rust
+fn derive_mode(flags: &HashMap<String, FlagValue>) -> OutputMode {
+    if read_bool(flags, "json") { return OutputMode::Rpc; }
+    if read_bool(flags, "print") && !read_bool(flags, "interactive") {
+        return OutputMode::Json;
+    }
+    OutputMode::Text
+}
+```
+
+```bash
+# interactive (Text)
+indus "help me debug this"
+
+# print: one-shot result, then exit (Json)
+indus -p "summarize this repo"
+
+# wire: headless line-protocol link (Rpc)
+indus --json
+```
+
+Every real run — a bare prompt, no args, `-p`, `--json`, `--interactive` — is handed to `induscode::boot::boot_run`, which owns the whole launch arc (parse → materialise dirs → resolve resources → select runner → run → drain) and resolves the process exit code. `boot_run` never calls `process::exit`; `main` adopts its `ExitCode` unchanged. See [Boot](/rust-cli/subsystems/boot) and [Channels](/rust-cli/subsystems/channels) for the wire protocol.
+
+## @file Attachments
+
+Any token of the form `@<path>` (before the `--` terminator, and longer than one char so the bare `@` is not consumed) is collected as a file attachment for the first message rather than as a positional. The reader strips the `@` and pushes the remainder into the file-reference channel:
+
+```rust
+if token.starts_with('@') && token.len() > 1 {
+    state.file_refs.push(token[1..].to_string());
+    i += 1;
+    continue;
+}
+```
+
+The references are surfaced separately by `read_file_references` (a thin re-walk honouring the `--` terminator) so the attachment gatherer can expand them without re-deriving the whole parse. The reader leaves `Invocation::attachments` as `None`; `induscode::launch::attachments::gather_attachments` (over `AttachmentOptions { cwd }`) resolves each path relative to the run's working directory and fills the `Attachments` value:
+
+```rust
+pub struct Attachments {
+    pub prose: String,        // each text file wrapped in a path-keyed block
+    pub media: Vec<Block>,    // base64 image blocks: indusagi::llmgateway::Block::Image
+}
+```
+
+Image files become the framework image block `indusagi::llmgateway::Block::Image { media_type, data_base64 }` directly — there is no second image type. An invocation with no `@file` arguments has no `Attachments` at all (the field is `Option`) rather than an empty one.
+
+```bash
+indus "review this change" @src/main.rs @docs/diagram.png
+indus -p "explain this config" @~/.config/app/settings.toml
+```
+
+## The -- Terminator
+
+A bare `--` stops option parsing. Every subsequent token is treated as a positional, even if it starts with `-` or `@`. Use it to pass a prompt that would otherwise look like a flag or an attachment:
+
+```bash
+indus -- "--this is a prompt, not a flag--"
+```
+
+After `--`, `--model` is the prompt, `@x` is a positional (not a file reference), and `read_file_references` returns nothing for tokens past the terminator. The terminator itself is consumed and never appears in the positionals.
+
+## Meta Short-Circuits
+
+Three requests are handled in `route` before any session starts or any directory is touched. They are derived from one tolerant parse of the argv (`read_invocation`), so the meta-request booleans and the unknown-leading-flag check never disagree.
+
+```bash
+indus --help                  # usage banner (generated from the 18-row flag table)
+indus --version               # "indusagi <version>"
+indus --list-models           # the full provider/model catalog
+indus --list-models claude    # filtered by a case-insensitive substring
+indus --list-models=opus      # inline substring filter
+```
+
+`--help` / `-h` prints `render_usage()` (the body, no trailing newline) plus the appended `Commands:` footer (`render_commands_section`) documenting the no-session verbs that are subcommands rather than flags. Note that `auth --help` is intercepted *before* this global short-circuit and reaches the framework auth command's own help, because the launch reader sets `invocation.help` for a `--help` token anywhere in argv.
+
+`--version` / `-v` prints `"{BRAND.app_name} {VERSION}"` — `app_name` is `"indusagi"` and `VERSION` is the single-source compile-time `env!("CARGO_PKG_VERSION")`, so it reflects the built crate, not a hardcoded literal.
+
+`--list-models [filter]` is owned by the CLI (boot would otherwise drop it into the REPL). `list_models_filter` reads the optional substring from either an inline `--list-models=substr` or the next non-flag token, then `induscode::launch::catalog::print_model_catalog` renders an aligned table over the live `indusagi/ai` facade catalog (the `mock` provider excluded). Columns: **Provider**, **Model**, **Context**, **Max Output**, **Thinking**, **Images**, sorted by provider then model id. Token counts format compactly (`128K`, `1M`, `1.5M`, `-` for unknown). When nothing matches, a single `No models match the given filter.` line is printed instead of an empty table.
+
+## The auth Subcommand
+
+When the first token is `auth`, the CLI owns the invocation and runs to an exit code **without touching boot** (the no-session credential gate). It is intercepted before the global `--help` / `--version` short-circuit. The sub-verb is classified by `classify_auth_verb` into one of three routes:
+
+```rust
+enum AuthRoute {
+    AgentLogout,   // auth logout  -> the agent's own signout over auth.json
+    AgentStatus,   // auth status  -> the agent's reconciling vault reader
+    Framework,     // auth <login|refresh|help|...> -> indusagi-shell-app's command
+}
+```
+
+| Sub-verb | Route | Behavior |
+|----------|-------|----------|
+| `auth login <provider>` | Framework | Drives the framework PKCE browser flow (`indusagi::shell_app::auth_cli::run_auth_command`). A one-line tip pointing at `signin <provider>` is printed first, since shipped client ids are unconfigured sentinels in a default build. |
+| `auth status [provider]` | AgentStatus | The agent's own `DiskAuthVault` reader, which reconciles BOTH the framework single-record `{ providers: { … } }` shape AND the agent's nested `provider → account → record` shape, so an api-key sign-in is visible. Always exits `0`. |
+| `auth refresh` | Framework | Refreshes a stored OAuth credential through the framework command. |
+| `auth help` (and any unknown sub-verb, or a bare `auth`) | Framework | The framework command renders auth-specific help / reports a usage error. |
+| `auth logout [provider]` | AgentLogout | The framework command has no logout verb, so this is routed to the agent's `signout` credential path over the workspace `auth.json`. |
+
+The framework route clamps the framework's `i32` exit code (0 ok, 2 usage, 1 failure) into the `ExitCode` byte the OS adopts. The framework auth command is reached through the declared `indusagi-shell-app` dependency, never a vendored copy. See [Auth](/rust-cli/configuration/models) and the framework [AI facade](/rust/subsystems/llm-gateway) for the credential primitives.
+
+## Credential Subcommands
+
+When the first token is `signin` or `signout` (recognised by `is_credential_verb`), the CLI runs the agent's own multi-account credential command and exits — boot explicitly does NOT route these (it would fall them through to the REPL with "interactive console requires a terminal").
+
+```bash
+indus signin anthropic                # store an Anthropic API key (interactive)
+indus signin anthropic --oauth        # opt into the browser (OAuth) flow instead
+indus signout anthropic               # remove a stored credential for a provider
+```
+
+| Verb | Purpose |
+|------|---------|
+| `signin <provider>` | Validate and store an api key (or browser sign-in) for a provider / account. |
+| `signout <provider>` | Remove a stored credential for a provider / account. |
+
+### Default-to-api-key
+
+The shipped OAuth client ids are unconfigured sentinels, so browser sign-in is a dead end out of the box. `default_signin_to_api_key` appends `--method api-key` to a `signin` argv when the user has not already chosen a method (none of `--method`, `--oauth`, `--api-key`, `--apikey` is present), so `indus signin anthropic` lands straight on the working api-key prompt. An explicit `--method oauth` / `--oauth` is preserved untouched; a `signout` argv is never altered.
+
+```rust
+fn default_signin_to_api_key(argv: &[String]) -> Vec<String> {
+    if argv.first().map(String::as_str) != Some("signin") || argv_picks_method(argv) {
+        return argv.to_vec();
+    }
+    let mut out = argv.to_vec();
+    out.push("--method".to_string());
+    out.push("api-key".to_string());
+    out
+}
+```
+
+The command runs over a disk-backed `DiskAuthVault` (the workspace `auth.json`), the real OAuth seam (`CliOAuthSeam`, wired to the registered browser providers), and a stdio console seam (`StdCredentialIo`). The api-key entry is read secret-safe: on a TTY the typed key's echo is muted via crossterm raw mode (restored even on error), while a piped (non-TTY) stdin falls through to a plain line read so the flow is testable. The cleartext is wrapped in a `SecretString` immediately and never logged or echoed.
+
+**OAuth-capable providers** (browser sign-in), registered by `oauth::register_built_in_oauth_providers()` (an explicit prime, never at import time): `anthropic`, `openai-codex`, `github-copilot`.
+
+**Api-key providers** — the `induscode::launch::credentials::PROVIDER_DIRECTORY`, 14 `ProviderEntry` rows, each with its conventional env var:
+
+| id | label | env_key |
+|----|-------|---------|
+| `anthropic` | Anthropic (Claude) | `ANTHROPIC_API_KEY` |
+| `openai` | OpenAI | `OPENAI_API_KEY` |
+| `google` | Google Gemini | `GEMINI_API_KEY` |
+| `xai` | xAI (Grok) | `XAI_API_KEY` |
+| `groq` | Groq | `GROQ_API_KEY` |
+| `cerebras` | Cerebras | `CEREBRAS_API_KEY` |
+| `mistral` | Mistral | `MISTRAL_API_KEY` |
+| `openrouter` | OpenRouter | `OPENROUTER_API_KEY` |
+| `minimax` | MiniMax | `MINIMAX_API_KEY` |
+| `kimi` | Kimi (Moonshot) | `MOONSHOT_API_KEY` |
+| `sarvam` | Sarvam | `SARVAM_API_KEY` |
+| `krutrim` | Krutrim | `KRUTRIM_API_KEY` |
+| `nvidia` | NVIDIA | `NVIDIA_API_KEY` |
+| `zai` | Z.ai | `ZAI_API_KEY` |
+
+Every failure is a typed `induscode::launch::contract::CredentialFault` whose `kind` is one of `UnknownProvider`, `InvalidKey`, `InvalidAccount`, `NameCollision`, `NotFound`, `Vault`, `Aborted` — printed via `format_credential_fault` before a non-zero exit; nothing is signalled by a bare `process::exit` or string sentinel. The `--help` `Commands:` footer documents `signin <provider>` / `signout <provider>` and the `auth login` / `auth status` verbs, and suggests `indus signin anthropic` as the starting point.
+
+## Package Subcommands
+
+When the first token is one of `install`, `remove`, `update`, `list`, `config` (recognised by `induscode::launch::pickers::is_package_command`), the CLI runs the extension-package command and exits — boot does NOT route these either. The command persists through the same two-tier `induscode::core::PreferenceStore` (global tier over the resolved workspace, project tier over the process cwd) the rest of the app reads.
+
+```bash
+indus install npm:@scope/my-ext     # add a source (idempotent)
+indus list                          # show configured sources
+indus remove npm:@scope/my-ext      # drop a source
+indus update                        # re-read and report the configured set
+indus config                        # print settings paths + merged settings
+```
+
+The verb is parsed by `PackageCommand::from_token`:
+
+| Subcommand | Argument | Purpose |
+|------------|----------|---------|
+| `install` | source | Add a package source to the configured set (idempotent under source matching). |
+| `remove` | source | Remove a package source from the configured set. |
+| `update` | — | Re-read and report the configured sources (resolution is lazy at startup). |
+| `list` | — | Print the configured package sources. |
+| `config` | — | Print the global / project settings file locations and the merged resolved settings. |
+
+`run_package_command(argv, &mut store, &mut io) -> PackageResult` returns a `PackageResult` whose `code` is adopted (clamped to a byte) as the exit code; it never panics for an expected failure (a bad / missing argument is a printed error line plus a non-zero code). Sources are plain strings the addon loader understands — an `npm:` spec, a `git:` / `https:` repo, or a bare local path. See [Addons](/rust-cli/subsystems/addons) for how the configured sources are loaded.
+
+## Dispatch Order
+
+`route(brand, rest)` consumes the command line in a fixed order, so a leading subcommand verb always wins over a prompt of the same spelling:
+
+1. **`auth` subcommand** — `rest[0] == "auth"` → `run_auth_subcommand` → exit (intercepted before the global meta short-circuits so `auth --help` reaches the auth command).
+2. **`--help` / `-h`** — render `render_usage()` + the `Commands:` footer → exit `0`.
+3. **`--version` / `-v`** — print `"indusagi <version>"` → exit `0`.
+4. **Unknown leading flag** — a leading `-…` token the flag table does not name → usage error, exit `2`.
+5. **Credential verbs** — `rest[0] ∈ {signin, signout}` → `run_agent_credential` → exit.
+6. **Package verbs** — `rest[0] ∈ {install, remove, update, list, config}` → `run_package` → exit.
+7. **`--list-models [filter]`** — print the catalog → exit `0`.
+8. **Everything else** — handed to `induscode::boot::boot_run`, which resolves the runner from the output mode and returns the process `ExitCode`.
+
+See [Boot](/rust-cli/subsystems/boot) for the stage pipeline and runner registry, and [Launch](/rust-cli/subsystems/launch) for the parser internals.
+
+## Unknown Flags and Usage Errors
+
+The parser is deliberately **total**: an unrecognised `--flag` is tolerated as a loose boolean switch in the `Invocation::flags` bag (an inline `--flag=value` keeps its string value), never rejected — the extension-flag escape hatch. This is the hard contrast with the framework's `indusagi::shell_app::invocation::tokenize_invocation`, which errors on unknown flags.
+
+```rust
+let inv = read_invocation(&["--frobnicate".to_string()]);
+assert_eq!(inv.flags.get("frobnicate"), Some(&FlagValue::Bool(true)));
+```
+
+The agent's exit-2 usage convention is therefore enforced not by the parser but by `unknown_leading_flag` in `main.rs`: when the **leading** token starts with `-` (and is not the bare `-` stdin sentinel or the `--` terminator) yet names no flag in `token_index()`, the CLI reports it on stderr and exits `2`:
+
+```
+indus: unknown option '--bogus'
+Try 'indus --help' for the available options.
+```
+
+A leading `signin` / `signout` / `auth` / package verb is a non-flag positional, so it is never an unknown-leading-flag error — `route` intercepts those before this check.
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` (`ExitCode::SUCCESS`) | A clean run; `--help`, `--version`, `--list-models`, `auth status`; a successful `signin` / `signout`. |
+| `1` (`ExitCode::FAILURE`) | A handled credential command that raised a typed `CredentialFault` (printed first), an unexpected failure during boot, or a package command that reported a bad / missing argument. |
+| `2` (`EXIT_USAGE`) | A malformed invocation — an unknown **leading** flag (`unknown_leading_flag`). |
+
+The `auth` framework route additionally clamps the framework command's own `i32` code (0 / 1 / 2) into the returned `ExitCode`. `boot_run` maps every run outcome to an `ExitCode` and always drains its closables, so `main` is a thin adopt-and-return shim — no `process::exit` is ever called.
+
+## Parsing the Command Line in Rust
+
+The parser is part of the library surface for embedding and testing. `read_invocation` folds a sliced `argv` into a fully-typed `Invocation`; `read_file_references` re-walks just the `@file` refs.
+
+```rust
+use induscode::launch::parser::{read_invocation, read_file_references};
+use induscode::launch::contract::{OutputMode, ThinkingEffort};
+
+let inv = read_invocation(&[
+    "-p".into(), "--model".into(), "openai/gpt".into(), "hello".into(), "@notes.md".into(),
+]);
+assert_eq!(inv.mode, OutputMode::Json);
+assert!(inv.print);
+assert_eq!(inv.model.as_deref(), Some("openai/gpt"));
+assert_eq!(inv.prompt.as_deref(), Some("hello"));
+
+let refs = read_file_references(&["-p".into(), "hi".into(), "@notes.md".into()]);
+assert_eq!(refs, vec!["notes.md".to_string()]);
+```
+
+Render the usage banner, print the catalog, and drive the subcommands directly:
+
+```rust
+use induscode::launch::usage::render_usage;
+use induscode::launch::catalog::{CatalogFilter, RegistrySource, StdoutCatalogIo, print_model_catalog};
+
+println!("{}", render_usage());   // the generated 18-row banner, no trailing newline
+
+let mut io = StdoutCatalogIo;
+let filter = CatalogFilter { search: Some("claude".into()), ..Default::default() };
+print_model_catalog(&mut io, &filter, &RegistrySource);
+```
+
+The full launch type surface — `Invocation`, `OutputMode`, `ThinkingEffort`, `ToolName`, `FlagValue`, `FlagSpec` / `flag_specs()`, `CatalogFilter`, `Attachments`, `CredentialFault`, `ProviderEntry` — lives in `induscode::launch::{contract, flags, parser, usage, catalog, credentials}`. The launch subsystem internals are documented in [Launch](/rust-cli/subsystems/launch); the parity story against the TS and Python editions is covered in [the TS CLI](/cli/reference/cli) and [the Python CLI](/python-cli/reference/cli).

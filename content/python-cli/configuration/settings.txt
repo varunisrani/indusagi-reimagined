@@ -1,0 +1,290 @@
+# Settings
+
+> Preferences for an interactive `induscode` session — colour scheme, image and
+> reasoning rendering, default provider/model/thinking level, steering and
+> follow-up delivery, and more. They live in a two-tier JSON store
+> (`induscode.settings.PreferenceStore`): a per-checkout `.pindusagi/settings.json`
+> layered over a machine-wide `~/.pindusagi/settings.json`, with built-in defaults
+> underneath. State location is resolved by the [`workspace`](/python-cli/subsystems/boot)
+> layer and overridable with `INDUSAGI_CODING_AGENT_DIR` / `INDUSAGI_HOME`.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Two-tier layering](#two-tier-layering)
+- [State locations](#state-locations)
+- [Environment overrides](#environment-overrides)
+- [Preference keys](#preference-keys)
+- [Narrow vocabularies](#narrow-vocabularies)
+- [The PreferenceStore API](#the-preferencestore-api)
+- [On-disk format and key spelling](#on-disk-format-and-key-spelling)
+- [Reading and writing programmatically](#reading-and-writing-programmatically)
+- [Design notes](#design-notes)
+
+## Overview
+
+The `induscode.settings` subpackage is the single place every preference is
+named, typed, given a fallback default, and tied to its on-disk JSON spelling.
+It is split into two modules behind one barrel:
+
+| Module | Responsibility |
+|--------|----------------|
+| `contract.py` | Pure shape and defaults — the `Preferences` dataclass, the key vocabularies, the field↔JSON alias maps, and the fully-populated `DEFAULT_PREFERENCES`. No I/O. |
+| `manager.py` | Filesystem — `PreferenceStore`, the two-tier reader/writer, plus `PreferenceLocations`. |
+
+Every console surface and boot stage reads a guaranteed concrete value through
+the store rather than reaching into files directly. The store is constructed
+once during [boot](/python-cli/subsystems/boot) and threaded through to the
+console as a service, where overlay pickers read and write it live.
+
+## Two-tier layering
+
+A read resolves across three layers; the first that defines a key wins:
+
+1. **Project tier** — `.pindusagi/settings.json` beside the working tree (one per checkout).
+2. **Global tier** — `<profile_root>/settings.json` (one per machine, normally `~/.pindusagi/settings.json`).
+3. **Built-in defaults** — `DEFAULT_PREFERENCES`, where every key carries a concrete non-`None` value.
+
+A write through `set(...)` + `save()` lands in the **project tier only**. The
+global file is never rewritten, so a per-checkout change can never leak
+machine-wide. Because the defaults are fully populated, a caller of `get(...)`
+always receives a concrete value and never has to branch on `None`.
+
+## State locations
+
+The two file paths come from the [`workspace`](/python-cli/subsystems/boot)
+locator, which folds a data-defined layout onto a resolved profile root. With
+no overrides, the profile root is `~/.pindusagi/` and the global tier is
+`~/.pindusagi/settings.json`. Other per-user state shares the same root:
+
+| Member | Default location | Holds |
+|--------|------------------|-------|
+| `profile_dir` | `~/.pindusagi/` | The root of all per-user state |
+| `settings_path` | `~/.pindusagi/settings.json` | The global preference tier |
+| `auth_path` | `~/.pindusagi/auth.json` | Stored credentials (see [Auth](/python-cli/configuration/auth)) |
+| `sessions_dir` | `~/.pindusagi/sessions/` | Persisted transcripts |
+| `models_path` | `~/.pindusagi/models.json` | Custom model-catalog overrides (see [Models](/python-cli/configuration/models)) |
+| `mcp_config_path` | `~/.pindusagi/mcp-servers.json` | External MCP servers (see [MCP](/python-cli/configuration/mcp)) |
+| `themes_dir` | `~/.pindusagi/themes/` | User-installed colour themes |
+| `prompts_dir` | `~/.pindusagi/prompts/` | User-authored prompt/command templates |
+
+The project tier is always `<cwd>/.pindusagi/settings.json` — it is **not**
+relocated by the environment overrides below, which only move the profile root
+(the global tier and the rest of the state directory).
+
+## Environment overrides
+
+The profile root resolves by a fixed precedence ladder, all pure (no filesystem
+access at resolution time):
+
+| Variable | Effect | Precedence |
+|----------|--------|------------|
+| `INDUSAGI_CODING_AGENT_DIR` | Agent-specific override; its value **is** the profile dir | Highest — wins over `INDUSAGI_HOME` |
+| `INDUSAGI_HOME` | Framework state-directory override; its value **is** the profile dir | Used when the agent override is absent |
+| _(neither)_ | `<home>/.pindusagi` | Default |
+
+Both override values are `~`-expanded and, when relative, resolved against the
+working directory (matching `path.resolve` semantics, no symlink resolution).
+
+```bash
+# Relocate all per-user state (settings, auth, sessions, …) for one shell
+export INDUSAGI_CODING_AGENT_DIR=/srv/induscode-state
+pindus --version
+
+# Or use the framework-wide root override (induscode shares the framework's flat root)
+export INDUSAGI_HOME=~/work/induscode-home
+pindus
+```
+
+When the agent-specific override is set it wins; `INDUSAGI_HOME` is consulted
+only if `INDUSAGI_CODING_AGENT_DIR` is unset or blank.
+
+## Preference keys
+
+`Preferences` is a frozen dataclass with 23 fully-optional snake_case fields.
+Every default is concrete (non-`None`); `None` plays the "key not present" role,
+so a sparse or partial record is legal. The on-disk JSON keeps the camelCase
+spelling.
+
+| Field (snake_case) | JSON key (camelCase) | Type | Default |
+|--------------------|----------------------|------|---------|
+| `colour_scheme` | `colourScheme` | `str` | `"default"` |
+| `show_images` | `showImages` | `bool` | `True` |
+| `show_reasoning` | `showReasoning` | `bool` | `True` |
+| `hide_thinking` | `hideThinking` | `bool` | `False` |
+| `image_auto_resize` | `imageAutoResize` | `bool` | `True` |
+| `block_images` | `blockImages` | `bool` | `False` |
+| `enable_skill_commands` | `enableSkillCommands` | `bool` | `True` |
+| `steering_mode` | `steeringMode` | `DeliveryMode` | `"all"` |
+| `follow_up_mode` | `followUpMode` | `DeliveryMode` | `"all"` |
+| `collapse_changelog` | `collapseChangelog` | `bool` | `False` |
+| `show_hardware_cursor` | `showHardwareCursor` | `bool` | `False` |
+| `editor_padding_x` | `editorPaddingX` | `int` | `1` |
+| `enabled_models` | `enabledModels` | `tuple[str, ...]` | `()` |
+| `default_provider` | `defaultProvider` | `str` | `"anthropic"` |
+| `default_model` | `defaultModel` | `str` | `""` |
+| `default_thinking_level` | `defaultThinkingLevel` | `ThinkingLevel` | `"medium"` |
+| `quiet_startup` | `quietStartup` | `bool` | `False` |
+| `last_seen_version` | `lastSeenVersion` | `str` | `""` |
+| `logo_sweep` | `logoSweep` | `bool` | `False` |
+| `reduced_motion` | `reducedMotion` | `bool` | `False` |
+| `auto_compact` | `autoCompact` | `bool` | `True` |
+| `double_escape_action` | `doubleEscapeAction` | `EscapeAction` | `"clear"` |
+| `extension_packages` | `extensionPackages` | `tuple[str, ...]` | `()` |
+
+A few semantic notes: `enabled_models` is a set of glob/id patterns selecting
+which models the picker shows (empty means all); `auto_compact` governs whether
+the [window-budget](/python-cli/subsystems/window-budget) manager compacts the
+transcript automatically; `extension_packages` lists the sources the
+[launcher](/python-cli/subsystems/launch) installs; `last_seen_version`
+auto-condenses the startup banner once it equals the running version.
+
+## Narrow vocabularies
+
+Three small unions pin the values a few keys may hold. `SettingKey` (a `Literal`
+union of all 23 snake_case key names) and `SETTING_KEYS` (the same set as a
+tuple, derived via `get_args` so it can never drift) cover the key namespace
+itself.
+
+**`EscapeAction`** — what a double-tap of the escape key does in the console:
+
+| Value | Effect |
+|-------|--------|
+| `tree` | Open the turn history as a navigable tree of branches |
+| `fork` | Open the prior-turn picker to branch off an earlier turn |
+| `clear` | Wipe the composer buffer (the default) |
+
+`ESCAPE_ACTIONS` is the canonical tuple `("tree", "fork", "clear")`. The legacy
+aliases `rewind` (→ `fork`) and `branch` (→ `tree`) are still accepted in an
+older preference file but are not part of `ESCAPE_ACTIONS`. `is_escape_action()`
+is a `TypeGuard` narrowing a value to a canonical action.
+
+**`DeliveryMode`** — how a queue of pending turns drains back into a run:
+
+| Value | Effect |
+|-------|--------|
+| `all` | Release every queued turn at once on the next handoff |
+| `one-at-a-time` | Release a single queued turn per handoff |
+
+`DELIVERY_MODES` is the tuple `("all", "one-at-a-time")`, and `is_delivery_mode()`
+narrows a value to a known mode. Both `steering_mode` and `follow_up_mode` use
+this vocabulary.
+
+**`ThinkingLevel`** — the reasoning-effort vocabulary
+(`'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'`) is re-exported from
+the [framework agent](/python/facades/agent) rather than re-declared, so the
+agent and the UI speak the same words. It types `default_thinking_level`.
+
+## The PreferenceStore API
+
+`PreferenceStore` is constructed two ways. `from_workspace(...)` is the runtime
+path used by boot; `at_paths(...)` pins both files explicitly and is what tests
+drive against a temp directory so the real home is never touched.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `PreferenceStore.from_workspace(ws, cwd=None)` | classmethod | `manager.py` | Resolve the global tier from `ws.settings_path` and the project tier from `<cwd>/.pindusagi/settings.json` |
+| `PreferenceStore.at_paths(global_path, project_path)` | classmethod | `manager.py` | Pin both tier files directly (neither needs to exist yet) |
+| `get(key)` | method | `manager.py` | Resolve one preference: project → global → default; raises `KeyError` on an unknown key |
+| `set(key, value)` | method | `manager.py` | Stage a value into the in-memory project tier; `value=None` clears the override |
+| `save()` | method | `manager.py` | Flush the project tier only to `.pindusagi/settings.json` |
+| `reload()` | method | `manager.py` | Re-read both tiers from disk, discarding unsaved staged changes |
+| `snapshot()` | method | `manager.py` | Build a full `Preferences` record (defaults ← global ← project) |
+| `paths()` | method | `manager.py` | The resolved `PreferenceLocations` (global_path, project_path) |
+| `project_overrides()` | method | `manager.py` | A copy of the in-memory project tier (canonical keys) |
+| `global_defaults()` | method | `manager.py` | A copy of the in-memory global tier (canonical keys) |
+
+`get` and `set` accept **either** the snake_case field name or the camelCase
+JSON spelling — `canonical_key()` normalises both to the field name and raises
+`KeyError` for anything unknown, so a typo is loud rather than silently ignored.
+
+## On-disk format and key spelling
+
+The store holds both tiers in memory under canonical snake_case field names and
+translates to the camelCase JSON keys on save. A saved file is plain pretty JSON
+with a trailing newline:
+
+```json
+{
+  "colourScheme": "midnight",
+  "showReasoning": false,
+  "editorPaddingX": 2,
+  "enabledModels": ["claude-*", "gpt-4o"]
+}
+```
+
+Loading is deliberately tolerant. A missing file, unparseable JSON, or a JSON
+value that is not an object all degrade to the empty record rather than raising,
+so one mangled settings file never blocks startup. JSON `null` values are dropped
+(treated as "key not present"). JSON arrays are coerced to tuples so tier values
+compare equal to the tuple-valued defaults. Unknown keys are preserved verbatim
+through a load → save round-trip but never surface through `get` or `snapshot`.
+
+## Reading and writing programmatically
+
+Build the store the way boot does — from the resolved workspace and cwd:
+
+```python
+from induscode.settings import PreferenceStore
+from induscode.workspace import create_workspace
+
+ws = create_workspace()                       # resolves ~/.pindusagi (or an override)
+store = PreferenceStore.from_workspace(ws, cwd=".")
+# global tier  = ws.settings_path             (~/.pindusagi/settings.json)
+# project tier = ./.pindusagi/settings.json
+
+scheme = store.get("colour_scheme")           # "default" if neither tier sets it
+level = store.get("default_thinking_level")   # "medium" fallback
+```
+
+A console overlay reads and writes live, using the camelCase JSON spelling that
+the dual-spelling acceptance allows:
+
+```python
+# A picker overlay toggling preferences and persisting them:
+enabled = list(store.get("enabledModels"))    # () -> [] by default
+store.set("colourScheme", "midnight")
+store.set("editorPaddingX", 2)
+store.set("enabledModels", ["claude-*"])
+store.save()                                   # flushes ONLY ./.pindusagi/settings.json
+```
+
+Clearing an override falls back through the tiers, and `snapshot()` materialises
+the fully-resolved record:
+
+```python
+from pathlib import Path
+from induscode.settings import PreferenceStore
+
+store = PreferenceStore.at_paths(Path("/tmp/global.json"), Path("/tmp/proj.json"))
+store.set("show_reasoning", False)             # stages into the project tier
+store.save()                                    # writes {"showReasoning": false} to proj.json
+store.set("show_reasoning", None)              # clears the override -> back to default True
+snap = store.snapshot()                         # full Preferences: defaults <- global <- project
+assert snap.show_reasoning is True
+```
+
+## Design notes
+
+- **None-clears semantics.** `set(key, None)` pops the project-tier override (the
+  equivalent of clearing a key) so the value falls back to global/default on the
+  next read; it never writes a JSON `null`.
+- **Project-only writes.** `save()` flushes the project tier exclusively. The
+  global file is read but never rewritten by the store, so a checkout cannot
+  mutate machine-wide preferences.
+- **Field↔JSON alias maps.** `FIELD_TO_JSON_KEY` / `JSON_TO_FIELD_KEY` are the
+  single explicit tie between the snake_case fields and the camelCase JSON keys.
+  No mechanical case converter is used — every mapping is spelled out so the two
+  namings cannot silently drift.
+- **Import-time invariants.** `contract.py` asserts at import that the dataclass
+  fields, the `SettingKey` union, the alias map, and `DEFAULT_PREFERENCES` all
+  describe the same 23-key set and that every default is non-`None`. Any drift is
+  an immediate, loud import-time error.
+- **Frozen and immutable.** `Preferences`, `DEFAULT_PREFERENCES`, and
+  `PreferenceLocations` are frozen; list-valued defaults are tuples, so the
+  defaults can be shared without a defensive copy.
+
+See [Console overview](/python-cli/console/overview) for the surfaces that toggle
+these preferences live, [Boot](/python-cli/subsystems/boot) for where the store
+is constructed and threaded through, and the [framework agent](/python/facades/agent)
+for the `ThinkingLevel` vocabulary.

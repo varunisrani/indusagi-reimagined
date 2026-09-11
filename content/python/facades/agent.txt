@@ -1,0 +1,347 @@
+# Agent Facade
+
+> `indusagi.agent` is the high-level, batteries-included entry point for driving a
+> coding agent: pick a model, attach tools, call `await agent.prompt(...)`.
+> Imported as `from indusagi.agent import Agent, create_coding_tools`. It is a thin
+> shim over the runtime core — it owns no conversation loop of its own.
+
+The package wraps the green runtime ([Runtime](/python/subsystems/runtime)) in a
+friendly, mutable surface: the `Agent` class, the `create_*_tool` factories over
+the [Capabilities](/python/subsystems/capabilities) built-ins, append-only JSONL
+session trees, and a runtime registry for app-defined message kinds. The message
+and content models themselves (`UserMessage`, `AssistantMessage`, `TextContent`,
+…) live in [AI Facade](/python/facades/ai) and are consumed here but not
+re-exported.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [The Agent class](#the-agent-class)
+- [AgentState and AgentOptions](#agentstate-and-agentoptions)
+- [Prompt, steer, and follow up](#prompt-steer-and-follow-up)
+- [Events](#events)
+- [Tool wiring](#tool-wiring)
+- [Session persistence](#session-persistence)
+- [The message-kind registry](#the-message-kind-registry)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+From `indusagi/agent/__init__.py`:
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `Agent` | class | `agent.py` | High-level agent: `set_model`/`set_tools`/`set_system_prompt`, then async `prompt`/`continue_`/`steer`/`follow_up`/`wait_for_idle`/`abort`; `subscribe()` to events; mutable `.state` |
+| `AgentState` | dataclass | `agent.py` | Mutable runtime state the UI watches: `systemPrompt`, `model`, `thinkingLevel`, `tools`, `messages`, `isStreaming`, `streamMessage`, `pendingToolCalls`, `error` |
+| `AgentOptions` | TypedDict | `agent.py` | Optional constructor kwargs (`initial_state`, `convert_to_llm`, `transform_context`, `steering_mode`, `follow_up_mode`, `stream_fn`, `session_id`, `get_api_key`, `thinking_budgets`) |
+| `AgentTool` | Protocol | `agent.py` | `runtime_checkable` structural protocol: `name`/`label`/`description`/`parameters` + `execute(...)` |
+| `AgentToolResult` | dataclass | `agent.py` | Frozen result of a tool `execute()`: `content` tuple, `details`, `isError` |
+| `AgentEvent` | type | `agent.py` | Union of the 10 streamed event dataclasses |
+| `AGENT_EVENT_GROUPS` | const | `agent.py` | Dict grouping event-type strings into `agent`/`turn`/`message`/`toolExecution` buckets |
+| `ThinkingLevel` / `ThinkingBudgets` / `QueueMode` / `StreamFn` | type | `agent.py` | Vocabulary aliases: reasoning tier, per-level token budgets, queue release mode, swappable stream entry point |
+| `validate_message` / `is_user_message` / `is_thinking` / `is_tool_call` | function | `agent.py` | Runtime shape guards over duck-typed messages and blocks |
+| `SessionManager` | class | `sessions.py` | Append-only JSONL session tree |
+| `SessionContext` / `SessionInfo` / `SessionTreeNode` | dataclass | `sessions.py` | Recovered model-facing context, per-file summary, and a node in the tree |
+| `build_session_context` / `find_most_recent_session` / `parse_session_entries` / `migrate_session_entries` / `load_entries_from_file` / `get_latest_compaction_entry` | function | `sessions.py` | Free functions for parsing/migrating JSONL logs and rebuilding the context |
+| `CURRENT_SESSION_VERSION` | const | `sessions.py` | `int 3` — the on-disk session schema version (v1/v2 migrated in place) |
+| `register_message_type` / `unregister_message_type` / `get_message_type` / `registered_message_types` | function | `registry.py` | Runtime registry mapping a role tag to its class |
+| `convert_to_llm` | function | `registry.py` | Reduce an `AgentMessage` list to the plain user/assistant/toolResult messages the model accepts |
+| `BashExecutionMessage` / `CustomMessage` / `BranchSummaryMessage` / `CompactionSummaryMessage` | dataclass | `registry.py` | The four built-in session-only message kinds, pre-registered at import |
+| `create_coding_tools` / `create_read_only_tools` / `create_all_tools` | function | `tools.py` | Build cwd-bound tool collections |
+| `create_read_tool` / `create_bash_tool` / `create_edit_tool` / `create_write_tool` / `create_grep_tool` / `create_find_tool` / `create_ls_tool` / `create_process_tool` / `create_todo_read_tool` / `create_todo_write_tool` / `create_web_search_tool` / `create_web_fetch_tool` | function | `tools.py` | 1:1 factories binding a built-in to a working dir, returning a `FacadeAgentTool` |
+| `FacadeAgentTool` | class | `tools.py` | One capabilities tool wearing the facade `AgentTool` surface |
+| `ToolRegistry` / `ToolMetadata` / `TOOL_METADATA` / `create_tool_registry` | class/const | `tools.py` | Name→factory registry, its metadata record, the static map, and the cwd-bound builder |
+| `coding_tools` / `read_only_tools` / `all_tools` + `read_tool`/`bash_tool`/… | const | `tools.py` | Module-level `FacadeAgentTool` singletons bound to the process cwd, plus curated lists |
+
+## The Agent class
+
+Construct an `Agent` with no arguments, a keyword bag, or an `AgentOptions`
+mapping (the two merge — kwargs win). Configuration is set with snake_case
+setters, then a run is started with `await agent.prompt(...)`:
+
+```python
+import asyncio
+from indusagi.agent import Agent, create_coding_tools
+
+async def main():
+    agent = Agent()
+    agent.set_system_prompt("You are a helpful coding assistant.")
+    agent.set_tools(create_coding_tools("/path/to/project"))
+
+    unsubscribe = agent.subscribe(lambda ev: print(ev.type))
+    await agent.prompt("explain this repository")
+    unsubscribe()
+
+    for msg in agent.state.messages:
+        print(getattr(msg, "role", None))
+
+asyncio.run(main())
+```
+
+On construction the model defaults to `{provider: "google", id: "gemini-2.5-flash"}`
+(resolved against the `indusagi.ai` catalog; `None` if unavailable). Setters:
+
+| Setter | Effect |
+|--------|--------|
+| `set_model(m)` | The model to invoke (a model card or a bare id string). `prompt()` fails if `None`. |
+| `set_system_prompt(v)` | The system instruction passed to the core config. |
+| `set_thinking_level(level)` | A `ThinkingLevel` tier (see below). |
+| `set_tools(tools)` | The list of `AgentTool`s exposed to the model. |
+| `set_steering_mode(mode)` / `set_follow_up_mode(mode)` | Queue release: `"all"` or `"one-at-a-time"`. |
+| `replace_messages(...)` / `append_message(...)` / `clear_messages()` | Edit conversation history; appends replace the list reference so watchers see fresh objects. |
+
+`ThinkingLevel` carries the tiers `"off"`, `"minimal"`, `"low"`, `"medium"`,
+`"high"`, `"xhigh"`. The shim folds them onto the core's reasoning levels:
+`"off"` → `None`, `"minimal"` → `"low"`, `"xhigh"` → `"max"`, the rest pass
+through unchanged.
+
+## AgentState and AgentOptions
+
+`agent.state` is a live, mutable `AgentState` dataclass with TS-style camelCase
+fields, intended to be watched by a UI:
+
+| Field | Meaning |
+|-------|---------|
+| `systemPrompt` / `model` / `thinkingLevel` / `tools` | Current configuration. |
+| `messages` | The conversation so far (`AgentMessage` objects). |
+| `isStreaming` | `True` while a run is in flight. |
+| `streamMessage` | The live partial assistant message during streaming, else `None`. |
+| `pendingToolCalls` | Set of tool-call ids currently executing. |
+| `error` | The last run failure string, or `None`. |
+
+`AgentOptions` keys (all optional; equally valid as keyword arguments):
+
+| Key | Purpose |
+|-----|---------|
+| `initial_state` | A mapping or `AgentState` to seed state from. |
+| `convert_to_llm` | Override the default history → model-message reduction. |
+| `transform_context` | Hook to rewrite history before a batch is submitted. |
+| `steering_mode` / `follow_up_mode` | Default `QueueMode` for each queue (defaults to `"one-at-a-time"`). |
+| `stream_fn` | Stored for API parity; the real model seam is the core gateway (see notes). |
+| `session_id` | Forwarded for provider-side caching. |
+| `get_api_key` | `Callable[[provider], key]` spliced into the model invocation per run. |
+| `thinking_budgets` | A `ThinkingBudgets` TypedDict of per-level token allowances. |
+
+## Prompt, steer, and follow up
+
+`prompt()` accepts raw text (optionally with images), a single `AgentMessage`, or
+a list of messages. It validates that no run is already streaming and that a
+model is selected, then drives the run to completion before returning:
+
+```python
+import asyncio
+from indusagi.agent import Agent, create_read_only_tools
+
+async def main():
+    agent = Agent(steering_mode="one-at-a-time", follow_up_mode="all")
+    agent.set_tools(create_read_only_tools("."))
+    agent.set_thinking_level("medium")
+
+    task = asyncio.create_task(agent.prompt("survey the codebase"))
+    agent.steer("focus on the agent package")        # folds into the live run
+    agent.follow_up("now summarize what you found")  # held until idle
+    await task
+    await agent.wait_for_idle()
+
+asyncio.run(main())
+```
+
+| Method | Semantics |
+|--------|-----------|
+| `await prompt(input, images=None)` | Start a new run; resolves when the run settles. |
+| `await continue_()` | Resume the existing conversation (e.g. retry after a context overflow). Named `continue_` because `continue` is a Python keyword. |
+| `steer(message)` | Enqueue a redirection that folds into the live core run at the next safe step. |
+| `follow_up(message)` | Enqueue a message held back until the agent goes idle, then drained in the post-settle loop. |
+| `await wait_for_idle()` | Resolve once no run is in flight. |
+| `abort()` | Tear down the current run. |
+| `reset()` | Clear conversation data and queues (configuration is kept). |
+| `clear_steering_queue()` / `clear_follow_up_queue()` / `clear_all_queues()` | Drop queued messages. |
+
+Internally `prompt()` resolves the input into messages, builds a core
+`AgentConfig` (model id, system prompt, mapped thinking level, and a tool box
+adapting the facade tools onto the core `ToolRunner`), then calls
+`indusagi.runtime.create_agent`. An `invoke_model` closure reaches
+`indusagi.llmgateway.stream`, splicing in any per-provider key from
+`get_api_key`. The core's run event stream is translated back into the facade
+event vocabulary. If a run faults, a zeroed-usage error assistant message is
+synthesized (`stopReason` `"aborted"` or `"error"`) and a non-empty trailing
+partial may be salvaged.
+
+A missing tool yields the verbatim text `No registered tool named "<name>".`;
+exceptions raised by a tool are wrapped with the prefix
+`[agent:tool_execution:<name>]`. A faulty event listener cannot sink the run —
+exceptions in listeners are swallowed (but `CancelledError` propagates).
+
+## Events
+
+`subscribe(fn)` registers an event listener and returns an unsubscribe disposer.
+Listeners receive `AgentEvent`s, each a frozen dataclass with a `type` discriminator:
+
+| Group | Events | Carries |
+|-------|--------|---------|
+| `agent` | `agent_start`, `agent_end` | `agent_end.messages` — the run's produced messages |
+| `turn` | `turn_start`, `turn_end` | `turn_end.message` + `turn_end.toolResults` |
+| `message` | `message_start`, `message_update`, `message_end` | the live/finished message; `message_update.assistantMessageEvent` carries the originating delta |
+| `toolExecution` | `tool_execution_start`, `tool_execution_update`, `tool_execution_end` | `toolCallId`, `toolName`, `args`, `result`/`partialResult`, `isError` |
+
+`AGENT_EVENT_GROUPS` is the dict mapping each group name to its event-type
+strings, handy for filtering or logging. The translator maintains the live
+partial assistant message, per-turn tool results, and turn framing, appending
+finished messages onto `state.messages` as it goes.
+
+## Tool wiring
+
+A tool is anything satisfying the `AgentTool` protocol — `name`, `label`,
+`description`, `parameters`, and an `async execute(tool_call_id, params, signal,
+on_update)` returning an `AgentToolResult`. The `create_*_tool` factories bind a
+[Capabilities](/python/subsystems/capabilities) built-in to a working directory
+and return a `FacadeAgentTool`, which mints a fresh local tool context per call
+(or pins a shared one for the todo pair).
+
+```python
+from indusagi.agent import (
+    create_coding_tools,
+    create_read_only_tools,
+    create_read_tool,
+    create_bash_tool,
+)
+
+# Curated collections bound to a cwd:
+coding = create_coding_tools("/path/to/project")    # read/bash/edit/write/process/todo*/web*
+readonly = create_read_only_tools("/path/to/project")  # read/grep/find/ls/todoread/web*
+
+# Or wire individual tools:
+agent_tools = [create_read_tool("/repo"), create_bash_tool("/repo")]
+```
+
+The twelve factories map 1:1 onto built-ins: `read`, `bash`, `edit`, `write`,
+`grep`, `find`, `ls`, `process`, `todo_read` / `todo_set` (the `create_todo_*`
+pair), `websearch`, `webfetch`. Pass the same `todo_store` token to both
+`create_todo_read_tool` and `create_todo_write_tool` so the pair shares one
+checklist — the store is keyed by tool-context identity. Per-factory `options`
+bags are accepted for signature parity but mostly ignored, since the core tools
+carry their own defaults.
+
+`create_tool_registry(cwd)` returns a `ToolRegistry` with all twelve built-ins
+registered; `TOOL_METADATA` is the static name → `ToolMetadata` map (each with a
+`ToolCategory`). Module-level singletons (`read_tool`, `bash_tool`, …) and the
+`coding_tools` / `read_only_tools` lists plus the `all_tools` dict are bound to
+the process working directory. The Composio tool family is excluded here; it
+lives behind [Connectors](/python/subsystems/connectors).
+
+## Session persistence
+
+`SessionManager` stores each conversation as one append-only JSONL file. The
+first line is a `{"type": "session", "version": 3, ...}` header; every subsequent
+record carries an `id` and `parentId`, so the records form a tree. A leaf pointer
+marks "now": appends hang a child off the leaf, and branching moves the leaf back
+— history is never rewritten on branch.
+
+```python
+from indusagi.agent import SessionManager
+
+sm = SessionManager.create("/path/to/project")
+uid = sm.append_message({"role": "user", "content": "hello"})
+sm.append_model_change("google", "gemini-2.5-flash")
+sm.append_message({"role": "assistant", "content": [{"type": "text", "text": "hi"}]})
+
+ctx = sm.build_session_context()   # SessionContext(messages, thinkingLevel, model)
+print(len(ctx.messages), ctx.model)
+
+# Resume the most recent session for this cwd later:
+resumed = SessionManager.continue_recent("/path/to/project")
+print(resumed.get_session_id())
+```
+
+Static factories: `create(cwd)`, `open(path)`, `continue_recent(cwd)`,
+`in_memory(cwd)`, `fork_from(...)`, plus the async `list(...)` / `list_all(...)`
+scanners. Append methods include `append_message`, `append_compaction`,
+`append_model_change`, `append_thinking_level_change`, `branch_with_summary`,
+`append_custom_entry`, and `append_label_change`. Navigation: `build_session_context()`,
+`get_tree()`, `get_branch()`, `get_leaf_id()`, `get_entry()`, `get_children()`.
+
+`build_session_context()` walks parent links root-to-leaf, applies the latest
+compaction (a `CompactionSummaryMessage` recap, then the retained tail from
+`firstKeptEntryId`, then everything after), and projects records into
+model-facing messages — reconstructing session-only kinds through the registry
+constructors. It returns a `SessionContext(messages, thinkingLevel, model)`.
+
+Key behaviors:
+
+- Records are kept as plain dicts in the exact TS JSON shape (camelCase, never
+  re-modelled), so unknown or extension fields survive load → migrate → rewrite
+  losslessly.
+- `CURRENT_SESSION_VERSION` is `3`. v1→v2 adds the `id`/`parentId` tree shape
+  (and converts `firstKeptEntryIndex` → `firstKeptEntryId`); v2→v3 relabels
+  `"hookMessage"` → `"custom"`. Damaged JSONL lines are silently skipped.
+- The default directory is `~/.pindusagi/agent/sessions/<encoded-cwd>/`,
+  overridable via `INDUSAGI_DIR`, `INDUSAGI_AGENT_DIR`, or
+  `INDUSAGI_CODING_AGENT_DIR`. Persistence is deferred until at least one
+  assistant message exists, so empty or aborted sessions leave no file.
+
+## The message-kind registry
+
+`register_message_type` is the runtime replacement for static declaration-merging:
+it maps a `role` tag to the class that carries it so renderers and session loaders
+recognize app-defined and built-in kinds. It works directly or as a class
+decorator:
+
+```python
+from dataclasses import dataclass
+from typing import ClassVar, Literal
+from indusagi.agent import register_message_type, convert_to_llm
+
+@register_message_type("reminder")
+@dataclass(frozen=True)
+class ReminderMessage:
+    role: ClassVar[Literal["reminder"]] = "reminder"
+    content: str
+    timestamp: int
+
+# Unregistered/unknown roles are dropped by convert_to_llm; the built-in
+# session kinds (bashExecution/custom/branchSummary/compactionSummary) are
+# translated into user messages for the model.
+model_msgs = convert_to_llm([ReminderMessage(content="check tests", timestamp=0)])
+print(model_msgs)  # [] — 'reminder' has no convert_to_llm handler
+```
+
+The four built-in session-only kinds — `BashExecutionMessage`, `CustomMessage`,
+`BranchSummaryMessage`, `CompactionSummaryMessage` — are frozen dataclasses with
+camelCase fields (`exitCode`, `customType`, `fromId`, `tokensBefore`) and are
+pre-registered at import. `convert_to_llm` reduces a full `AgentMessage` list to
+the plain user/assistant/toolResult messages the model accepts:
+`user`/`assistant`/`toolResult` pass through; `bashExecution` is restated as user
+text (respecting the `excludeFromContext` opt-out); `custom` becomes a user
+message; the two summary kinds are wrapped in their delimiters and presented as
+user messages; everything else is dropped. The constructors
+(`create_branch_summary_message`, `create_compaction_summary_message`,
+`create_custom_message`, `bash_execution_to_text`) rebuild typed messages from
+saved ISO-string entry fields, and `get_field` reads a field off either a
+dataclass or a raw JSON mapping.
+
+## Relationship to neighbors
+
+The facade sits one layer above the core. It depends on the
+[Runtime](/python/subsystems/runtime) (`create_agent`, `AgentDeps`,
+`AgentConfig`, `RunSnapshot`, `RunEvent`, `ToolCall`, `ToolOutcome`) for the
+conversation loop, the [LLM Gateway](/python/subsystems/llm-gateway) (`stream`
+plus the contract `Turn`/`Block`/`ToolDescriptor`/`StreamOptions` types) for the
+model seam, and [Capabilities](/python/subsystems/capabilities) (`DefinedTool`,
+`ToolContext`, `make_local_context`, and the twelve built-in tools) which
+`tools.py` wraps 1:1. The message/content vocabulary is imported from the
+[AI Facade](/python/facades/ai) and consumed but not re-exported. The
+[MCP](/python/facades/mcp) and [Memory](/python/facades/memory) facades are
+sibling public surfaces, and TUI/CLI layers ([TUI](/python/ui/tui),
+[CLI](/python/reference/cli)) build on the `Agent`.
+
+A few documented shim deviations preserve the observable surface while delegating
+real work to the core:
+
+- `convert_to_llm` / `transform_context` run once per submitted batch, not before
+  every internal model call — the core owns intra-run history.
+- `stream_fn` is accepted and stored only for API parity; swapping transports
+  happens at the core gateway's model invoker.
+- Steering messages are framed (`message_start` / `message_end`) when folded into
+  the live run, not exactly at the next `turn_start`.
+
+Back to the [Architecture overview](/python/architecture).

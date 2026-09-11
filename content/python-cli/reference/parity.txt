@@ -1,0 +1,152 @@
+# Parity & Gaps
+
+> `induscode` is a clean-room Python rebuild of the TypeScript `indusagi-coding-agent` (lineage `v0.1.62`), running entirely on the [indusagi framework](/python/README). This page summarizes the area-by-area parity audit and the known gaps recorded against the TS ground truth. Read it via `import induscode` (the package barrel single-sources `VERSION` and re-exports all subsystems) or by running `pindus --version`.
+
+The audit compares `induscode-python-rebuild/src/induscode` row by row against the TS source tree `indus-code-rebuild/src`. The verdict is **full feature parity** on the user-facing surface — every CLI flag, all 26 slash commands, every console overlay, settings, sessions, channels, addons, and the capability deck — with **13 deliberate, plan-cited divergences** and **a short list of known gaps** that cluster in two subsystems (`launch` and `insight`). The tone here is neutral and factual: this is a rebuild, and this page records exactly where it matches and where it does not.
+
+## Table of Contents
+
+- [Provenance](#provenance)
+- [Parity by Area](#parity-by-area)
+- [Deliberate Divergences](#deliberate-divergences)
+- [Known Gaps](#known-gaps)
+- [Upstream Framework Defect](#upstream-framework-defect)
+- [Library Swaps](#library-swaps)
+- [Version & Doc-String Drift](#version--doc-string-drift)
+- [Source Files](#source-files)
+
+## Provenance
+
+`induscode` is an independent implementation written against a behavioral spec plus the public `indusagi` API. No third-party application source was copied. Two release gates enforce this:
+
+| Gate | What it checks |
+|------|----------------|
+| `scripts/lineage_scan.py` | Word-boundary greps `src/induscode` (excluding tests and the separately-installed framework) for upstream `pi` / `mariozechner` markers; exits `1` on any hit. |
+| public-API guard test | Pins the package's exported surface so it cannot silently drift. |
+
+```bash
+python3 scripts/lineage_scan.py   # exits 1 if any upstream marker appears in src/induscode
+```
+
+The provenance and notice travel with redistributions: `pyproject.toml` embeds both `NOTICE` and `CREDITS.md` into the wheel via PEP 639 `license-files`. The package is MIT-licensed and built with `hatchling`. The underlying `indusagi` framework is a separate PyPI package with its own notice and is explicitly **not** scanned by the lineage gate — `induscode` is built on top of it and reuses it wholesale (LLM API abstraction, agent core, Textual TUI primitives, MCP client, observability), keeping only its own seams (transcript tree, auth vault, signal translation, capability deck).
+
+## Parity by Area
+
+The port was delivered milestone by milestone (M0–M6). The M6 parity audit marked **106/106 checklist rows done** (0 partial, 0 missing), with the test suite green. The table below summarizes the areas; each is a complete, tested layer.
+
+| Area | Parity | Notes |
+|------|--------|-------|
+| CLI flags + conventions | full (23/23) | All 17 flags (`-p`, `--json`/`--rpc`, `-i`, `-m`, `--thinking`, `--list-models`, `--cwd`, `--resume`, `--continue`, `--tools`, `--no-tools`, `--mcp`, `--system`, `--append-system`, `--help`, `--version`, `--account`) plus `@file` attachments, `--` terminator, `-pi` clustering, and unknown-flag tolerance. See [CLI reference](/python-cli/reference/cli). |
+| Subcommands | full | `signin`/`login`, `signout`/`logout`, and `install`/`remove`/`update`/`list`/`config` package management. See [auth](/python-cli/configuration/auth). |
+| Slash commands | full (26 static + dynamic + 10 aliases) | Transcript, workbench, and integrations groups, plus dynamic `/skill:<name>` and `/<template>` macros. See [slash commands](/python-cli/console/slash-commands). |
+| Overlays, theme, input, startup | full (16/16) | 12 modal kinds routed through `OVERLAY_HANDLERS`, 4 theme schemes with live preview, 21-chord `/keys`, double-Ctrl+C exit, startup map and changelog splash. See [dialogs](/python-cli/console/dialogs) and [theming](/python-cli/console/theming). |
+| Channels | full (5/5) | `SESSION_OPS` ×6 with flat `LinkSnapshot`, dialog bridge `ask`/`tell` (90 s timeout→fallback), oneshot text + NDJSON framing, U+2028/29 escaping with split-rune reassembly, JSON-RPC error codes. See [channels](/python-cli/subsystems/channels). |
+| Addons + capability deck | full (8/8) | 13 hook events with observe/transform/gate, interceptor onion, `.indus/addons` discovery via `importlib`, 12 framework built-ins, 5 app cards, and the content/ULID bridge ledger. See [addons](/python-cli/subsystems/addons) and [capability deck](/python-cli/subsystems/capability-deck). |
+| Sessions, transcripts, export | full | Branchable NDJSON tree (`indus/transcript@1`), resume by id with deepest-leaf recovery, per-cwd `--<slug>--` scoping, legacy import, and self-contained HTML `/export`. See [sessions](/python-cli/subsystems/sessions) and [transcript export](/python-cli/subsystems/transcript-export). |
+| Runtime-bridge | full (2/2) | 3 dialects (`claude-cli`, `codex-cli`, `indusagi-cli`) → provider-neutral `NormalizedEvent`. Library-only in both builds (not wired into boot). See [runtime bridge](/python-cli/subsystems/runtime-bridge). |
+| Window-budget + insight | full (wired) | `window_budget` condenser (`0.75` trigger / `6000` keep-recent / `2048` reserve), manual `/summarize-context`, and the insight collector/replay wrapper over [framework tracing](/python/subsystems/tracing). See [window budget](/python-cli/subsystems/window-budget) and [insight](/python-cli/subsystems/insight). |
+| Auth vault | full | Multi-account with OAuth refresh, default promotion, `0600` file mode. See [auth](/python-cli/configuration/auth). |
+
+For the boot pipeline that wires these together, see [boot](/python-cli/subsystems/boot) and [launch](/python-cli/subsystems/launch).
+
+## Deliberate Divergences
+
+These 13 differences are by-design ports of TS behavior onto Python / Textual / framework idioms. They are documented, plan-cited, and fully tested — not defects.
+
+| # | Divergence |
+|---|-----------|
+| W1 | **Composer deleted** — the TS bespoke software-caret composer is replaced by the framework `PromptEditor`, folded into `console/app.py` + `console/input/`. |
+| W2 | **Paste vault / burst-debounce deleted** — replaced by framework `EditorCore` paste markers and native paste events. |
+| W3 | **jiti → importlib** — `.py` addons load via `importlib.util.spec_from_file_location`; the TS virtual-module/alias bridge collapses and `BUNDLED_NAMESPACES` is vestigial. |
+| W4 | **insight wraps `indusagi.tracing`** — the bulk tracing engine stays in the framework; only the collector sink, replay reader, and redaction wrapper are app code. |
+| W5 | **repl placeholder → real Textual mount** — the M0 `cli.py` stub is replaced by the real console mount in `boot/runners/repl_runner.py` (the seam stays injectable for tests). |
+| W6 | **runtime-bridge barrel-only** — a tested library layer in both builds, deliberately not wired into the boot path in either. |
+| W7 | **`/memory` on/off cosmetic** — flips a reporting flag only, never removes the memory card from the live deck. Matches TS. |
+| W8 | **Two distinct compaction engines** — `window_budget` (tokens, `0.75`, 3.6 chars/token) is the wired conductor `CondenseFn`; the framework `runtime.memory` (turns, `0.8`) is intentionally unwired. |
+| W9 | **Chord-latch break semantics** — timer-bounded (600 ms) under Textual since the editor consumes printables; behavioral parity with the TS latch. |
+| W10 | **OAuth overlay on `asyncio.Future`** — a parked-resolver replaces TS callback threading; provider threading and vault refresh are preserved. |
+| W11 | **TypeBox → literal JSON-schema dicts** — addon/tool schemas are plain dicts per the framework `parameters: Mapping` convention. |
+| W12 | **Modal routing inversion** — TS always-mounted overlays become awaited `push_screen` flows with typed outcomes via `OVERLAY_HANDLERS`. |
+| W13 | **todo wire names** — `todo_read` / `todo_set` (vs the TS internal names), honoring the Python framework's wire contract verbatim. |
+
+## Known Gaps
+
+The gap audit (2026-06-12 snapshot) records **7 gaps: 0 high, 1 medium, 6 low**, clustered in `launch` and `insight`. Nothing in the core agent loop, tool execution, or console UI is affected. The estimate is ~98% behavioral parity.
+
+| # | Gap | Subsystem | Status | Severity |
+|---|-----|-----------|--------|----------|
+| 1 | CLI `--resume` interactive picker never mounts on a TTY; the runner silently falls back to a fresh session | launch | broken | **medium** |
+| 2 | GitHub Copilot browser sign-in provider absent (framework `OAUTH_PROVIDERS` carries only `anthropic`, `openai`) | launch | missing | low |
+| 3 | Insight secret redaction over-redacts — whole value instead of the matched run | insight | divergent | low |
+| 4 | Insight `fail()` emits no in-flight `update` signal before close | insight | divergent | low |
+| 5 | Insight persisted/streamed fault loses the error name + stack | insight | partial | low |
+| 6 | Insight redactor `omit_keys` option (drop keys wholesale) missing | insight | missing | low |
+| 7 | Top-level package namespace re-export of all subsystems | root barrel | divergent | low |
+
+Notes on individual gaps:
+
+- **Gap 1 (medium, the most impactful):** `_DefaultResumeDeps.mount_picker` in `launch/pickers.py` unconditionally raises, and `boot/runners/repl_runner.py` calls `pick_resume_target` with no injected deps, so `pindus --resume` on a real terminal starts a fresh session with a one-line stderr notice. It is *medium* rather than *high* because the capability is reachable: the in-console `/resume` slash command is fully wired and opens the exact same arbitrary-session picker (`console/overlays/sessions.py` via `push_screen_wait`). A user can run `pindus --resume`, land in a fresh session, type `/resume`, and reach the picker.
+- **Gaps 3–6 (insight):** all four are wrapper-side costs of delegating to the framework `SecretScrubber` / `SegmentError` / transport (waiver W4). None affects the final close record's status or any end-user agent behavior; impact is limited to live trace dashboards and offline trace analysis. They are documented inline in `insight/wrapper.py`.
+- **Gap 7 (root barrel) is now closed in source.** The gap report claims `induscode/__init__.py` re-exports only `workspace` and that the docstring still references the M0-era stub. The current source lazily re-exports **all 17 subsystems** via PEP 562 `__getattr__` with `__all__ = ["VERSION", "__version__", *sorted(_SUBSYSTEMS)]`, and the docstring describes the lazy barrel. Treat the gap report as a point-in-time snapshot; at least this row no longer holds.
+
+```python
+import induscode
+induscode.runtime_bridge      # lazy namespace re-export (PEP 562 __getattr__)
+induscode.capability_deck     # any of the 17 subsystems
+from induscode.workspace import BRAND, VERSION
+print(BRAND.bin_names)        # ('pindus', 'induscode')
+```
+
+The recommended fix order, highest user-impact first: wire the CLI `--resume` Textual picker (gap 1), add the GitHub Copilot OAuth config (gap 2), then the four insight refinements (gaps 3–6).
+
+## Upstream Framework Defect
+
+One known defect is **not** a port gap and is marked DO-NOT-FIX in the app:
+
+- **Symptom:** the first streamed text chunk is dropped from `-p` / `--json` / NDJSON output (`"pong"` → `"ong"`). The whole first chunk is dropped, not a fixed character count.
+- **Root cause:** the framework `agent/agent.py` `_FacadeTranslator._on_delta` emits the first text delta only inside the `MessageStartEvent` partial; only the second-and-later deltas surface as `MessageUpdateEvent` text deltas.
+- **App side is parity-correct:** `conductor/signal_hub.py` maps `message_start → []` (matching the TS translator table), so no `TextSignal` is produced for the first chunk. The oneshot text strategy accumulates only `TextSignal` deltas, so `-p` loses the first chunk.
+- **Blast radius:** `-p` text output, the `-p` / `--json` text-signal stream. The interactive TUI **masks** it — the final `message_end` carries the complete assistant message, so the rendered result is correct.
+
+The fix is filed upstream against the framework; the app intentionally does not work around it to avoid diverging from the TS translator table. See [framework parity](/python/reference/parity) for the framework-side record.
+
+## Library Swaps
+
+The TS dependencies were replaced with Python equivalents during the port:
+
+| TS dependency | Python replacement |
+|---------------|--------------------|
+| `marked` | `markdown-it-py>=3.0` (transcript-export markdown) |
+| `highlight.js` | `pygments>=2.18` (transcript-export highlighting) |
+| `ulid` | `python-ulid>=2.7` (bridge-ledger ULID keys) |
+| Ink / React | Textual (interactive console) |
+| jiti virtual modules | plain `importlib` addon loading |
+
+The sole framework dependency is `indusagi[mcp,tui]>=0.1.2`. The `mcp` and `tui` (Textual) extras are required because the framework's `shell_app` barrel imports `mcp` and `textual` eagerly, and the agent's MCP enrollment plus the Textual console need them. The process title is not set — the TS entry set `process.title`, but Python has no portable titling without a third-party dependency, so it is deliberately skipped (the same decision as the framework port).
+
+## Version & Doc-String Drift
+
+The version is single-sourced: it lives only in `pyproject.toml` (currently `0.1.2`), and `workspace/brand.py` reads it back at runtime via `importlib.metadata.version("induscode")`, with a `"0.1.0.dev0"` fallback that fires only on an uninstalled source checkout. This fixes the TS build, which duplicated the version as a literal.
+
+```python
+import induscode
+print(induscode.VERSION)        # e.g. '0.1.2' — from importlib.metadata, not a literal
+```
+
+Because the runtime version comes from package metadata, `pindus --version` reports whatever `pyproject.toml` declares (`0.1.2`), not the doc strings. Note that the `README`, `CHANGELOG` (header `0.1.0 — 2026-06-11`), and `PARITY_REPORT` still reference `0.1.0`/`v0.1.0` from the first release. Test-count figures also drift across documents (the changelog and parity report cite 649 tests, the README cites 703); take the per-document figure as the snapshot at that document's date.
+
+## Source Files
+
+| File | Role |
+|------|------|
+| `PARITY_REPORT.md` | M6 row-by-row parity audit against the TS ground truth (106/106 rows, 13 waivers, live smoke results). |
+| `GAP_REPORT.md` | The 7-gap audit (2026-06-12) with TS/Python evidence, user impact, and fix hints per gap. |
+| `CREDITS.md` / `NOTICE` | Provenance and notice, embedded into the wheel via PEP 639 `license-files`. |
+| `CHANGELOG.md` | Release log (first release header `0.1.0 — 2026-06-11`). |
+| `pyproject.toml` | The build manifest — version single-source, `indusagi[mcp,tui]` dependency, `pindus`/`induscode` console scripts. |
+| `scripts/lineage_scan.py` | The clean-room provenance gate. |
+| `src/induscode/__init__.py` | The lazy namespace barrel re-exporting all 17 subsystems. |
+| `src/induscode/workspace/brand.py` | `BRAND` / `Brand` / `VERSION` — the single source of truth for identity literals. |
+| `src/induscode/entry.py` | The `pindus` / `induscode` console-script entry (`run` → `main` → `boot`). |
+
+See also [Package Exports](/python-cli/reference/package-exports) for the full namespace map and [Testing](/python-cli/reference/testing) for the test suite layout.

@@ -1,0 +1,382 @@
+# Conductor
+
+> The conductor is `induscode`'s product-level session core — the [`Conductor`](#the-brain-conductor) struct that wraps exactly one framework [`Agent`](/rust/subsystems/runtime), drives a prompt to settlement, re-emits the framework's coarse 7-event `RunEvent` stream as a stable 11-kind [`SessionSignal`] product stream, persists a branchable transcript, retries transient model faults with backoff, swaps to a fallback model on overload, condenses through a pluggable seam, gates every tool through a permission engine, and resolves an immutable per-turn [`ConductorState`]. Reach it as `induscode::conductor`; it is the runtime brain every `indusr` run mode (interactive ratatui REPL, `--print`, `--json` link) drives.
+
+The framework `Agent` is a raw LLM conversation loop: it emits a coarse `RunEvent` stream and never throws (a failed turn comes back as a `RunSnapshot` whose `phase == Faulted`). The conductor turns one such agent into a *coding-agent session*. It drives turns to settlement; projects the framework loop events into a distinct, stable `SessionSignal` stream; persists every produced message into an on-disk transcript tree; retries transient faults with exponential backoff; swaps to a `--fallback-model` on HTTP 529 overload; auto-condenses through the [window-budget](/rust-cli/subsystems/window-budget) seam when the live context nears the model window; gates every tool call through a permission rule engine plus a catastrophic-command blocklist; runs the plan-mode handshake; injects post-edit diagnostics; surfaces typed discriminated faults (never string sentinels); and maintains an immutable `ConductorState` snapshot behind a lock-free reducer.
+
+## Table of Contents
+
+- [What the Conductor Owns](#what-the-conductor-owns)
+- [Module Layout](#module-layout)
+- [The Frozen Type Seam](#the-frozen-type-seam)
+- [The Brain: Conductor](#the-brain-conductor)
+- [Driving a Turn to Settlement](#driving-a-turn-to-settlement)
+- [The Signal Stream](#the-signal-stream)
+- [State and the Pure Reducer](#state-and-the-pure-reducer)
+- [Typed Faults](#typed-faults)
+- [Retry, Fallback, and Abort](#retry-fallback-and-abort)
+- [The Queue: Re-entrant Input](#the-queue-re-entrant-input)
+- [The Signal Hub and Projector](#the-signal-hub-and-projector)
+- [Persistence and Branching](#persistence-and-branching)
+- [The Condense Seam](#the-condense-seam)
+- [Model Catalog and Matcher](#model-catalog-and-matcher)
+- [Permissions and the Bash Guard](#permissions-and-the-bash-guard)
+- [Plan Mode](#plan-mode)
+- [Post-edit Diagnostics and Skill Parsing](#post-edit-diagnostics-and-skill-parsing)
+- [Statistics and Cost](#statistics-and-cost)
+
+## What the Conductor Owns
+
+The conductor is the typed seam between the `induscode` product (its ratatui console, print/JSON channels) and the framework runtime. It does **not** re-declare framework shapes — it composes `Agent`, `AgentConfig`, `AgentDeps`, `RunEvent`, `RunSnapshot`, `RunError`, `ToolBox`, `ToolRunner` from [`indusagi::runtime`](/rust/subsystems/runtime) and `Turn`, `Usage`, `ModelCard`, `Block`, `ThinkingLevel`, `StreamOptions` from [`indusagi::llmgateway`](/rust/subsystems/llm-gateway). Crucially, the framework's `RunEvent` loop stream is deliberately **not** the same union as the product `SessionSignal` stream: the conductor consumes the former internally and re-emits the latter, so the app surface evolves independently of the framework loop.
+
+It sits at the apex of the agent DAG — `conductor → deck + window-budget + briefing + core` — and is itself the provider seam: it re-exports the framework's `ModelInvoker` trait, which `induscode::runtime_bridge` implements. Within one session the conductor owns the **turn loop**, the **signal hub**, the **transcript store**, the **model catalog/matcher**, the **immutable state snapshot**, the **pending-input queue**, **fork/navigate/resume** branch ops, the **permission mode + approval resolver**, the **plan-mode handshake**, the **post-edit diagnostics** seam, and the **skill-block parser**.
+
+## Module Layout
+
+The conductor is `induscode::conductor`, a flat 9-module package. [`contract`](#the-frozen-type-seam) is the frozen type seam; every other module is a behavior module written against it. The crate root re-exports the contract vocabulary.
+
+| Module | Holds |
+|--------|-------|
+| `contract` | Frozen type seam: `SessionSignal`, `ToolDiff`, `ConductorFault`/`FaultKind`, `ConductorPhase`, `ConductorState`, `StateAction`, transcript schema (`TranscriptEntry`/`SessionHead`/`TRANSCRIPT_SCHEMA`/`TranscriptRole`), `ModelCardRef`/`MatchQuery`, `QueueMode`/`QueuedInput`, `BashOutcome`/`ExecuteBashOptions`, `ApprovalDecision`/`ApprovalResolver`, `CheckpointPort`, `CondenseFn`/`CondenseOpts`/`IdentityCondense`, `RetryPolicy`, `ConductorOptions`/`ConductorDeps`, the re-exported `ModelInvoker` and `PermissionMode`. |
+| `agent_loop` | **The brain.** `Conductor` + `ConductorInner`, the streaming turn loop, retry/backoff/fallback, the pure `reduce_state` reducer, the pending-queue drain, the rebuild dance, plus `LoopDeps` and the agent factories. (Named `agent_loop`, not `loop` — `loop` is a keyword.) |
+| `signals` | `SignalHub` synchronous panic-isolated fan-out + the pure `translate` projector (`RunEvent` → `Vec<SessionSignal>`). |
+| `transcript` | `TranscriptStore` branch-aware tree over a `TranscriptBackend` (`MemoryBackend`/`FsBackend`), the `LiveClock`/`TranscriptClock` seam, NDJSON codec, and the pure `replay` reducer. |
+| `catalog` | `ModelCatalog`, `CatalogCard`, `ModelMatcher`, `SessionStats`, `estimate_session_cost` over `indusagi::llmgateway::catalog`. |
+| `permissions` | The pure rule engine (`resolve_rule_decision`), the async `PermissionGate`, the `GatedToolBox` decorator, plan-mode pure transitions, and approved-plan persistence. |
+| `bash_guard` | `parse_bash_command` shell parser/classifier + `evaluate_catastrophic` blocklist. |
+| `session_ops` | `parse_skill_invocation`, the `DiagnosticsEngine` post-edit diff engine, and `WindowBudgetCondense` (the production `CondenseFn`). |
+| `mod` | The public barrel; re-exports the contract surface. |
+
+## The Frozen Type Seam
+
+`induscode::conductor::contract` declares *only* shapes plus a few inert helpers — no behavior, no I/O. Every behavior module is written against it. It ports `indus-code-rebuild/src/conductor/contract.ts` (see the [TS conductor](/cli) and [Python conductor](/python-cli/subsystems/conductor) for parity).
+
+Two re-exports anchor the conductor to the framework rather than minting duplicates:
+
+```rust
+// The provider seam IS the framework's ModelInvoker — re-exported so runtime-bridge
+// implements ONE canonical trait threaded through AgentDeps.invoke_model.
+pub use indusagi::runtime::contract::ModelInvoker;
+
+// The permission vocabulary lives in induscode-core::settings; re-exported, not duplicated.
+pub use crate::core::PermissionMode;
+```
+
+`ConductorOptions` is the assembly-time config; `ConductorDeps` is the all-`Option`/`Arc` injectable bag so tests run with no network and no disk:
+
+| `ConductorOptions` field | Type | Purpose |
+|--------------------------|------|---------|
+| `model_id` | `String` | **Required.** Canonical id (`provider/modelId`) to bind the session to. |
+| `system` | `Option<String>` | Initial system prompt seeding the conversation. |
+| `thinking` | `Option<String>` | Initial reasoning effort (serialized form). |
+| `fallback_model_id` | `Option<String>` | Model to swap to on HTTP 529 overload (`--fallback-model`); `None` disables the swap. |
+| `workspace` | `Option<String>` | Working directory the session is scoped to (defaults to process cwd). |
+| `sessions_dir` | `Option<String>` | Directory to persist the transcript into; `None` keeps an in-memory store. |
+| `auto_compact` | `bool` | Auto-condense when the transcript nears the window. |
+| `permission_mode` | `Option<PermissionMode>` | The mode the session opens in (defaults to `Default`). |
+| `plans_dir` | `Option<String>` | Directory approved plan-mode plans persist into (`<plans_dir>/plans/`). |
+
+`ConductorDeps` carries `condense: Option<Arc<dyn CondenseFn>>`, `retry: RetryPolicy`, `sleep`, `approval: Option<Arc<dyn ApprovalResolver>>`, and `checkpoint: Option<Arc<dyn CheckpointPort>>`. The behavior modules also consume a richer `LoopDeps` (see [The Brain](#the-brain-conductor)).
+
+## The Brain: Conductor
+
+The orchestrator is `induscode::conductor::agent_loop::Conductor`, `Clone` over an `Arc`-shared inner so a UI render loop and the driving turn share one source of truth:
+
+```rust
+#[derive(Clone)]
+pub struct Conductor { inner: Arc<ConductorInner> }
+
+impl Conductor {
+    pub fn new(config: AgentConfig, deps: LoopDeps) -> Self;
+}
+```
+
+The base `AgentConfig`'s `model` seeds `ConductorState::model_id`; the live agent is built once up front and **rebuilt** on any model/tool/thinking change. The Rust framework `Agent` is a concrete `Clone` struct whose `AgentConfig` is **immutable** after `create_agent`, so a mid-session model / tool-deck / thinking swap mutates a clone of the config template and re-runs the agent factory — the "rebuild dance" (`rebind_model`, `set_thinking_level`, `register_tools`).
+
+`Conductor::new` picks the agent factory by precedence: an explicit `factory` (tests' scripted invoker) wins; else an account-scoped `key_resolver` (`--account`) mints agents whose `ModelInvoker` injects the resolved key onto every request's `StreamOptions::api_key`; else a persistence `store` builds the store-bound factory so every rebuild keeps writing to and resuming from the same session file; else an in-memory gateway default. `LoopDeps` is the loop's collaborator bag:
+
+```rust
+#[derive(Clone, Default)]
+pub struct LoopDeps {
+    pub factory: Option<AgentFactory>,          // mints agents over a config template
+    pub condense: Option<Arc<dyn CondenseFn>>,  // default IdentityCondense (no-op)
+    pub retry: Option<RetryPolicy>,
+    pub sleep: Option<SleepFn>,                  // paused in tests
+    pub auto_compact: Option<bool>,
+    pub fallback_model_id: Option<String>,
+    pub key_resolver: Option<KeyResolver>,       // --account vault key injection
+    pub permission_mode: Option<PermissionMode>,
+    pub approval_resolver: Option<Arc<dyn ApprovalResolver>>,
+    pub store: Option<SessionStore>,             // framework persistence store
+    pub plans_dir: Option<std::path::PathBuf>,
+    pub workspace: Option<String>,
+    pub diagnostics: Option<Arc<DiagnosticsEngine>>,
+}
+```
+
+The factory seams `AgentFactory = Arc<dyn Fn(AgentConfig) -> Agent + Send + Sync>` are `default_factory` (live gateway), `store_factory(store)`, `key_resolving_factory(resolver, store)`, and `scripted_factory(invoke)` (the network-free test seam). The injectable `SleepFn` makes the backoff testable against a paused clock.
+
+`ConductorInner` holds the live `Mutex<Agent>` + `Mutex<AgentConfig>` template, the `condense`/`retry`/`sleep`/`auto_compact` deps, the single source of truth `state: RwLock<Arc<ConductorState>>` (so `snapshot()` is a cheap `Arc` clone), the ordered `in_flight` tool list, the pending `queue`, the `busy`/`draining` re-entrancy guards, the signal `handlers`, the live `thinking` level, the fallback bookkeeping (`fallback_model_id`/`fallback_tried`), the `condense_failures` circuit breaker, the `text_streamed` latch, the `workspace_session_id`, the shared `permission_mode`/`pre_plan_mode`/`approval_resolver` holders, the plan-mode `pending_enter_plan`/`pending_exit_plan` flags, the diagnostics seam state (`workspace`, `diagnostics`, `edited_this_turn`, `turn_message_baseline`), and the `session_name` holder (the human-friendly label `/name` sets and reads back).
+
+## Driving a Turn to Settlement
+
+`submit(input)` is the single entry point. Inside `Conductor`:
+
+1. **Busy guard.** `busy.compare_exchange(false, true)` — if a turn is already in flight the input is **enqueued** as a follow-up (never dropped) and the current snapshot returns immediately. Otherwise the busy flag is held and `run_turn` runs, then `drain_queue` runs, then the flag is released.
+2. **Per-turn reset (`run_turn`).** Clear `in_flight`; reset `fallback_tried`, `text_streamed`, `pending_enter_plan`/`pending_exit_plan`, and `edited_this_turn`; pin the message baseline and seed the diagnostics baseline once.
+3. **Phase + prompt.** Dispatch `Phase(Streaming)` and emit `SessionSignal::Prompt`.
+4. **Drive with retry (`run_with_retry`).** Subscribe `on_run_event` to the framework agent's raw `RunEvent` stream, then `agent.submit_prompt(prompt).await`. The framework call **never throws** — the loop inspects the settled `RunSnapshot::phase` instead of catching (the central reshape from the TS `try/catch`).
+5. **Project events.** During the call, `on_run_event` keeps the ordered in-flight-tool list (`ToolStarted` appends and flips phase→`Tooling`; `ToolFinished` removes by id and flips phase→`Streaming` when empty), captures plan markers and edited paths, runs `translate`, and emits each resulting `SessionSignal` on the hub. `TurnEnd` folds usage and records `context_tokens`.
+6. **Settle the clean turn.** On a clean settle: `record_usage` reads the framework's own cumulative `usage_total`; `run_post_edit_diagnostics` runs the checker and may enqueue a follow-up; `maybe_condense` runs the condense seam if the live context nears the window; then `Settled` + `Idle`.
+7. **Plan handshake + drain.** `run_plan_handshakes` acts on any enter/exit-plan request (the async approval prompt runs here at turn-end, never inside the sync event handler). The finished turn drains the queue (`steer` entries first), each entry as its own turn.
+
+A faulted turn keeps its typed fault and does **not** persist, condense, or settle on top of it — it stays `Faulted` and the caller reads `fault` off the returned `Arc<ConductorState>`. Cancellation is law: a slow tool under Ctrl-C surfaces a typed `Aborted` fault, never a panic/hang, because the in-flight `submit_prompt().await` returns a `RunErrorKind::Aborted` faulted snapshot that is neither transient nor overload and falls straight through to terminal.
+
+## The Signal Stream
+
+The conductor re-emits a distinct, stable 11-kind `SessionSignal` union — the surface the app renders. It is serde-tagged on `kind` (snake_case). Subscribe via `subscribe(handler)`, which returns an idempotent disposer thunk:
+
+```rust
+pub fn subscribe(&self, handler: SignalHandler) -> impl FnOnce();
+pub type SignalHandler = Box<dyn Fn(&SessionSignal) + Send + Sync>;
+```
+
+| Variant | `kind` | Carries | Meaning |
+|---------|--------|---------|---------|
+| `Prompt` | `prompt` | `text` | The user's turn was accepted (emitted before the model replies). |
+| `Text` | `text` | `delta` | A chunk of assistant answer text. |
+| `Thinking` | `thinking` | `delta` | A chunk of reasoning/thinking text. |
+| `ToolStart` | `tool_start` | `id`, `name` | A tool invocation began (correlate by `id`). |
+| `ToolEnd` | `tool_end` | `id`, `name`, `ok`, `output?`, `diff?` | A tool finished; carries the full raw JSON `output` verbatim and a structured `ToolDiff` when the output held a `{ path, old, new }` triple. |
+| `TurnEnd` | `turn_end` | `usage` | The assistant turn settled; reports token spend. |
+| `Persisted` | `persisted` | `entry_id` | The latest node was committed to the transcript. |
+| `Compacted` | `compacted` | — | The transcript was condensed to fit the window. |
+| `Fault` | `fault` | `fault` | A typed `ConductorFault` occurred. |
+| `Queue` | `queue` | `count` | The pending-input queue changed; new depth. |
+| `Idle` | `idle` | — | No in-flight work; ready for input. |
+
+`ToolEnd` carries the full per-tool output (`output: Option<Value>`) so the console can render complete logs/content for **every** tool (bash stdout, read file body, grep matches, task result) — not just an edit diff — by projecting it through the framework's `describe_tool_source` descriptor. `ToolDiff { path, old, new }` is surfaced separately for the unified-diff renderer.
+
+## State and the Pure Reducer
+
+`ConductorState` is an immutable snapshot, never a live view. Read it with `snapshot() -> Arc<ConductorState>`; the brain holds it behind an `RwLock<Arc<…>>` so the read is lock-free-ish (a cheap `Arc` clone) and the render loop never blocks the turn:
+
+```rust
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConductorState {
+    pub phase: ConductorPhase,        // idle | streaming | tooling | condensing | faulted
+    pub head: SessionHead,            // session id + active leaf + persisted usage
+    pub usage: Usage,                 // cumulative token/cost spend
+    pub context_tokens: u64,          // latest-turn window occupancy (NOT cumulative)
+    pub model_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fault: Option<ConductorFault>,
+}
+```
+
+A subtle correctness point: `context_tokens` is the **latest turn's** window occupancy — it *replaces* rather than accumulates — so the footer's `ctx:%` divides by the context window correctly. The Rust `Usage` carries no aggregate `total`, so `context_tokens_of` sums the four tiers (input + output + cache reads/writes, absent cache tiers folding in as 0).
+
+Every transition runs through the pure `reduce_state`, which always returns a fresh object via an exhaustive `match` with no `_` arm:
+
+```rust
+pub fn reduce_state(prev: &ConductorState, action: StateAction) -> ConductorState;
+
+pub enum StateAction {
+    Phase(ConductorPhase),
+    Head(SessionHead),
+    Usage { usage: Usage, context_tokens: u64 },
+    Model(String),
+    Fault(ConductorFault),   // records the fault, flips to Faulted
+    Settled,                 // clears any stale fault, returns to Idle
+}
+```
+
+`dispatch` reads the current state, runs `reduce_state`, and swaps the new `Arc` into the lock.
+
+## Typed Faults
+
+Faults are typed discriminated **values**, not raised exceptions and never string sentinels. A consumer switches on `fault.kind`:
+
+```rust
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct ConductorFault {
+    pub kind: FaultKind,          // model | tool | persistence | aborted | overflow
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cause: Option<Value>,     // a serialized RunError, or structured detail
+}
+
+pub enum FaultKind { Model, Tool, Persistence, Aborted, Overflow }
+```
+
+| `kind` | Recovery story |
+|--------|----------------|
+| `Model` | The LLM call itself failed (transport, provider, decode, or a terminal `RunError`). |
+| `Tool` | A tool invocation threw or returned a hard error. |
+| `Persistence` | Writing/reading the on-disk transcript failed. |
+| `Aborted` | The caller cancelled the in-flight turn via `abort()`. |
+| `Overflow` | The context window was exceeded and could not be condensed. |
+
+Mint one only with `conductor_fault(kind, message, cause)`. The single sanctioned projection from a framework error is `fault_from_run_error(&RunError)`: the framework's six `RunErrorKind`s fold onto the five product categories — `Aborted → Aborted`, `CompactionFailed → Overflow`, `ToolFailed → Tool`, and `ModelFailed`/`TurnBudget`/`InvalidState → Model` — with the original `RunError` serialized into `cause`. A fault is dispatched into state (flipping `phase` to `Faulted`) **and** emitted as a `Fault` signal.
+
+## Retry, Fallback, and Abort
+
+`run_with_retry` retries transient model faults with exponential backoff. On a faulted snapshot it classifies the carried `RunError`: `is_transient` prefers the typed kind (`Aborted` is never transient) and falls back to a substring scan of the message for transport/provider prose (`429`, `rate limit`, `overloaded`, `timeout`/`timed out`, `econnreset`, `etimedout`, `503`/`502`/`500`, `unavailable`, `temporarily`). A transient error retries up to `RetryPolicy.max_attempts` with a delay of `base_delay * 2^(attempt-1)`:
+
+```rust
+pub struct RetryPolicy { pub max_attempts: u32, pub base_delay: Duration }
+impl Default for RetryPolicy {                 // { max_attempts: 2, base_delay: 250ms }
+```
+
+`is_overload_fault` matches the **529** token (and "overloaded"/"overload") specifically — distinct from `is_transient`, which does not. When the transient budget is exhausted on an overload AND a `--fallback-model` is configured and not yet tried this turn, `swap_to_fallback` rebinds to it via the rebuild dance, emits a non-terminal "Switched to X due to high demand for Y" note, restarts the budget, and continues — a one-shot mid-turn swap. Exhausting the budget with no usable fallback (or a non-transient `RunError`) dispatches a typed terminal fault and ends the loop.
+
+`abort()` tears down the framework run (root token + scheduler), then mints a typed `Aborted` fault and pulses idle:
+
+```rust
+let state = conductor.snapshot();
+if matches!(state.phase, ConductorPhase::Streaming | ConductorPhase::Tooling) {
+    conductor.abort().await;   // -> aborted fault, then idle; idempotent + safe while idle
+}
+```
+
+## The Queue: Re-entrant Input
+
+`submit` while busy enqueues the input as a follow-up and returns the current snapshot — never dropped, never faulted. The in-flight turn drains the queue once it settles, each entry running as its own turn. `take_next` prefers a `Steer` entry over a `FollowUp`, so an interrupt is honored first. Each queue change emits a `Queue { count }` signal.
+
+| Method | Purpose |
+|--------|---------|
+| `enqueue(input, mode)` | File an input for a later turn (`QueueMode::Steer` or `QueueMode::FollowUp`). |
+| `pending_count()` / `pending_inputs()` | Depth and a read-only snapshot (oldest first). |
+| `clear_queue()` | Discard every queued input. |
+| `dequeue_last()` | Pop the most-recently queued text back into a prompt (the console's Alt+Up "un-queue"). |
+
+`drain_queue` is itself re-entrancy-guarded (the `draining` flag) so a `submit` that fires mid-drain merely enqueues and does not start a second loop.
+
+## The Signal Hub and Projector
+
+`induscode::conductor::signals` is the conductor's own product-event bus, deliberately not the framework's loop emitter nor its async `SignalChannel` transport — this hub is synchronous and in-process. `SignalHub` keeps an insertion-ordered registry of handlers:
+
+```rust
+pub struct SignalHub { /* … */ }
+impl SignalHub {
+    pub fn subscribe(&self, handler: SignalHandler) -> Unsubscribe<'_>;
+    pub fn emit(&self, signal: &SessionSignal);
+    pub fn with_error_sink(sink: HandlerErrorSink) -> Self;
+}
+```
+
+`emit` fans out over a *snapshot* of the handler `Arc`s taken under the lock, then dispatches each with the lock released — so a handler that subscribes/unsubscribes (or re-enters `emit`) mid-dispatch affects only later emits, and a captured handler still runs even if it is unsubscribed mid-pass (TS `[...handlers]` semantics). A panicking handler is isolated via `std::panic::catch_unwind` and routed to the optional `on_handler_error` sink; one bad consumer never silences the others. The brain's own `emit` applies the same per-handler `catch_unwind` isolation.
+
+The projector is a pure, exhaustive 7-arm `match` with **no `_` arm** — a new framework event is a compile error:
+
+```rust
+pub fn translate(event: &RunEvent) -> Vec<SessionSignal>;
+```
+
+The mappings: `TextDelta → Text`; `ThinkingDelta → Thinking`; `ToolStarted → ToolStart`; `ToolFinished → ToolEnd` (carrying `ok = !outcome.is_error`, the verbatim `output`, and an `extract_tool_diff`-probed `ToolDiff`); `Settled → TurnEnd { usage }`; `Faulted → Fault` (via `fault_from_run_error`); and `Snapshot → []` (phase is tracked off the conductor's own dispatch, not the event). `extract_tool_diff` is tolerant of the field spellings edit cards use (`old`/`oldText`/`old_string`, `new`/`newText`, `path`/`file`/`filePath`).
+
+A signal-level fallback handles connectors (the real Anthropic connector) that surface the assistant answer only in the settled snapshot rather than as streamed `TextDelta`s: a `text_streamed` latch tracks whether any delta streamed this turn; on `Settled` with the latch still false, `final_assistant_text_of` reads the answer off the snapshot and emits a synthetic `Text` signal before the `TurnEnd` (idempotent — never doubled when text did stream).
+
+## Persistence and Branching
+
+`induscode::conductor::transcript::TranscriptStore` is an append-only, branchable **tree** bound to one session id over a pluggable `TranscriptBackend`. It borrows only the framework DAG's parent-chain walk *algorithm* — the type and the on-disk format are the product's own, deliberately distinct from `indusagi::runtime::SessionStore`:
+
+- **Identity** — ULIDs (`indusagi::core::ids::new_id`), so two identical turns are distinct nodes (the edit/branch UX needs the same text to appear twice).
+- **Role** — a six-way `TranscriptRole` (`User`/`Assistant`/`Tool`/`System`/`Condense`/`Note`), richer than the framework's three message roles.
+- **Head** — `SessionHead { session_id, leaf: Option<String>, usage: Option<Usage> }` (empty transcript ⇒ `leaf: None`), carrying a cumulative `Usage` the store rewrites on every flush.
+- **Envelope** — the conductor's own `indus/transcript@1` NDJSON line shape (`{schema, kind, id, prev, role, message, at, meta?}` / a `head` line).
+
+| Primitive | Behaviour |
+|-----------|-----------|
+| `append(content, role?, meta?)` | Mint a ULID node parented at the current leaf, encode via `encode_entry`, advance the head. Role derived via `role_for_message` unless overridden. |
+| `branch_at(id)` | Repoint the leaf and rewrite the whole file (`TranscriptError::UnknownNode` on an unknown id). |
+| `path_to(from?)` | Walk parent links leaf→root, reversed (the active branch); a `seen` guard defends against a corrupt cycle. |
+| `persist_usage(usage)` | Pin the cumulative usage onto the head and rewrite so the running total survives a reload. |
+| `load(session_id)` / `open(…)` | Read the backend, parse via `parse_session_text`, rebuild via `replay`; a head-less file recovers the `deepest_leaf`. |
+| `start_new_session(id)` / `reset()` | `/clear` (drop nodes, new id) vs. rewind the head to a new root. |
+
+`MemoryBackend` is the default (no disk); `FsBackend` writes `<dir>/<session_id>.ndjson`. The pure `replay` reducer rebuilds the `TranscriptState` (an `IndexMap` node table + head) from an ordered entry list and a leaf id. `parse_session_text` is tolerant by design — blank, malformed, and foreign-schema lines are dropped, and the last `head` line wins. Timestamps are formatted by a dependency-free proleptic-Gregorian `iso8601_from_epoch_ms` (no `chrono`), so a fixed-clock test gets a byte-stable line.
+
+In the live path the conductor's agent is the durable writer/reader. The store-bound factory threads a framework `SessionStore` (suffix `.jsonl`) into every minted agent, so each settled turn auto-persists through `Effect::Persist` and `resume(session_id)` re-seats the live agent's conversation via `Agent::resume`. The conductor exposes branch operations on top: `resume` restores a persisted session (faulting cleanly with a typed `Persistence` fault when there is no store or no such session, so boot's `applyResume` falls back to fresh); `reload` re-reads the active branch; `restored_messages` snapshots the rehydrated turns for the console to repaint. Fork/navigate live in `session_ops` and the [console](/rust-cli/console/overview).
+
+## The Condense Seam
+
+`CondenseFn` is the pluggable condense hook, operating on the framework `Turn` model — exactly what `Agent::messages()` yields:
+
+```rust
+#[async_trait::async_trait]
+pub trait CondenseFn: Send + Sync {
+    async fn condense(&self, messages: Vec<Turn>, opts: CondenseOpts) -> Vec<Turn>;
+}
+pub struct CondenseOpts { pub force: bool, pub model: Option<String>, pub context_tokens: u64 }
+```
+
+The contract is **strict shrink**: the returned `Vec<Turn>` must be no longer than the input, so the conductor's shrink-guard (`after.len() < before.len()`) lands the compaction. The default `IdentityCondense` returns its input unchanged, so a conductor built without a window-budget dep never condenses. Real compaction is `induscode::conductor::session_ops::WindowBudgetCondense`, wired in production from the [window-budget](/rust-cli/subsystems/window-budget) engine. It bridges `Turn ↔ window_budget::Message`, then runs the full three-layer pipeline (microcompact stale tool results → slice the head: `force` cuts at the last user turn, auto uses the token tail → summarize the dropped head → rehydrate recent reads under a count guard that keeps the net transcript strictly shorter).
+
+`maybe_condense` runs only when `auto_compact` is on, the circuit breaker has not tripped (`MAX_CONSECUTIVE_CONDENSE_FAILURES = 3`), and `nears_window` reports the live `context_tokens` exceed the bound card's `budget_limit` under `window_budget::AUTO_CONDENSE_POLICY` (the same policy the injected condenser slices against, so the trigger and the cut never disagree). When the bound model is unknown to the catalog the gate is conservatively `false` — never condense blind. The manual `condense()` (`/compact`) forces aggressively regardless. `run_condense` flips to `Condensing`, emits `Compacted`, runs the hook, and on a shrink re-seats the agent via `reseat_messages` — which, store-backed, persists the condensed list as a fresh linear branch (so a later resume replays the condensed branch) and resumes the agent from the re-flushed head; a re-seat/persist failure bumps the circuit breaker and surfaces a `Persistence` fault (the failing append/resume mints `conductor_fault(FaultKind::Persistence, …)`).
+
+## Model Catalog and Matcher
+
+`induscode::conductor::catalog::ModelCatalog` is a normalized, de-duplicated view over the framework model list (`indusagi::llmgateway::catalog::model_cards`), keyed by canonical `provider/modelId`. The `mock` echo provider is filtered out of the live source (it must never auto-select or appear in the picker), though tests inject their own `CatalogSource`. `CatalogCard` extends the lightweight `ModelCardRef` with capability facets (`reasoning`, `accepts_images`, `context_tokens`) and the full framework `ModelCard` retained for binding and pricing.
+
+`ModelMatcher` is a scored-candidate resolver over the catalog — `resolve` / `resolve_card` / `resolve_all` return best-first results using a prioritized scoring scale (strategies do not stack; the single best fires):
+
+| Match | Score (`scale`) |
+|-------|-----------------|
+| Exact canonical id | `EXACT_CANONICAL = 900` |
+| Exact model id | `EXACT_MODEL_ID = 800` |
+| Provider-scoped (`provider/` or bare slug) | `PROVIDER_SCOPED = 600` |
+| Glob (`*`/`?`/`[set]`, never crossing `/`) | `GLOB_PATTERN = 400` |
+| Alias substring | `ALIAS_SUBSTRING = 200` |
+
+Capability constraints (`provider`, `model_id`, `reasoning`, `supports_image_input`) are gates, not scores — a card failing any is removed from the field entirely. Ties break by a small `tie_bonus` (tighter id-length match, nudging reasoning cards) then canonical id lexical order, so equal scores never depend on catalog iteration. An empty `MatchQuery` returns the leading survivor nudged toward a reasoning model. The glob engine is a hand-rolled backtracking matcher (no `regex` dependency).
+
+The conductor drives the catalog through `select_model(id)`, `cycle_model()` (rotate to the next card by provider-then-id order), and `set_thinking_level`/`cycle_thinking_level` (the `THINKING_LADDER` of `Off → Low → Medium → High`), each routing through the rebuild dance and a `Model`/state dispatch. See [Models](/rust-cli/console/slash-commands) for the `/model` picker.
+
+## Permissions and the Bash Guard
+
+`induscode::conductor::permissions` is the product-side brain of the permission stack — a pure rule engine, an async gate, plan-mode transitions, and approved-plan persistence. The framework `AgentConfig` carries no `canUseTool` hook, so enforcement is a `ToolBox`/`ToolRunner` decorator, not a runtime callback.
+
+`resolve_rule_decision(tool_name, input, rules, mode, read_only_extra) -> PermissionBehavior` is pure, total, and exhaustive over the folded `PermissionMode` (no `_` arm). Its precedence, highest first:
+
+0. **Catastrophic blocklist** — a shell command on the built-in blocklist denies outright, above every rule and mode (not even `bypass` runs it).
+1. **Deny rules** — any matching `Deny` rule blocks, in every mode.
+2. **Plan mode** — denies any mutating (non-read-only) tool.
+3. **Ask rules** — a matching `Ask` rule forces a prompt.
+4. **Bypass mode** — allows everything not already denied/asked.
+5. **Read-only auto-allow** — a known read-only tool allows in any mode.
+6. **acceptEdits mode** — auto-allows edit/write tools.
+7. **Allow rules** — a matching allow rule (or, for shell, the allow rule SET covering every sub-command).
+8. **Fallthrough** — `Ask` (prompt, then deny when no resolver is wired).
+
+`READ_ONLY_TOOL_NAMES` (read/ls/grep/find/glob/websearch/webfetch/todoread) and `EDIT_TOOL_NAMES` (edit/write/multiedit) classify the tiers. Rules are induscode-style `Bash(npm run test:*)` strings parsed by `parse_rule`; specifiers support a trailing `:*`/`*` prefix wildcard, embedded globs, or exact match. `create_permission_gate(config)` turns the engine into an async `PermissionGate`; an `Ask` routes to an optional `ApprovalResolver` (a richer host returns `AllowAlways`, which appends a session allow rule). `GatedToolBox`/`gate_tool_box` decorate a deck `ToolBox` so a `Deny` short-circuits to a cooperative `ToolOutcome { is_error: true }` — the tool body never runs.
+
+The catastrophic blocklist lives in `induscode::conductor::bash_guard`. `parse_bash_command` is a quote-aware shell parser that splits a compound command across the control operators (`;`, `&&`, `||`, `|`, `&`, newline), descends into `(…)` subshells and `$(…)`/`` `…` `` substitutions, and strips benign wrappers (`env VAR=x`, `nice`, `nohup`, `timeout N`, `xargs`, `command`, `sudo`/`doas` recorded as an elevation flag) so a blocked binary cannot hide behind quoting or a wrapper:
+
+```rust
+pub fn parse_bash_command(command: &str) -> Vec<ParsedCommand>;
+pub fn evaluate_catastrophic(command: &str) -> Option<String>;
+pub fn bash_subcommand_subjects(command: &str) -> Vec<String>;
+```
+
+`evaluate_catastrophic` runs the per-sub-command blocklist (root-targeting `rm -rf`, `dd of=/dev/…`, `mkfs`, redirect-to-raw-disk, `chmod -R 777 /`), the whole-string fork-bomb scan, and the cross-sub-command `curl … | sh` correlation. It is deliberately narrow — `rm -rf node_modules`, `curl -o file`, `chmod -R 755 ./scripts` are NOT blocked — and is defense-in-depth, not the real security boundary (the OS sandbox and the gate are). `bash_subcommand_subjects` renders one rule-matching subject per sub-command so a `Bash(npm test)` allow covers the first but not the second of `npm test && rm important.txt`.
+
+## Plan Mode
+
+Plan mode is captured during the turn and acted on at turn-end. The plan cards (`enter_plan_mode`/`exit_plan_mode`) embed a marker in their tool result; `capture_plan_signals` reads it out of the framework's collapsed `[{kind, value}]` array off `ToolFinished.outcome.output` and sets `pending_enter_plan` or `pending_exit_plan` — a sync handler that must **not** raise the async approval prompt. After the turn settles, `run_plan_handshakes` drains the flags: an enter flips into plan mode (capturing the pre-plan mode); an exit raises `request_plan_approval` through the conductor's stable approval delegate, and on approval restores the captured mode, persists the plan (`write_plan` → `<plans_dir>/plans/<base36-stamp>-<slug>.md`, `0o600`), and enqueues the approved-plan note (`enqueue_plan_note`) as a follow-up so the model proceeds from it; a rejection stays in plan mode.
+
+The pure mode transitions live in `permissions`: `cycle_permission_mode` (the Shift+Tab `PERMISSION_CYCLE` of `Default → AcceptEdits → Plan → Bypass → (wrap)`), `enter_plan`/`leave_plan`, and `initial_pre_plan` (a session opening in plan mode seeds the pre-plan capture to `Default`). The brain exposes `permission_mode()`/`set_permission_mode`/`cycle_permission_mode`/`toggle_plan_mode` over the shared `permission_mode`/`pre_plan_mode` holders the gate reads live (via `mode_getter`), so a mid-session mode switch changes verdicts with no gate rebuild. The console installs its overlay resolver after mount via `set_approval_resolver`; the gate consults the stable `approval_delegate` (denying when none is installed).
+
+## Post-edit Diagnostics and Skill Parsing
+
+`induscode::conductor::session_ops::DiagnosticsEngine` is the LSP-free, shell-sourced post-edit diff engine. The turn-start half pins a message baseline and seeds a per-session diagnostics baseline once; the `Settled` handler scans the snapshot's new `edit`/`write` tool-call blocks (the Rust `RunEvent::ToolStarted` carries no args, so paths are read off the snapshot, restricted to TS/JS files via `is_typescript_or_js` and resolved against the workspace); the turn-end seam runs `new_diagnostics`, which runs the checkers (`DiagnosticRunner`, with `parse_tsc_output`/`parse_eslint_output` parsers), restricts to the edited files, subtracts the per-session baseline, dedups against prior turns (a FIFO-capped `delivered` ledger, cleared per-file before each check so a re-edit re-surfaces), severity-sorts, volume-caps (`MAX_PER_FILE = 10`, `MAX_TOTAL = 30`), and `format_diagnostics_summary`-renders any NEW diagnostics into a follow-up enqueued for the next turn. The seam is best-effort (never faults the turn), re-entrancy-safe (the injected follow-up edits nothing, so it short-circuits), and fully inert with no engine or with `enabled: false`.
+
+`parse_skill_invocation(text) -> Option<SkillInvocation>` is the attribute-scanning hand parser the turn loop calls to peel a leading `<skill name="…" location="…">body</skill>` block off a prompt before submitting (routing the named skill is a higher layer's job). It scans `key`/`key="value"`/`key=bare` attributes into an `args` map, captures the verbatim body up to `</skill>` (trimming one leading/trailing newline), and decodes the canonical XML entities. A `name`-less block, a self-closing tag, or leading non-whitespace parses to `None` — ordinary prompts simply return `None`.
+
+## Statistics and Cost
+
+`stats() -> SessionStatsReport` walks the live agent's conversation for per-role message counts (`user_messages`, `assistant_messages`, `tool_calls`, `tool_results`, `total_messages`) and reads the cumulative token tiers + USD cost off the snapshot. The token buckets come from `catalog::SessionStats::from_usage`; cost is resolved through the framework price sheet via `estimate_session_cost` → `indusagi::llmgateway::catalog::estimate_cost` against the bound `ModelCard` — the conductor never mints its own price table. `cost_report()` renders the multi-line `/cost` figures.
+
+In-session shell execution and the `BashOutcome`/`ExecuteBashOptions` contract types are declared here for the deck; the `bash_guard` module supplies `build_guarded_command` (quoting via `induscode-core::kit`) for the executor.
+
+The conductor is assembled at startup by [boot](/rust-cli/architecture) and consumed by the interactive [console](/rust-cli/console/overview), the print/JSON channels, and the sessions library. For how a session is wired end-to-end, see the [architecture overview](/rust-cli/architecture); for the framework loop the conductor drives, see the [runtime](/rust/subsystems/runtime).

@@ -1,0 +1,295 @@
+# TUI Primitives
+
+> `indusagi.tui` is the framework-free model tier of the terminal UI: pure
+> primitives for key decoding, ANSI/grapheme width math, fuzzy matching, editor
+> keybinding resolution, autocomplete, and a headless line-editor core. Imported
+> as `from indusagi.tui import ...`. It deliberately imports neither `textual`
+> nor `rich` — rendering, scrolling, and terminal I/O live in the widget layer
+> ([react-ink](/python/ui/react-ink)).
+
+The modules under `indusagi.tui` own the math and protocol logic the Textual
+widgets depend on, but stay side-effect-free and unit-testable. Everything here
+is the "model" half: bytes/str in, key-id strings, scores, column counts, and
+buffer state out. Nothing touches a real terminal.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-modules](#sub-modules)
+- [Key decoding](#key-decoding)
+- [Width and wrapping math](#width-and-wrapping-math)
+- [Fuzzy matching](#fuzzy-matching)
+- [Editor keybindings](#editor-keybindings)
+- [Autocomplete](#autocomplete)
+- [Editor core and contracts](#editor-core-and-contracts)
+- [Narrow public surface](#narrow-public-surface)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+These names are re-exported from `indusagi.tui` (the package `__init__`). Each
+submodule has a wider `__all__` of its own — see [Narrow public
+surface](#narrow-public-surface).
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `Key` | class | `tui/keys.py` | Typed builder of key-id strings (`Key.escape`, `Key.ctrl("c")`) |
+| `KeyId` | type | `tui/keys.py` | Alias `str`; a base key optionally prefixed by `ctrl+`/`shift+`/`alt+` |
+| `KeyEventType` | type | `tui/keys.py` | `Literal['press','repeat','release']` — the Kitty event subfield |
+| `parse_key` | function | `tui/keys.py` | Decode raw input (`str | bytes`) to a key id, or `None` |
+| `matches_key` | function | `tui/keys.py` | Test whether raw input corresponds to a given key id |
+| `is_key_release` | function | `tui/keys.py` | True for a Kitty `:3` release event (paste-guarded) |
+| `is_key_repeat` | function | `tui/keys.py` | True for a Kitty `:2` auto-repeat event (paste-guarded) |
+| `is_kitty_protocol_active` / `set_kitty_protocol_active` | function | `tui/keys.py` | Get/set the process-global Kitty-active flag |
+| `visible_width` | function | `tui/utils.py` | Column width: ANSI-stripped, tab-expanded, grapheme/east-asian aware |
+| `truncate_to_width` | function | `tui/utils.py` | Shorten to a max visible width with an ellipsis (ANSI-aware) |
+| `wrap_text_with_ansi` | function | `tui/utils.py` | Word-wrap preserving SGR styling across line breaks |
+| `fuzzy_match` | function | `tui/fuzzy.py` | Order-preserving subsequence match → `FuzzyMatch(matches, score)` |
+| `fuzzy_filter` | function | `tui/fuzzy.py` | Multi-token AND filter + ascending-score rank |
+| `FuzzyMatch` | dataclass | `tui/fuzzy.py` | Frozen result: `matches: bool`, `score: float` |
+| `EditorAction` | type | `tui/keybindings.py` | Literal union of bindable editor behaviors |
+| `EditorKeybindingsConfig` | type | `tui/keybindings.py` | `Mapping[EditorAction, KeyId | list[KeyId]]` — a binding layer |
+| `EditorKeybindingsManager` | class | `tui/keybindings.py` | Layered resolver (preset → user → per-component) |
+| `DEFAULT_EDITOR_KEYBINDINGS` | const | `tui/keybindings.py` | The base binding layer applied to every editor |
+| `get_editor_keybindings` / `set_editor_keybindings` | function | `tui/keybindings.py` | Accessors for the process-wide singleton manager |
+| `AutocompleteItem` / `SlashCommand` | dataclass | `tui/autocomplete.py` | Suggestion item and slash-command definition |
+| `AutocompleteProvider` | type | `tui/autocomplete.py` | `runtime_checkable` Protocol for suggestion providers |
+| `CombinedAutocompleteProvider` | class | `tui/autocomplete.py` | `@file` + slash + path completion |
+| `Component` / `TUI` | class | `tui/contracts.py` | Legacy component lifecycle/host contracts |
+| `OverlayAnchor` / `SizeValue` / `OverlayMargin` / `OverlayOptions` / `OverlayHandle` | type | `tui/contracts.py` | Overlay placement vocabulary |
+| `EditorTheme` / `MarkdownTheme` / `SelectListTheme` / `SettingsListTheme` | dataclass | `tui/theme_types.py` | Theme contracts (bundles of text-painter callables) |
+| `EditorComponent` | class | `tui/editor.py` | The composed editor contract |
+
+## Sub-modules
+
+| Module | Holds |
+|--------|-------|
+| `keys.py` | Legacy + Kitty key decoding, the `Key` builder, event/paste guards |
+| `utils.py` | ANSI/grapheme width math, truncation, ANSI-aware wrapping, slicing |
+| `fuzzy.py` | Order-preserving fuzzy matcher and multi-token filter |
+| `keybindings.py` | `EditorAction` vocabulary and the layered keybindings resolver |
+| `autocomplete.py` | `@file`/slash/path completion providers (async, cached) |
+| `contracts.py` | Legacy `Component`/`TUI` base classes and overlay placement types |
+| `theme_types.py` | Theme contracts the rendering layer fills with painter closures |
+| `editor.py` | The `EditorComponent` contract and the headless `EditorCore` |
+
+## Key decoding
+
+`keys.py` decodes raw terminal input into canonical **key-id** strings. A key id
+is a base key (`"c"`, `"escape"`, `"up"`) optionally prefixed by any ordering of
+`ctrl+`/`shift+`/`alt+`. The `Key` builder produces these strings with the right
+modifier ordering, so you never hand-write them:
+
+```python
+from indusagi.tui import Key, parse_key, matches_key, is_key_release
+
+# parse raw terminal bytes into a key id
+assert parse_key(b"\x03") == "ctrl+c"          # ^C
+assert parse_key(b"\x1b[A") == "up"            # arrow up
+
+# test raw input against a typed key id from the Key builder
+assert matches_key(b"\x03", Key.ctrl("c"))
+assert matches_key(b"\x1b", Key.escape)
+
+# release detection only matters under the Kitty protocol
+assert is_key_release("\x1b[99;1:3u") is True
+assert is_key_release("\x1b[200~pasted:3F text\x1b[201~") is False  # paste guard
+```
+
+`parse_key` and `matches_key` accept `str | bytes`. The decoder understands both
+legacy escape sequences and the modern **Kitty keyboard protocol** (CSI-u
+sequences carrying a modifier bitmask and a press/repeat/release subfield).
+`is_key_release` (`:3`) and `is_key_repeat` (`:2`) sniff that subfield and bail
+out on bracketed-paste markers (`\x1b[200~` … `\x1b[201~`) so paste payloads are
+never mistaken for events.
+
+The `Key` builder exposes named keys as class attributes (`Key.escape`,
+`Key.enter`, `Key.return_`, `Key.page_up`, `Key.page_down`, `Key.backtick`) and
+modifier combinations as static methods (`Key.ctrl`, `Key.shift`, `Key.alt`,
+`Key.ctrl_shift`, `Key.shift_ctrl`, `Key.ctrl_alt`, `Key.alt_ctrl`,
+`Key.shift_alt`, `Key.alt_shift`, `Key.ctrl_shift_alt`). Note the snake-cased
+Python names map onto the emitted strings: `Key.return_` → `"return"`,
+`Key.page_up` → `"pageUp"`.
+
+A process-global flag, toggled by `set_kitty_protocol_active(True)` once the
+terminal layer confirms support, gates Kitty parsing; `is_kitty_protocol_active`
+reads it.
+
+## Width and wrapping math
+
+`utils.py` is the column-width substrate. `visible_width` measures terminal
+columns by stripping ANSI SGR codes, expanding tabs to three spaces, then
+summing grapheme-cluster widths — counting east-asian wide/fullwidth glyphs (and
+emoji sequences) as 2 columns and everything else as 1 (ambiguous-as-narrow).
+Results are LRU-cached.
+
+```python
+from indusagi.tui import visible_width, truncate_to_width, wrap_text_with_ansi
+
+print(visible_width("\x1b[31mhello\x1b[0m"))     # 5 (ANSI not counted)
+print(visible_width("你好"))                       # 4 (east-asian wide = 2 each)
+
+print(truncate_to_width("a very long line", 8))   # 'a ver...'
+print(wrap_text_with_ansi("one two three four", 8))  # ['one two', 'three', 'four']
+```
+
+`truncate_to_width` shortens to a maximum visible width, appending an ellipsis
+(default `'...'`) and emitting a reset (`\x1b[0m`) before it; it can optionally
+pad to an exact width. `wrap_text_with_ansi` word-wraps while re-applying active
+SGR codes on continuation lines, so styling survives the break — it never pads
+or paints backgrounds.
+
+> Grapheme segmentation relies on the third-party `regex` module (for `\X`
+> cluster matching); the standard library `re` is insufficient. Install it
+> alongside `indusagi`.
+
+## Fuzzy matching
+
+`fuzzy_match` is an order-preserving subsequence matcher: it locates each query
+character in order within the text, then scores the placement. The score is
+**lower-is-better** — penalties (gaps, lateness) add, rewards (consecutive runs,
+word boundaries) subtract. If a direct match fails, it retries a digit/letter
+swap variant (e.g. `"foo12"` ↔ `"12foo"`) with a swap penalty.
+
+```python
+from indusagi.tui import fuzzy_match, fuzzy_filter
+
+m = fuzzy_match("abc", "alphabetic")
+print(m.matches, m.score)   # True, <float>  (lower score = tighter)
+
+files = ["src/main.py", "src/agent/session.py", "README.md"]
+# multi-token AND filter, best matches first
+print(fuzzy_filter(files, "src ses", lambda s: s))
+# -> ['src/agent/session.py']
+```
+
+`fuzzy_filter(items, query, get_text)` splits the query on whitespace, keeps only
+items that match **every** token, and sorts ascending by summed per-token score.
+Matching is memoized through an internal cache (up to 2000 entries, oldest
+evicted).
+
+## Editor keybindings
+
+Physical keys are decoupled from logical behavior through **`EditorAction`** — a
+Literal union covering motions and operations like `cursorUp`,
+`deleteWordBackward`, `submit`, `newLine`, `selectUp`, `yank`, `yankPop`,
+`undo`, `expandTools`, and more. `EditorKeybindingsManager` maps actions to one
+or more `KeyId`s by layering, in order: a built-in preset (`default` or `vim`) →
+a user `EditorKeybindingsConfig` → per-component overrides. Later layers win.
+
+```python
+from indusagi.tui import (
+    get_editor_keybindings, EditorKeybindingsManager, DEFAULT_EDITOR_KEYBINDINGS, Key,
+)
+
+mgr = get_editor_keybindings()             # process-wide singleton
+assert mgr.matches("\r", "submit")         # Enter triggers submit (default layer)
+
+# custom layer + vim preset
+custom = EditorKeybindingsManager(
+    config={"submit": [Key.ctrl("s")]},
+    preset="vim",
+)
+print(custom.get_keys("submit"))
+print(custom.detect_conflicts())           # list[KeybindingConflict]
+```
+
+`matches(data, action, component_id=None)` resolves the action's keys across
+layers and delegates each candidate to `matches_key`. Other manager methods:
+`get_keys`, `register_action`, `set_config(config, preset)`,
+`set_component_override(component_id, config)`, `clear_component_override`, and
+`detect_conflicts` (which canonicalizes modifier ordering before scanning for
+collisions). `get_editor_keybindings` / `set_editor_keybindings` read and replace
+the lazily-created singleton.
+
+## Autocomplete
+
+`CombinedAutocompleteProvider` is the concrete provider used by the editor: it
+tries `@file` fuzzy attachment search first, then slash commands, then path
+completion. It is async (backed by `fd`/`scandir` over `asyncio`) and caches
+suggestion results.
+
+```python
+import asyncio
+from indusagi.tui import CombinedAutocompleteProvider, SlashCommand
+
+provider = CombinedAutocompleteProvider(
+    commands=[SlashCommand(name="help", description="show help")],
+)
+
+async def main():
+    res = await provider.get_suggestions(["/he"], 0, 3)
+    if res:
+        print(res.prefix, [i.label for i in res.items])
+
+asyncio.run(main())
+```
+
+`get_suggestions(lines, cursor_line, cursor_col)` returns a `SuggestionResult`
+(`items`, `prefix`) or `None`; `apply_completion(...)` returns an `ApplyResult`
+(new lines plus caret position). `AutocompleteProvider` is a
+`runtime_checkable` Protocol describing that pair of methods, so you can supply
+your own provider. `SlashCommand` carries an optional `get_argument_completions`
+hook for completing a command's arguments.
+
+## Editor core and contracts
+
+`editor.py` exports the `EditorComponent` contract — a composition of the legacy
+`Component` lifecycle plus read/write access, display config, and event
+callbacks (`get_text`, `get_expanded_text`, `set_text`,
+`insert_text_at_cursor`, `set_padding_x`, `set_autocomplete_provider`,
+`get_keybinding_scope_id`, …). Behind it sits a pure, headless `EditorCore` that
+maintains the multi-line buffer, grapheme-aware cursor and word motion, prompt
+history, an Emacs-style kill ring (yank / yank-pop), fish-style coalesced undo,
+large-paste collapsing into `[paste #N …]` markers, backslash-Enter
+continuation, and soft-wrap math with a sticky column. `EditorCore` is exercised
+by tests but is not re-exported from `indusagi.tui` — import it from
+`indusagi.tui.editor` if you need it directly. The Textual editor widget in
+[react-ink](/python/ui/react-ink) drives `EditorCore` and handles the actual
+painting and I/O.
+
+`contracts.py` defines the legacy `Component`/`TUI` base classes and the overlay
+placement vocabulary (`OverlayAnchor`, `SizeValue`, `OverlayMargin`,
+`OverlayOptions`, `OverlayHandle`). `theme_types.py` defines the theme contracts
+(`EditorTheme`, `MarkdownTheme`, `SelectListTheme`, `SettingsListTheme`) as
+bundles of text-painter callables; the rendering layer fills them with concrete
+closures while this module stays framework-free.
+
+## Narrow public surface
+
+The `indusagi.tui` top-level surface is intentionally **narrower** than each
+submodule's own `__all__`. Many real, importable names are exported only from
+their module. Import these from the submodule, not the package root:
+
+| Submodule | Module-only names |
+|-----------|-------------------|
+| `tui.keys` | `decode_key`, `KeyEvent`, `normalize_key_id`, `MODIFIERS`, `CODEPOINTS`, `ARROW_CODEPOINTS`, `FUNCTIONAL_CODEPOINTS`, `LETTER_VALUES`, `SYMBOL_VALUES`, `SPECIAL_KEY_VALUES`, `KeyValidator` |
+| `tui.fuzzy` | `DEFAULT_FUZZY_CONFIG`, `FuzzyScoringConfig`, `FuzzyMatcherStrategy` |
+| `tui.keybindings` | `EDITOR_ACTIONS`, `VIM_EDITOR_KEYBINDINGS`, `KeybindingConflict`, `KeybindingPreset` |
+| `tui.utils` | `slice_by_column`, `slice_with_width`, `apply_background_to_line`, `extract_segments`, `extract_ansi_code`, `get_segmenter`, `is_whitespace_char`, `is_punctuation_char`, `AnsiCode`, `SliceResult`, `ExtractedSegments`, `TextWidthCalculator`, `TextWrapper`, `AnsiCodeManager`, `GraphemeHandler`, `text_width_calculator`, `text_wrapper` |
+| `tui.autocomplete` | `SuggestionResult`, `ApplyResult`, `AsyncAutocompleteProvider`, `AsyncAutocompleteChain` |
+| `tui.theme_types` | `TextPainter`, `CodeHighlighter` |
+| `tui.editor` | `EditorCore`, `EditorReadAccess`, `EditorWriteAccess`, `EditorDisplayConfig`, `EditorEventCallbacks` |
+
+```python
+from indusagi.tui.keys import decode_key, KeyEvent       # not at tui top level
+from indusagi.tui.fuzzy import DEFAULT_FUZZY_CONFIG
+from indusagi.tui.editor import EditorCore
+```
+
+Two pieces of state are **process-global and mutable**:
+`keys._kitty_protocol_active` (via `set_kitty_protocol_active`) and the
+keybindings singleton (via `set_editor_keybindings`). Both mutate shared state
+for the whole process.
+
+## Relationship to neighbors
+
+`indusagi.tui` is the pure logic tier consumed by the Textual widget layer,
+[react-ink](/python/ui/react-ink): its widgets drive the headless `EditorCore`,
+paint what `visible_width`/`wrap_text_with_ansi` compute, and own bracketed-paste
+decoding, scroll offsets, and the live Kitty protocol. The bridge that wires
+these layers together is described in [UI Bridge](/python/ui/ui-bridge). Within
+this package, `autocomplete.py` is the only intra-module importer (it uses
+`fuzzy_filter`). For where the UI sits in the overall design, see
+[Architecture](/python/architecture); for the full package map, see
+[Package Exports](/python/reference/package-exports).

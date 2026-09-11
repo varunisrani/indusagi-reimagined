@@ -1,0 +1,165 @@
+# Loading Extensions
+
+Addons (extensions) are TypeScript modules discovered from disk and loaded into a
+running session. This page covers how the loader finds, resolves, and folds them,
+and the current wiring status.
+
+The loading machinery lives in `indus-code-rebuild/src/addons` — specifically
+`manifest.ts` (discovery), `sandbox.ts` (the jiti-backed loader), and `host.ts`
+(the assembly point). See [extensions](extensions.md) for the addon API itself.
+
+> **Status:** Discovery, the loader, and the host are fully implemented and
+> tested, but they are **not yet invoked by the CLI runner**. There is currently
+> no `--extension`/`-e` flag (the launch flag table in
+> `src/launch/invocation/flags.ts` defines only `--model`, `--thinking`, `--tools`,
+> `--no-tools`, `--mcp`, `--system`, `--append-system`, and the mode/session
+> flags). Auto-discovery at boot is not wired either. The code below is the
+> programmatic API you can call directly; treat the at-launch behavior as a
+> planned integration. See `FEATURE_GAP_ROADMAP.md`.
+
+## Table of Contents
+
+- [Discovery Directory](#discovery-directory)
+- [Recognised Module Shapes](#recognised-module-shapes)
+- [The Module Loader](#the-module-loader)
+- [Loading Programmatically](#loading-programmatically)
+- [Ordering and Conflicts](#ordering-and-conflicts)
+- [Faults](#faults)
+
+## Discovery Directory
+
+Discovery scans a per-workspace directory named by the exported constant
+`ADDONS_DIR`:
+
+```typescript
+export const ADDONS_DIR = ".indus/addons" as const;
+```
+
+So addons live under `<workspace>/.indus/addons`. `discoverAddons(dir)` walks that
+directory one level deep and returns the absolute entry-module paths it finds,
+sorted by path for a deterministic load order. Hidden entries (dot-files and
+dot-directories) are skipped. A missing directory yields an empty list, not an
+error.
+
+`discoverSources(discovery)` folds an `AddonDiscovery` config — a workspace root
+(optional), an override `dir` (defaults to `ADDONS_DIR`), and a list of
+`explicitPaths` — into the deduplicated, id-stamped `AddonSource[]` the host feeds
+to the loader:
+
+```typescript
+interface AddonDiscovery {
+  workspace?: string;          // scans <workspace>/.indus/addons when set
+  dir?: string;                // override, relative to workspace
+  explicitPaths?: readonly string[];   // additional absolute entry modules
+}
+```
+
+## Recognised Module Shapes
+
+Inside the addons directory, `manifest.ts` recognises three candidate shapes:
+
+1. **A bare module file** — `something.ts` / `.tsx` / `.mts` / `.cts` / `.js` /
+   `.mjs` / `.cjs` sitting directly in the directory *is* its own entry.
+2. **A package directory with a manifest field** — a subdirectory whose
+   `package.json` carries the field named by `ADDON_MANIFEST_FIELD` (`"indusAddon"`),
+   pointing at the entry module relative to that subdirectory.
+3. **A package directory with a conventional index** — a subdirectory with no
+   manifest field falls back to an `index.*` entry if one exists.
+
+```json
+// .indus/addons/my-addon/package.json
+{
+  "indusAddon": "./src/entry.ts"
+}
+```
+
+An `AddonId` is derived for each entry (the enclosing folder name for an `index.*`
+file, otherwise the file's basename without extension), used for de-duplication and
+fault attribution. The full path is the ultimate uniqueness guarantee.
+
+## The Module Loader
+
+`createJitiLoader()` is the default `ModuleLoader` (`src/addons/sandbox.ts`). It
+builds one jiti instance bridging the framework `BUNDLED_NAMESPACES`
+(`indusagi/agent`, `indusagi/ai`, `indusagi/tui`, `@sinclair/typebox`) into the
+addon's module graph:
+
+- In a **compiled binary**: the specifiers map to the host's live namespace objects
+  via jiti's `virtualModules`, so the addon shares the host's exact module
+  instances.
+- Under **Node / `bun run` over source**: the specifiers resolve to real paths via
+  jiti's `alias`.
+
+Module caching is disabled, so re-loading an edited addon during a session picks up
+the new source. The loader normalizes the supplied path through `resolvePath`
+(home-`~` expansion + an invisible-whitespace scrub via `scrubInvisible`), imports
+it, and extracts the `AddonManifest`. A module that does not export a callable
+`register` is rejected, which the host converts into a `load` fault.
+
+The loader is injectable: every consumer takes the `ModuleLoader` interface, so a
+test (or an embedder) can supply a fake that returns a scripted manifest with no
+jiti and no disk.
+
+## Loading Programmatically
+
+```typescript
+import { addons } from "indusagi-coding-agent";
+
+const host = addons.createAddonHost({
+  // handles?: FrameworkHandles  — threaded into each addon's surface
+  // loader?: ModuleLoader        — defaults to createJitiLoader()
+});
+
+host.onFault((fault) => console.error(`[${fault.kind}] ${fault.message}`));
+
+// Scan a workspace's .indus/addons directory:
+const bundle = await host.loadAll("/path/to/workspace");
+
+// Or pass a full discovery config with explicit paths:
+const bundle2 = await host.loadAll({
+  workspace: "/path/to/workspace",
+  explicitPaths: ["/abs/path/to/extra-addon.ts"],
+});
+
+// bundle: { dispatch, interceptors, commands, tools, loaded }
+```
+
+To graft a single, already-resolved addon (e.g. an always-on bundled one) without
+directory discovery, use `host.loadOne(source)`, where `source` is an
+`AddonSource` (`{ id, path }`). The `id` is a branded `AddonId`, so mint it with
+the exported `addons.addonId(...)` helper:
+
+```typescript
+await host.loadOne({ id: addons.addonId("my-bundled-addon"), path: "/abs/entry.ts" });
+```
+
+## Ordering and Conflicts
+
+Addons are folded in discovery order (then explicit-path order). That order is
+preserved everywhere it matters:
+
+- **Event dispatch** runs subscriptions in registration order; the first `gate` to
+  stop wins.
+- **Interceptors** apply `enter` forward and `exit` in reverse (onion ordering), so
+  the addon loaded first wraps the outermost layer.
+- **Commands and tools** are name-deduped: the first claimant wins, and a later
+  duplicate is dropped as a `"conflict"` fault. Command names also may not shadow
+  the reserved core actions (`help`, `quit`, `exit`, `clear`, `model`, `compact`).
+
+## Faults
+
+A broken addon never aborts the others. Failures are isolated into typed
+`AddonFault`s routed to `host.onFault(...)`:
+
+| Kind | When |
+|------|------|
+| `load` | the module failed to resolve/import or had no `register` |
+| `register` | the addon's `register` threw |
+| `handler` | an event handler or interceptor stage threw at runtime |
+| `conflict` | a command/tool name was already claimed (or reserved) |
+
+## See Also
+
+- [Extensions](extensions.md) — the addon API and registration surface
+- [Hooks](hooks.md) — the event taxonomy
+- [Packages](packages.md) — sharing addon sources via the `install`/`list` commands

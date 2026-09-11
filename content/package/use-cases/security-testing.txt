@@ -1,0 +1,162 @@
+# Use Case: Authorized Security Testing
+
+> **Only test systems you own or are explicitly authorized to test.** Indusagi is a
+> general-purpose agent framework; it does not ship exploits, payloads, or attack
+> automation. The tools below are read/run primitives — keep them inside isolated,
+> authorized environments and follow responsible-disclosure practices.
+
+The `indusagi` framework can drive an LLM agent that assists a human operator during an
+*authorized, defensive* security assessment: reconnaissance of an in-scope target, reading
+and reasoning over scan output, drafting remediation notes, and orchestrating local tooling.
+Everything is built from the framework's three core layers — the LLM gateway, the agent
+runtime, and the built-in capabilities — so there is no security-specific module to learn.
+
+## Table of Contents
+
+- [What the framework actually provides](#what-the-framework-actually-provides)
+- [A read-only assistant (recommended default)](#a-read-only-assistant-recommended-default)
+- [Running local tooling with bash](#running-local-tooling-with-bash)
+- [The web tools: fetch and search](#the-web-tools-fetch-and-search)
+- [Locking down the bash backend](#locking-down-the-bash-backend)
+- [Responsible use](#responsible-use)
+- [Related documentation](#related-documentation)
+
+## What the framework actually provides
+
+There is no `indusagi/webui`, `ChatPanel`, or security-scanner module — those are not part of
+the package. The relevant surface is the built-in tool set exported from `indusagi/capabilities`
+(source `src/capabilities/index.ts`) and assembled into named collections by `toolBox`:
+
+| Collection | Tools | Use in an assessment |
+|------------|-------|----------------------|
+| `read-only` | `read`, `ls`, `grep`, `find`, `websearch`, `webfetch` | Observe a workspace and the web; never mutates the host |
+| `coding` | `read-only` + `write`, `edit`, `bash`, `todo_set`, `todo_read`, `process` | Adds local command execution and file mutation |
+| `all` | every registered tool | No tool withheld |
+
+The model-facing tool names come straight from the registry in `src/capabilities/registry.ts`.
+For a defensive assistant the `read-only` collection is the safe default; reach for `coding`
+only when the agent genuinely needs to run local tooling.
+
+## A read-only assistant (recommended default)
+
+Wire an agent with the `read-only` toolbox so the model can inspect an in-scope workspace and
+the public web, but cannot run commands or edit files. `createAgent` is exported from
+`indusagi/runtime` (source `src/runtime/index.ts`); its `invokeModel` seam defaults to the
+gateway's `stream`, so you only need a provider key in the environment.
+
+```ts
+import { runtime, capabilities } from "indusagi";
+
+const agent = runtime.createAgent({
+  model: "claude-sonnet-4",
+  system: "You are a defensive security analyst. Only reason about in-scope, authorized targets.",
+  tools: capabilities.toolBox("read-only"),
+});
+
+const result = await agent.submit(
+  "Read ./scan-output/nuclei.txt and summarize the high-severity findings.",
+);
+console.log(result);
+```
+
+`agent.submit` accepts a prompt string (or an array of `Turn`s) and resolves to a `RunSnapshot`.
+`toolBox(collection, cwd?)` roots every file tool at `cwd` (defaulting to `process.cwd()`),
+which is how you scope the agent to a single assessment directory.
+
+## Running local tooling with bash
+
+When the assistant needs to invoke local tooling, switch to the `coding` collection so the
+`bash` tool is available. The capability is the `bashTool` exported from `indusagi/capabilities`
+(source `src/capabilities/shell/bash.ts`). Its arguments are:
+
+| Argument | Type | Notes |
+|----------|------|-------|
+| `command` | string (required) | The shell command line to run |
+| `timeoutMs` | number (optional) | Per-call deadline in **milliseconds**; pinned to a 10-minute ceiling, defaults to 2 minutes |
+| `cwd` | string (optional) | Directory to run in; defaults to the session cwd |
+
+It runs **one** command to completion and returns combined `stdout`/`stderr` plus the exit code
+as a single text block. It is not a persistent shell — each call starts fresh. Output is clamped
+to the context's output budget so a chatty command cannot overflow the model's window. A non-zero
+(or signal-terminated) exit is flagged as an error result.
+
+```ts
+const agent = runtime.createAgent({
+  model: "claude-sonnet-4",
+  tools: capabilities.toolBox("coding", "/srv/assessment-2026-06"),
+});
+
+// The model can now call bash, e.g. to run an authorized, in-scope local scan:
+await agent.submit("Run `naabu -host 10.0.0.5 -silent` and list the open ports you found.");
+```
+
+For long-running or backgrounded processes there is also a `process` tool (member of `coding`),
+sourced from `src/capabilities/shell/process.ts`.
+
+## The web tools: fetch and search
+
+Both web tools are in the `read-only` collection, so they are available to even the most
+locked-down assistant.
+
+**`webFetchTool`** (`src/capabilities/web/webfetch.ts`, model name `webfetch`) downloads a
+single page over HTTP(S) and returns a stripped, reading-friendly text rendition.
+
+| Argument | Type | Notes |
+|----------|------|-------|
+| `url` | string (required) | Absolute `http:` or `https:` URL — relative, `file:`, and `data:` are refused |
+| `maxBytes` | integer (optional) | Caps how much of the body is processed; bounded by a 5 MB absolute ceiling, defaulting to 1 MB |
+
+It only issues a `GET`, follows redirects, times out after 30 s, and returns network failures as
+flagged error results rather than throwing.
+
+**`webSearchTool`** (`src/capabilities/web/websearch.ts`, model name `websearch`) runs a query
+against DuckDuckGo's HTML endpoint and returns ranked hits.
+
+| Argument | Type | Notes |
+|----------|------|-------|
+| `query` | string (required) | The free-text query |
+| `maxResults` | integer (optional) | 1..25; defaults to 5, over-large values pulled down to the ceiling |
+
+It returns both a model-readable text block and a structured `{ title, url, snippet }[]` JSON
+block, so a richer host can consume the data directly.
+
+```ts
+import { capabilities } from "indusagi";
+
+// The individual tools can also be driven directly through a ToolContext,
+// or selected into a collection:
+const tools = capabilities.toolBox("read-only");
+```
+
+## Locking down the bash backend
+
+The built-in `bashTool` executes through the kernel's injected `Shell.exec` seam
+(`ctx.shell`), never reaching for `node:child_process` itself. That seam is what you swap to
+sandbox or remote command execution: provide a custom `ToolContext` whose `shell` backend
+dispatches commands into an isolated container instead of the local host. The default Node
+backend is `nodeShell`, exported from `indusagi/capabilities`
+(source `src/capabilities/backends/node-backends.ts`); `makeNodeContext(cwd)` builds the
+default local context.
+
+> For most authorized assessments, the strongest control is simply **not exposing `bash` at
+> all** — keep the agent on `toolBox("read-only")` and run any scanning tools yourself,
+> handing their output to the agent to interpret.
+
+## Responsible use
+
+- **Authorization first.** Only point these tools at systems you own or have written
+  permission to test. The framework enforces no scope of its own.
+- **Prefer `read-only`.** Expose `bash`/`process`/`write`/`edit` only when an assessment
+  genuinely requires them, and scope the toolbox `cwd` to a single directory.
+- **Isolate execution.** When the agent must run commands, sandbox the shell seam and run in a
+  disposable, network-segmented environment.
+- **Respect targets.** Honor rate limits, terms of service, and responsible-disclosure
+  practices.
+
+## Related documentation
+
+- [Capabilities subsystem](/docs/subsystems/capabilities) — the built-in tools, `toolBox`, and collections
+- [Runtime subsystem](/docs/subsystems/runtime) — `createAgent`, the agent loop, and `submit`
+- [LLM gateway subsystem](/docs/subsystems/llm-gateway) — `stream`/`complete` and the model catalog
+- [Package exports](/docs/package-exports) — every importable subpath and its exports
+- [Getting started](/docs/getting-started) — install, build, and run the CLI

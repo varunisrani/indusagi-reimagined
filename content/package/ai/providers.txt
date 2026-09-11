@@ -1,0 +1,194 @@
+# AI Providers
+
+This document describes the provider adapters implemented in
+`src/facade/ml/adapters/*` and their options.
+
+## Adapter Set
+
+The built-in adapters (registered by `src/facade/ml/adapters/register-builtins.ts`)
+are, by API tag:
+
+| API tag | Adapter file | Stream fns |
+|---------|--------------|------------|
+| `mock-ai` | `mock.ts` | `streamMock`, `streamSimpleMock` |
+| `anthropic-messages` | `anthropic.ts` | `streamAnthropic`, `streamSimpleAnthropic` |
+| `openai-completions` | `openai-completions.ts` | `streamOpenAICompletions`, `streamSimpleOpenAICompletions` |
+| `openai-responses` | `openai-responses.ts` | `streamOpenAIResponses`, `streamSimpleOpenAIResponses` |
+| `azure-openai-responses` | `azure-openai-responses.ts` | `streamAzureOpenAIResponses`, `streamSimpleAzureOpenAIResponses` |
+| `openai-codex-responses` | `openai-codex-responses.ts` | `streamOpenAICodexResponses`, `streamSimpleOpenAICodexResponses` |
+| `google-generative-ai` | `google.ts` | `streamGoogle`, `streamSimpleGoogle` |
+| `google-vertex` | `google-vertex.ts` | `streamGoogleVertex`, `streamSimpleGoogleVertex` |
+| `bedrock-converse-stream` | `amazon-bedrock.ts` | `streamBedrock`, `streamSimpleBedrock` |
+| `kimi-openai-compatible` | `kimi.ts` | `streamKimi`, `streamSimpleKimi` |
+| `nvidia-openai-compatible` | `nvidia.ts` | `streamNvidia`, `streamSimpleNvidia` |
+
+Shared adapter modules: `google-shared.ts`, `openai-responses-shared.ts`,
+`openai-scaffold.ts` (a no-op scaffold), `simple-options.ts` (reasoning/budget
+helpers), and `transform-messages.ts` (internal message normalization).
+
+## Environment Variables
+
+These are read by `getEnvApiKey` in `src/facade/ml/env-api-keys.ts`.
+
+- `OPENAI_API_KEY` for provider `openai`
+- `AZURE_OPENAI_API_KEY` for provider `azure-openai-responses`
+- `GEMINI_API_KEY` for provider `google`
+- `GROQ_API_KEY` for provider `groq`
+- `CEREBRAS_API_KEY` for provider `cerebras`
+- `XAI_API_KEY` for provider `xai`
+- `OPENROUTER_API_KEY` for provider `openrouter`
+- `AI_GATEWAY_API_KEY` for provider `vercel-ai-gateway`
+- `ZAI_API_KEY` for provider `zai`
+- `MISTRAL_API_KEY` for provider `mistral`
+- `MINIMAX_API_KEY` for provider `minimax`
+- `MINIMAX_CN_API_KEY` for provider `minimax-cn`
+- `OPENCODE_API_KEY` for provider `opencode`
+- `SARVAM_API_KEY` for provider `sarvam`
+- `KRUTRIM_API_KEY` for provider `krutrim`
+- `NVIDIA_API_KEY` for provider `nvidia`
+- `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` for provider `github-copilot`
+- `ANTHROPIC_OAUTH_TOKEN` or `ANTHROPIC_API_KEY` for provider `anthropic`
+- `MOONSHOT_API_KEY` for provider `kimi`
+- `KIMI_API_KEY` or `KIMICODE_API_KEY` for provider `kimi-coding`
+
+Google Vertex (`google-vertex`) uses Application Default Credentials and reports
+a credentials-present marker when all of the following are configured:
+
+- `GOOGLE_APPLICATION_CREDENTIALS`, or the default ADC file at
+  `~/.config/gcloud/application_default_credentials.json`
+- `GOOGLE_CLOUD_PROJECT` or `GCLOUD_PROJECT`
+- `GOOGLE_CLOUD_LOCATION`
+
+Amazon Bedrock (`amazon-bedrock`) reports a credentials-present marker when any of
+the standard AWS auth sources are present:
+
+- `AWS_PROFILE`, or `AWS_ACCESS_KEY_ID` plus `AWS_SECRET_ACCESS_KEY`
+- `AWS_BEARER_TOKEN_BEDROCK`
+- `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI` or `AWS_CONTAINER_CREDENTIALS_FULL_URI`
+- `AWS_WEB_IDENTITY_TOKEN_FILE`
+
+For providers that authenticate through an SDK credential chain (Bedrock, Vertex),
+`getEnvApiKey` returns the sentinel `<sdk-managed-credentials>` rather than a
+literal key. `resolveEnvApiKey` reports this via `isAuthenticatedMarker`.
+
+## Anthropic Messages (`anthropic-messages`)
+
+Implementation: `adapters/anthropic.ts`. Options (`AnthropicOptions`):
+
+- `thinkingEnabled?: boolean`
+- `thinkingBudgetTokens?: number`
+- `interleavedThinking?: boolean`
+- `toolChoice?: "auto" | "any" | "none" | { type: "tool"; name: string }`
+
+Supports API keys and OAuth tokens, tool calls, tool results, and image inputs.
+
+## OpenAI Completions (`openai-completions`)
+
+Implementation: `adapters/openai-completions.ts`. Options (`OpenAICompletionsOptions`):
+
+- `toolChoice?: "auto" | "none" | "required" | { type: "function"; function: { name: string } }`
+- `reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh"`
+- `retryPolicy?: { maxAttempts?: number; baseDelayMs?: number }`
+
+This adapter also serves OpenAI-compatible backends (`openrouter`, `xai`, `groq`,
+`cerebras`, `mistral`, `zai`, `opencode`, and others). Per-endpoint behavior is
+inferred from `provider`/`baseUrl` or pinned via `model.compat` (`OpenAICompletionsCompat`):
+
+- `supportsStore`, `supportsDeveloperRole`, `supportsReasoningEffort`
+- `supportsUsageInStreaming`, `maxTokensField`
+- `requiresToolResultName`, `requiresAssistantAfterToolResult`
+- `requiresThinkingAsText`, `requiresMistralToolIds`
+- `thinkingFormat` (`"openai" | "zai"`), `openRouterRouting` (`OpenRouterRouting`)
+
+## OpenAI Responses (`openai-responses`)
+
+Implementation: `adapters/openai-responses.ts` and `adapters/openai-responses-shared.ts`.
+Options (`OpenAIResponsesOptions`):
+
+- `reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh"`
+- `reasoningSummary?: "auto" | "detailed" | "concise" | null`
+- `serviceTier?` (the Responses `service_tier` value)
+
+Exports `convertResponsesMessages` and `convertResponsesTools` from the shared module.
+
+## Azure OpenAI Responses (`azure-openai-responses`)
+
+Implementation: `adapters/azure-openai-responses.ts`. Options (`AzureOpenAIResponsesOptions`):
+
+- `reasoningEffort?: "minimal" | "low" | "medium" | "high" | "xhigh"`
+- `reasoningSummary?: "auto" | "detailed" | "concise" | null`
+- `azureApiVersion?: string`
+- `azureResourceName?: string`
+- `azureBaseUrl?: string`
+- `azureDeploymentName?: string`
+
+## OpenAI Codex Responses (`openai-codex-responses`)
+
+Implementation: `adapters/openai-codex-responses.ts`. Options (`OpenAICodexResponsesOptions`):
+
+- `reasoningEffort?: "none" | "minimal" | "low" | "medium" | "high" | "xhigh"`
+- `reasoningSummary?: "auto" | "concise" | "detailed" | "off" | "on" | null`
+- `textVerbosity?: "low" | "medium" | "high"`
+
+Uses the ChatGPT Codex endpoint; `sessionId` maps to `prompt_cache_key`.
+
+## Amazon Bedrock (`bedrock-converse-stream`)
+
+Implementation: `adapters/amazon-bedrock.ts`. Options (`BedrockOptions`):
+
+- `region?: string`
+- `profile?: string`
+- `toolChoice?: "auto" | "any" | "none" | { type: "tool"; name: string }`
+- `reasoning?: ThinkingLevel`
+- `thinkingBudgets?: ThinkingBudgets`
+- `interleavedThinking?: boolean`
+
+Uses the AWS SDK Converse streaming API; interleaved thinking is limited to the
+Claude 4.x family.
+
+## Google Generative AI (`google-generative-ai`)
+
+Implementation: `adapters/google.ts` and `adapters/google-shared.ts`.
+Options (`GoogleOptions`):
+
+- `toolChoice?: "auto" | "none" | "any"`
+- `thinking?: { enabled: boolean; budgetTokens?: number; level?: GoogleThinkingLevel }`
+
+Discrete thinking levels resolve to fixed token budgets
+(`MINIMAL`=512, `LOW`=1500, `MEDIUM`=6000, `HIGH`=20000;
+`THINKING_LEVEL_UNSPECIFIED`=-1). The shared module exports `executeGoogleRequest`,
+`convertTools`, `isThinkingPart`, `retainThoughtSignature`, `requiresToolCallId`,
+`mapToolChoice`, `mapStopReason`, `mapStopReasonString`, and the `GoogleThinkingLevel` type.
+
+## Google Vertex (`google-vertex`)
+
+Implementation: `adapters/google-vertex.ts` and `adapters/google-shared.ts`.
+Options (`GoogleVertexOptions`):
+
+- `toolChoice?: "auto" | "none" | "any"`
+- `thinking?: { enabled: boolean; budgetTokens?: number; level?: GoogleThinkingLevel }`
+- `project?: string`
+- `location?: string`
+
+Shares message conversion and tool handling with the Generative AI adapter.
+
+## Kimi (`kimi-openai-compatible`)
+
+Implementation: `adapters/kimi.ts`. Options (`KimiOptions`):
+
+- `reasoningLevel?: "none" | "low" | "medium" | "high"`
+
+OpenAI-compatible chat completions against Moonshot's Kimi API.
+
+## NVIDIA (`nvidia-openai-compatible`)
+
+Implementation: `adapters/nvidia.ts`. Options (`NvidiaOptions`):
+
+- `topP?: number`
+
+OpenAI-compatible chat completions against NVIDIA's API.
+
+## Mock (`mock-ai`)
+
+Implementation: `adapters/mock.ts`. A test backend that echoes the last user
+message; accepts internal `mockDelayMs`, `mockText`, and `mockToolName` options.

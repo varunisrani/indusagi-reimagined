@@ -1,0 +1,131 @@
+# LLM Gateway
+
+> `src/llmgateway` is the L1 Foundation layer — a unified, multi-provider gateway
+> that hands every other layer one way to talk to any model. Imported as
+> `indusagi/llmgateway`, or as the `gateway` namespace from `indusagi`.
+
+The gateway resolves a model id to a `ModelCard`, routes to the `Connector` that
+speaks the card's wire dialect, and returns a streaming `Channel` of `Emission`s (or
+an assembled `Reply`). Unknown ids fail fast with an `unsupported` `GatewayError`.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-directories](#sub-directories)
+- [Dispatch](#dispatch)
+- [The model catalog](#the-model-catalog)
+- [Connectors and credentials](#connectors-and-credentials)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+From `src/llmgateway/index.ts`:
+
+| Export | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `stream` | function | `gateway.ts` | Open a streaming invocation by model id; returns a `Channel` |
+| `complete` | function | `gateway.ts` | One-shot invocation by id; resolves a `Reply` |
+| `streamWithCard` | function | `gateway.ts` | Stream against a pre-resolved `ModelCard` (skips catalog lookup) |
+| `completeWithCard` | function | `gateway.ts` | One-shot against a pre-resolved `ModelCard` |
+| `MODEL_CARDS` | const | `catalog/cards.ts` | The static model registry |
+| `CardSelection` | class | `catalog/query.ts` | The fluent query result |
+| `models` | function | `catalog/query.ts` | Fluent query entry point |
+| `getCard` | function | `catalog/query.ts` | Resolve a card by id (or `undefined`) |
+| `estimateCost` | function | `catalog/cost.ts` | Cost estimation over a card's `CostSheet` |
+| `CONNECTOR_REGISTRY` | const | `connectors/index.ts` | The routing table: `ApiKind` → `Connector` |
+| `connectorForApi` | function | `connectors/index.ts` | Resolve the connector for a card's `api` |
+
+The barrel also re-exports the whole `contract` (`export * from "./contract"`),
+including the `GatewayError` class and `gatewayError` constructor.
+
+## Sub-directories
+
+| Directory | Holds |
+|-----------|-------|
+| `contract/` | The frozen type contract — `model-card.ts`, `conversation.ts`, `reply.ts`, `emission.ts`, `options.ts`, `errors.ts`, `connector.ts` |
+| `catalog/` | `cards.ts` (registry), `query.ts` (`models`/`getCard`/`CardSelection`), `cost.ts` (`estimateCost`) |
+| `connectors/` | One module per wire dialect plus `mock.ts`, assembled by `index.ts` |
+| `credentials/` | `secrets.ts` (env-backed key resolution), `oauth.ts`, `pkce.ts` (RFC 7636) |
+| `conversion/` | `mappers.ts`, `openai-compatible.ts`, `reduce.ts` — turn-to-wire mapping and reply reduction |
+| `streaming/` | `channel.ts` (`channelOf`/`collectReply`), `sse.ts` (`sseEvents`), `ndjson.ts` (`ndjsonLines`) |
+
+## Dispatch
+
+`stream` and `complete` take the same shape — a model id, a `Conversation`, and
+optional `StreamOptions`:
+
+```ts
+import { stream, complete } from "indusagi/llmgateway";
+
+const conversation = {
+  turns: [{ role: "user", blocks: [{ kind: "text", text: "hi" }] }],
+};
+
+// Streaming: iterate the Channel of Emissions.
+const channel = stream("claude-sonnet-4", conversation);
+for await (const emission of channel) {
+  if (emission.kind === "text") process.stdout.write(emission.delta);
+}
+
+// One-shot: await the assembled Reply.
+const reply = await complete("claude-sonnet-4", conversation);
+```
+
+The contract's frozen vocabulary includes `Conversation`, `Turn` (`UserTurn` /
+`AssistantTurn` / `ToolTurn`), `Block` (`TextBlock`, `ThinkingBlock`,
+`ToolCallBlock`, `ToolResultBlock`, `ImageBlock`, `CommandBlock`), `ToolDescriptor`,
+`Reply` (with `Usage` / `StopReason`), the `Emission` union, the `Channel`
+async-iterable, `StreamOptions` (and `ThinkingLevel` / `ToolChoice`), and
+`GatewayError` (`GatewayErrorKind`).
+
+## The model catalog
+
+`MODEL_CARDS` is the static registry; `getCard(id)` resolves one, and `models()`
+opens a fluent `CardSelection` query. A `ModelCard` carries a `ProviderId`, the
+`api` (`ApiKind`) wire dialect, `Modality`, and an optional `CostSheet`; `estimateCost`
+prices a usage figure against it.
+
+```ts
+import { models, getCard, estimateCost } from "indusagi/llmgateway";
+
+const card = getCard("claude-sonnet-4");
+const cost = card
+  ? estimateCost(card, { inputTokens: 1000, outputTokens: 500 })
+  : 0;
+```
+
+## Connectors and credentials
+
+`CONNECTOR_REGISTRY` is a `Readonly<Record<ApiKind, Connector>>` that is total over
+`ApiKind`, so `connectorForApi(card.api)` never misses a known dialect. The wire
+dialects are:
+
+```
+anthropic-messages, openai-completions, openai-responses,
+google-generative, google-vertex, amazon-bedrock, azure-openai,
+nvidia-openai-compatible, kimi-openai-compatible, ollama, mock
+```
+
+Every connector factory takes one dependency bag — `{ resolveSecret }` — wired from
+`credentials/secrets.ts`. `resolveSecret` walks a declarative per-provider table of
+env vars and yields the first non-empty value. The standard keys include
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY` (then `GOOGLE_API_KEY`),
+`AZURE_OPENAI_API_KEY`, `NVIDIA_API_KEY`, and `MOONSHOT_API_KEY` (then `KIMI_API_KEY`);
+Bedrock and Vertex use a cloud-IAM scheme, and Ollama and `mock` need no secret. The
+`credentials/` directory also holds `oauth.ts` and `pkce.ts` (PKCE per RFC 7636).
+
+Wire framing is decoded in `streaming/`: `sseEvents` parses WHATWG Server-Sent
+Events (the OpenAI/Anthropic/Google dialects) and `ndjsonLines` parses NDJSON (Ollama).
+
+## Relationship to neighbors
+
+The [Runtime](/docs/subsystems/runtime) is the gateway's primary consumer: its
+conductor reaches the gateway's `stream` through an injectable `ModelInvoker`, bound
+to `AgentConfig.model`. Runtime deliberately does *not* re-export the gateway's
+types — `Conversation`, `Turn`, `Block`, `Emission`, `Channel`, `ToolDescriptor`,
+etc. are imported straight from `indusagi/llmgateway` (or `.../llmgateway/contract`)
+so there is one source of truth. The gateway is also the floor the
+[Capabilities](/docs/subsystems/capabilities) tool kernel shares the `JsonSchema` /
+`ToolDescriptor` contract with.
+
+Back to the [Architecture overview](/docs/architecture).

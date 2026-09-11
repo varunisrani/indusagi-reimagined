@@ -1,0 +1,292 @@
+# Transcript Export
+
+> The Rust agent's self-contained-HTML transcript publisher. `publish_transcript(entries, opts)` renders a session's turns into one standalone `<!doctype html>` string — Markdown through `pulldown-cmark`, fenced code through `syntect`, terminal-styled (ANSI/SGR) tool output painted to safe `<span>`s, everything baked into a base64 JSON payload at publish time so the page opens with zero external runtime dependencies. It is a pure, synchronous, offline leaf: no I/O lives inside the subsystem. Reach it from the crate via `induscode::transcript_export`, or from the live console with the [`/export`](/rust-cli/console/slash-commands), `/share`, and `/copy` slash commands.
+
+The `transcript_export` subsystem turns a coding-session transcript — a list of `PublishEntry` views over framework messages — into a single HTML document that can be written to disk and opened directly in a browser with nothing else loaded. It owns three concerns end to end: **painting** terminal-styled SGR tool output into HTML spans via a table-driven machine, **computing** export colors from a theme token bag through a precomputed WCAG relative-luminance lookup table, and **assembling** a themed page-shell template whose `{{TOKEN}}` slots are filled at publish time. The page ships fully rendered — all markdown, highlighting, SGR spans, and tool widgets are already built and stored as a base64 JSON payload, so the embedded client script only decodes and injects HTML rather than parsing anything in the browser.
+
+## Table of Contents
+
+- [What This Owns](#what-this-owns)
+- [The Public Surface](#the-public-surface)
+- [Publishing a Transcript](#publishing-a-transcript)
+- [The Input Model](#the-input-model)
+- [The Table-Driven SGR Painter](#the-table-driven-sgr-painter)
+- [The Theme Bridge](#the-theme-bridge)
+- [Code Highlighting And Markdown](#code-highlighting-and-markdown)
+- [The Page Shell And Slots](#the-page-shell-and-slots)
+- [Content-Part Dispatch](#content-part-dispatch)
+- [The /export Slash Command](#the-export-slash-command)
+- [Faults](#faults)
+- [Source Layout](#source-layout)
+- [Relationship To The Framework](#relationship-to-the-framework)
+
+## What This Owns
+
+Publishing is a pure, synchronous render: in goes a `&[PublishEntry]` (each a narrow view of a framework message) plus `&PublishOptions`, out comes `Result<String, PublishError>` — one complete `<!doctype html>` page. There is no I/O inside the subsystem — the single file write belongs to the caller. Five modules layer cleanly under `crates/induscode/src/transcript_export/`:
+
+| Module | Concern |
+|--------|---------|
+| `contract.rs` | The **frozen value surface** — `struct`/`enum` types and inert constants only; no string assembly, no theme math. Every behavior module is written against names declared here. Ports the `src/briefing/contract.ts:431-790` slice the TS lumps into the briefing contract but which belongs to this crate. |
+| `sgr.rs` | The **ANSI/SGR painter** — a three-stage pipeline (`tokenize_sgr` → `fold_sgr` → `paint_sgr`) that converts a terminal byte stream into HTML-escaped text and styled `<span>` runs through a `OnceLock` dispatch table. |
+| `theme_bridge.rs` | The **export color service** — parses CSS colors, reads WCAG luminance from a 256-entry `LazyLock` LUT, reports light/dark mode, derives surface variants, picks readable ink, and projects tokens to `--x-*` CSS custom properties. |
+| `template.rs` | The **standalone page** — `PAGE_SHELL`, `PAGE_STYLES`, the JS `CLIENT_SCRIPT`, and `fill()` which substitutes only the known `{{TOKEN}}` slots. |
+| `publish.rs` | The **orchestrator** — `publish_transcript` wires the `pulldown-cmark` + `syntect` pipeline, renders each entry, base64-encodes the turns, resolves the theme, and fills the shell. Also owns the publisher's narrow `MessagePart` / `PublishMessage` / `PublishEntry` input model. |
+
+It builds on the [Rust framework](/rust) only loosely: `publish.rs` borrows the framework's own `syntect` syntax-set loader (`two_face::syntax::extra_newlines`, the exact call `indusagi::tui_render`'s markdown highlighter uses) and cribs the `scope_to_role` scope-bucketing pattern, but every emitter here is a ground-up build. The framework message union is never imported — the publisher reads `role` / `content` / `tool_call_id` / `tool_name` structurally through its own `PublishMessage` view and dispatches on each content part's enum discriminant.
+
+The binary is `indusr` (with `indusagir` as an equivalent alias) — both `[[bin]]` targets (`src/bin/main.rs`) share one `main`, branded off `argv[0]`'s basename. See the [Rust CLI overview](/rust-cli).
+
+## The Public Surface
+
+Everything is re-exported from `transcript_export/mod.rs` — import from the module root, never from individual files.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `publish_transcript` | fn | `publish.rs` | Top-level entry: render `&[PublishEntry]` + `&PublishOptions` to `Result<String, PublishError>` — a complete standalone HTML document string. |
+| `paint_sgr` | fn | `sgr.rs` | Convert a raw ANSI/terminal byte stream into HTML-escaped text and styled `<span>` runs; drives `tokenize_sgr` + `fold_sgr` end to end. |
+| `tokenize_sgr` | fn | `sgr.rs` | Split a terminal stream into an ordered `Vec<SgrToken>` of text runs and SGR command lists; drops non-SGR CSI sequences. |
+| `fold_sgr` | fn | `sgr.rs` | Fold one SGR numeric parameter list into a running `SgrState` via the dispatch table; handles the parametric `38`/`48` introducers inline. Pure. |
+| `DefaultThemeBridge` | struct | `theme_bridge.rs` | The concrete color service: methods `luminance` / `mode` / `derive_surface` / `readable_ink` / `to_css_vars` resolve export colors. |
+| `fallback_export_theme` | fn | `theme_bridge.rs` | Materialize `FALLBACK_EXPORT_THEME` (the `&'static`-string view) into an owned `ExportTheme` — the rebuild's own deep-slate dark palette. |
+| `parse_color` / `format_color` | fn | `theme_bridge.rs` | Parse a CSS color (`#rgb` / `#rrggbb` / `#rgba` / `#rrggbbaa`, `rgb()` / `rgba()`) into an `Rgb`, or render an `Rgb` back to `#rrggbb`. |
+| `LUMINANCE_LUT` | static | `theme_bridge.rs` | The 256-entry `LazyLock<[f64; 256]>` sRGB→linear lookup table for the per-channel step of the WCAG luminance formula. |
+| `PAGE_SHELL` / `PAGE_STYLES` / `CLIENT_SCRIPT` | const | `template.rs` | The page shell with `{{TOKEN}}` markers, the inlined stylesheet (reads `--x-*` properties), and the JS client renderer — all `const &str`, carried byte-verbatim from the TS. |
+| `fill` | fn | `template.rs` | Replace each known `{{TOKEN}}` in a template with its supplied value (walks `SHELL_SLOTS`, not an open scan). |
+| `SHELL_SLOTS` | const | `contract.rs` | `[&str; 9]` — the page-shell slot names in fill order. |
+
+The contract also exports the type surface: `SgrState` / `SGR_INITIAL_STATE`, `SgrToken`, `SgrMutation`, `ExportTheme` / `FALLBACK_EXPORT_THEME`, `Rgb`, `ThemeMode`, `ShellSlot`, `WidgetRender`, `PublishOptions`, `PublishRole`, and `PublishError`. The publisher's input model — `MessagePart`, `PublishContent`, `PublishMessage`, `PublishEntry` — is re-exported from `publish.rs`.
+
+## Publishing a Transcript
+
+`publish_transcript(entries, opts)` is synchronous and infallible in practice — it returns `Result<String, PublishError>` so any assembly failure surfaces as a typed fault rather than a panic. It builds a `DefaultThemeBridge`, indexes the widgets, renders every entry to a `RenderedTurn`, serializes the turns into a base64 payload, projects the theme into the `THEME_VARS` block, and returns `fill(PAGE_SHELL, &slots)`.
+
+```rust
+use induscode::transcript_export::{
+    publish_transcript, PublishContent, PublishEntry, PublishMessage,
+    PublishOptions, PublishRole,
+};
+
+let entries = vec![
+    PublishEntry {
+        role: PublishRole::User,
+        message: PublishMessage {
+            role: "user".to_string(),
+            content: PublishContent::Text("Fix the **bug** in `app.rs`".to_string()),
+            tool_call_id: None,
+            tool_name: None,
+        },
+    },
+    PublishEntry {
+        role: PublishRole::Assistant,
+        message: PublishMessage {
+            role: "assistant".to_string(),
+            content: PublishContent::Text("Done:\n```rust\nlet x = 1;\n```".to_string()),
+            tool_call_id: None,
+            tool_name: None,
+        },
+    },
+];
+
+let html = publish_transcript(
+    &entries,
+    &PublishOptions {
+        title: Some("Session Transcript".to_string()),
+        ..Default::default()
+    },
+)?;
+std::fs::write("transcript.html", html)?;
+```
+
+`PublishOptions` is fully optional — `PublishOptions::default()` yields a themed, self-contained file:
+
+| Field | Type | Default | Purpose |
+|-------|------|---------|---------|
+| `theme` | `Option<ExportTheme>` | `None` → `FALLBACK_EXPORT_THEME` | Override the export color palette. |
+| `title` | `Option<String>` | `None` → `"Session Transcript"` | Document title baked into the payload (and the page heading). |
+| `out_dir` | `Option<String>` | `None` | Directory hint for the file (the write itself is the caller's). |
+| `widgets` | `Vec<WidgetRender>` | `vec![]` | Pre-rendered custom-tool blocks (`WidgetRender { call_id, html }`), spliced in by tool-call id. |
+
+## The Input Model
+
+The publisher reads message content **structurally** rather than coupling to the framework message union. Its narrow view (`publish.rs`):
+
+```rust
+pub enum MessagePart {
+    Text(String),
+    Image { mime_type: String, data: String },
+    Thinking(String),
+    ToolCall { id: String, name: String, arguments: serde_json::Value },
+}
+
+pub enum PublishContent {
+    Text(String),
+    Parts(Vec<MessagePart>),
+}
+
+pub struct PublishMessage {
+    pub role: String,
+    pub content: PublishContent,
+    pub tool_call_id: Option<String>,
+    pub tool_name: Option<String>,
+}
+
+pub struct PublishEntry {
+    pub role: PublishRole,
+    pub message: PublishMessage,
+}
+```
+
+A `PublishContent::Text` is coerced to a single text part at render time by `parts_of`. The `PublishRole` enum (`User` / `Assistant` / `Tool` / `System` / `Condense` / `Note`) carries the attribution; `PublishRole::from_role(&str)` maps a framework role string, folding anything unrecognized to `Note`. Each role has a wire name (`as_str`) baked into the payload `role` field and a human label (`label`) — `You` / `Assistant` / `Tool` / `System` / `Summary` / `Note`.
+
+## The Table-Driven SGR Painter
+
+ANSI styling is treated as **data, not control flow**. Each handled SGR code maps to an `SgrMutation` (the data form of TypeScript's `Partial<SgrState>`) in a process-wide dispatch table built once into a `OnceLock<HashMap<u16, SgrMutation>>`; extending the machine means adding a table row, never editing a `match`. The pipeline is three stages:
+
+1. `tokenize_sgr(input: &str) -> Vec<SgrToken>` splits the raw terminal stream into an alternation of text runs (`SgrToken::Text`) and SGR parameter lists (`SgrToken::Sgr(Vec<u16>)`), dropping any CSI sequence whose final byte is not `m` and any bare escape. It scans Unicode scalar values, never emits an empty text run, and parses each parameter field with a `parseInt`-style numeric-prefix reader (an empty/non-numeric field reads `0`, overflow saturates at `u16::MAX`).
+2. `fold_sgr(state: SgrState, params: &[u16]) -> SgrState` folds one parameter list left-to-right over a running state. A fixed-meaning code resolves through the table; the `30`–`37` / `40`–`47` / `90`–`97` / `100`–`107` color runs come from a built-in 16-color palette; the parametric `38`/`48` extended-color introducers (24-bit `;2;r;g;b` and 256-index `;5;n`) are read inline by `read_extended_color`, not from the table. An empty list is the bare `ESC[m` form and is a reset.
+3. `paint_sgr(input: &str) -> String` drives both, wrapping each text run in a `<span>` carrying `sgr-*` classes and inline color styles, resolving the inverse swap and hidden conceal at render time (`styles_for`), and emitting neutral runs bare (no span).
+
+```rust
+use induscode::transcript_export::paint_sgr;
+
+// bold + red "hot", reset, then 256-color index 196 "x"
+let html = paint_sgr("\x1b[1;31mhot\x1b[0mcalm\x1b[38;5;196mx");
+// "hot" → <span class="sgr-bold" style="color:#c14a4a">hot</span>
+// "calm" → bare run (no span) after the reset
+// "x"   → <span style="color:#ff0000">x</span>
+```
+
+Palette colors are concrete CSS strings (ANSI red is `#c14a4a`; 256-index 196 resolves to `#ff0000`), so the emitted spans are self-contained — the page never ships an ANSI palette to render them. A reset (`SGR 0`) returns the machine to `SGR_INITIAL_STATE` via a whole-state replace (`SgrMutation::Reset`); a `SgrMutation::Set` patches only its `Some(..)` fields. Output is byte-exact with the TS painter: the 16-color BASE/BRIGHT palette, the `16`–`231` 6×6×6 cube over `{0, 95, 135, 175, 215, 255}`, the `232`–`255` gray ramp, the off-switches (`22`/`24`/`27`/`28`/`29`/etc.), and per-character HTML escaping of the five significant characters.
+
+The 256-color `color256` and the SGR `clamp_byte` **truncate** (`| 0`), which is deliberately distinct from the theme bridge's **rounding** `clamp_byte_round` — both clamps are byte-observable and kept separate (plan G-3).
+
+## The Theme Bridge
+
+`DefaultThemeBridge` holds a resolved `ExportTheme` (a ten-token color bag — `page_surface` / `card_surface` / `note_surface` / `ink` / `ink_muted` / `accent` / `border` / `user_role` / `agent_role` / `tool_role`) and answers every color query the publisher makes against the shared `LUMINANCE_LUT`:
+
+| Method | Purpose |
+|--------|---------|
+| `luminance(color: &str) -> f64` | WCAG relative luminance (0–1) of a CSS color; unparseable input reads `0.0`. |
+| `mode() -> ThemeMode` | `Light` if the page-surface luminance is at or above `MODE_THRESHOLD` (`0.18`), else `Dark`. |
+| `derive_surface(base: &str, amount: i32) -> String` | Step every channel of a base color by a signed amount (positive lightens, negative darkens); an unparseable base falls through to the card surface. |
+| `readable_ink(background: &str) -> String` | Pick whichever of `ink` / `ink_muted` has the higher WCAG contrast against a background. |
+| `to_css_vars() -> Vec<(&'static str, String)>` | Project the theme to its ten CSS custom properties in fixed `THEME_TOKENS` order, returned as an **ordered** `Vec` (not a map) so the `--x-*` block is byte-stable across runs. |
+
+The luminance read is fast because the per-channel sRGB→linear gamma step is precomputed once by `LUMINANCE_LUT` (a `LazyLock<[f64; 256]>`) — a read is three table lookups plus the weighted sum `0.2126·R + 0.7152·G + 0.0722·B`, never a `powf` per channel. Black pins to `0.0` and white to `1.0`.
+
+```rust
+use induscode::transcript_export::{fallback_export_theme, DefaultThemeBridge};
+use induscode::transcript_export::contract::ThemeMode;
+
+let bridge = DefaultThemeBridge::new(fallback_export_theme());
+assert_eq!(bridge.mode(), ThemeMode::Dark);
+let l = bridge.luminance("#13161c");          // WCAG relative luminance, 0..1
+let lighter = bridge.derive_surface("#1b1f27", 12); // lighten card surface by 12
+let vars = bridge.to_css_vars();              // [("pageSurface", "#13161c"), ...]
+```
+
+`create_theme_bridge(Option<ExportTheme>)` is the convenience factory: `None` yields a bridge over the deep-slate fallback. When the active UI supplies no export colors, `FALLBACK_EXPORT_THEME` (the rebuild's own dark palette) is used — the parity default, since the console caller passes only `{ title }` and never a theme.
+
+## Code Highlighting And Markdown
+
+Prose runs through `pulldown-cmark` with GFM tables enabled and hard line breaks off (`{gfm: true, breaks: false}`, replacing the TS `marked`). `render_markdown` intercepts the parser's code-block events and routes fenced code through `highlight_code` — mirroring marked's overridden `code()` renderer — so fences emit `<pre><code class="language-…">` with `xhl-*` spans rather than pulldown's default escaped block. Prose events are buffered (`into_static`) and flushed in order via `pulldown_cmark::html::push_html`.
+
+Fenced code is highlighted by `syntect` over the framework's own syntax set (`two_face::syntax::extra_newlines`, loaded once into a `LazyLock<SyntaxSet>`). `resolve_syntax` maps a language tag through an `EXTENSION_LANGUAGES` alias table (`ts`/`tsx` → TypeScript, `py` → Python, `rs` → Rust, `sh`/`bash`/`zsh` → bash, etc.) before falling back to syntect's token lookup. `highlight_with_syntax` walks `ParseState` / `ScopeStack` line-by-line — cribbing the framework's `highlight_with_syntax` apply-then-read idiom and `split_inclusive('\n')` newline handling — and `scope_to_xhl` buckets each TextMate scope onto one of the five page classes:
+
+| `xhl-*` class | Scopes |
+|---------------|--------|
+| `xhl-comment` | `comment*` |
+| `xhl-number` | `constant.numeric*` |
+| `xhl-string` | `string*`, `constant.character*`, `constant.other.symbol*` |
+| `xhl-keyword` | `keyword*`, `storage.modifier*`, `constant.language*`, `variable.language*` |
+| `xhl-literal` | `entity.name.type/class/namespace/tag*`, `entity.other.attribute-name*`, `support.type/class*`, `storage.type*` |
+
+The specific `constant.numeric` is tested before the generic buckets, and the `type`-family folds to `xhl-literal` because the page has no `xhl-type` rule (plan G-7). An unrecognized language is **not** auto-detected (the documented deviation, plan G-2 — the syntect port has no cheap auto-detect); it falls back to plain escaped code, as does any internal parse failure, so a published page never breaks on an exotic snippet.
+
+The MIT license notices for `pulldown-cmark` and `syntect` are embedded verbatim into the `MARKED_LIB` / `HIGHLIGHT_LIB` slots — these swap the stale `marked` (MIT) and `highlight.js` (BSD-3) notices the TS carried for the Rust engines actually used (plan G-4).
+
+## The Page Shell And Slots
+
+`PAGE_SHELL` is the standalone HTML page string, carrying closed `{{TOKEN}}` placeholders. `SHELL_SLOTS` is the `[&str; 9]` list of slot names; `fill()` does literal `str::replace` only over those known names, so any stray `{{...}}` in user/tool content survives untouched. Because `str::replace` is value-literal, a `$` in a value is inserted verbatim (the regression the TS escaped-regex guarded against, now free):
+
+| `ShellSlot` | `{{TOKEN}}` | Filled with |
+|-------------|-------------|-------------|
+| `ThemeVars` | `THEME_VARS` | The `--x-*` CSS custom-property block, hyphenated from the theme (`pageSurface`/`page_surface` → `--x-page-surface`). |
+| `PageSurface` / `CardSurface` / `NoteSurface` | `PAGE_SURFACE` / `CARD_SURFACE` / `NOTE_SURFACE` | Resolved surface colors. |
+| `Styles` | `STYLES` | `PAGE_STYLES` — the inlined stylesheet (`.turn` / `.tool-frame` / `.aside-note` / `sgr-*` / `xhl-*` class families). |
+| `Script` | `SCRIPT` | `CLIENT_SCRIPT` — the JS that decodes the payload and injects each turn into `#xscript-root`. |
+| `Payload` | `PAYLOAD` | The base64-encoded JSON of rendered turns. |
+| `MarkedLib` / `HighlightLib` | `MARKED_LIB` / `HIGHLIGHT_LIB` | The `pulldown-cmark` and `syntect` license notices, verbatim. |
+
+The `THEME_VARS` block is built by `theme_vars_block`, which hyphenates each token name (`hyphenate` handles both camelCase boundaries and `_` separators, so the block is `--x-page-surface: …;` either way). The turns are rendered to HTML *at publish time*, JSON-serialized by `payload_json`, base64-encoded by `to_base64` (standard base64 of the UTF-8 JSON bytes, round-tripping through the page's `JSON.parse(decodeURIComponent(escape(atob(...))))` decode chain, plan G-6), and spliced into the `PAYLOAD` slot. The embedded `CLIENT_SCRIPT` only decodes and injects the already-built `turn.html` — its `window.marked` / `window.hljs` re-hydration paths are inert fallbacks that never fire (plan G-5). This is what makes the file parser-free and dependency-free.
+
+## Content-Part Dispatch
+
+`render_entry` dispatches each `PublishEntry`'s content parts on their `MessagePart` discriminant:
+
+- **`Text`** — Markdown for user/assistant turns (`render_markdown`); for `Tool` turns, `render_tool_text` paints ANSI-bearing text (detected by `has_ansi`, the `ESC[` introducer) with `paint_sgr` inside a `<pre class="tool-frame">`, or escapes plain text into the same frame.
+- **`Image`** — an inline `data:{mime};base64,{data}` URI `<img>` (`render_image`).
+- **`Thinking`** — rendered as a muted `<div class="aside-note">`, not prose.
+- **`ToolCall`** — `render_tool_call` emits a labeled `<div class="tool-frame">` showing the tool name and pretty-printed (HTML-escaped) JSON arguments.
+
+A `Tool` result entry is first checked against the widget index keyed by `tool_call_id`; if a pre-rendered `WidgetRender` block exists, its HTML is spliced in whole. `System` and `Condense` roles become standalone notes (`kind: "note"` in the payload, otherwise omitted); every other role becomes a styled turn card. The rendered `RenderedTurn` carries `{ kind, role, label, html }`, serialized as `{ title, turns: [...] }`.
+
+## The /export Slash Command
+
+The primary in-app consumer lives in the [console](/rust-cli/console/overview): `induscode::console::slash` registers `/copy`, `/export [path]`, and `/share`, each minting a `ConductorAction` that the live loop in `console/mount.rs` services. `/export` raises `ConductorAction::ExportTranscript { path }`; the mount handler projects the live transcript onto `PublishEntry` via `to_publish_entries` and calls `export_transcript_html`.
+
+```bash
+# indusr REPL
+/export                    # writes transcript-<stamp>.html into the cwd
+/export docs/session.html  # writes to an explicit (relative-to-cwd) path
+/share                     # export, then publish a secret GitHub gist via `gh`
+/copy                      # copy the last assistant reply to the OS clipboard
+```
+
+`to_publish_entries` (porting `toPublishEntries`) flattens each `Turn`'s `Block`s to prose — `Block::Text` / `Block::Thinking` directly, `Block::ToolResult` through `stringify_tool_output`, `Block::ToolCall` as `name(input)` — and surfaces a tool turn's first `ToolResult` call id so the publisher can attribute the node. `export_transcript_html` resolves the target (a bare/empty path → `transcript-<epoch_stamp>.html` in the cwd; a relative path is joined to the cwd; an absolute path is used as-is), calls `publish_transcript(..., PublishOptions { title: Some("Session Transcript"), ..default })`, and writes the result. An empty transcript is a typed failure — **no** file is written and the console never toasts "Exported". `/share` exports first, then runs `gh gist create … --public=false`, falling back to reporting the local HTML path when `gh` is missing or unauthenticated. See [Slash Commands](/rust-cli/console/slash-commands) for the full command surface.
+
+## Faults
+
+The only failure this layer surfaces is `PublishError::Publish { message, cause }` (a `thiserror::Error`), mirroring the `"publish"` `BriefingFaultKind` the TS raised via `briefingFault("publish", …)`. It is minted by `PublishError::publish(message)` or `PublishError::publish_with(message, cause)`; the latter carries an underlying `Box<dyn Error + Send + Sync>` as the `#[source]` so consumers get the chain without parsing the message:
+
+```rust
+use induscode::transcript_export::{publish_transcript, PublishError};
+
+match publish_transcript(&entries, &opts) {
+    Ok(html) => { /* write to disk */ }
+    Err(PublishError::Publish { message, .. }) => eprintln!("export failed: {message}"),
+}
+```
+
+`render_entry`, the SGR painter, the theme bridge, and `fill` are all infallible by construction — the `Result` exists so a future assembly failure has a typed home rather than a panic.
+
+## Source Layout
+
+```
+crates/induscode/src/transcript_export/
+├── mod.rs            # public barrel — pub use the surface from here
+├── contract.rs       # frozen types + inert constants (SgrState, ExportTheme, PublishOptions, SHELL_SLOTS, PublishRole, PublishError, ...)
+├── sgr.rs            # the table-driven SGR painter (tokenize_sgr / fold_sgr / paint_sgr + OnceLock dispatch table)
+├── theme_bridge.rs   # the export color service (DefaultThemeBridge, LUMINANCE_LUT, parse_color / format_color)
+├── template.rs       # PAGE_SHELL / PAGE_STYLES / CLIENT_SCRIPT / fill
+└── publish.rs        # publish_transcript orchestrator + input model + pulldown-cmark/syntect pipeline + license notices
+```
+
+The Cargo dependencies the subsystem pulls (workspace-pinned):
+
+```toml
+pulldown-cmark = { workspace = true }   # markdown → HTML
+syntect        = { workspace = true }   # fenced-code highlighting
+two-face       = { workspace = true }   # the framework's syntax set
+base64         = { workspace = true }   # the transcript-export payload base64
+serde_json     = { workspace = true }   # tool-call args + payload JSON
+thiserror      = { workspace = true }   # PublishError
+```
+
+## Relationship To The Framework
+
+`transcript_export` is the publish-time HTML/Markdown builder of the [Rust agent](/rust-cli). It reuses the [Rust framework](/rust) only through its dependency graph — the `syntect` loader and the `scope_to_role` bucketing pattern from `indusagi::tui_render`'s markdown highlighter — and otherwise emits every byte itself. It consumes the framework's `Block` / `Turn` message types only at the console boundary (`console/mount.rs`'s `to_publish_entries`), never inside the subsystem, so a persisted transcript node round-trips through the publisher's own structural view.
+
+It is the Rust analogue of the TS [`transcript-export`](/cli) and Python [`transcript_export`](/python-cli/subsystems/transcript-export) subsystems, ported byte-exact where it matters (the SGR palette, the 256-color cube, the page shell, the base64 chain) and deliberately diverged where the Rust toolchain differs (pulldown-cmark + syntect for marked + highlight.js, no fenced-language auto-detect, the swapped license notices).
+
+Related reading: the [conductor](/rust-cli/subsystems/conductor) (which owns the live transcript this subsystem renders), [briefing](/rust-cli/subsystems/briefing) (whose contract the fault set mirrors), the [console](/rust-cli/console/overview) and [slash commands](/rust-cli/console/slash-commands) (the `/export` consumers), and [sessions](/rust-cli/subsystems/sessions) (the saved-conversation catalog and on-disk `.jsonl` transcript persistence).

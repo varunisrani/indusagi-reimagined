@@ -1,0 +1,332 @@
+# CLI Reference
+
+> The `pindusagi` / `indusagi` command-line front door. It parses `argv`, assembles an immutable boot
+> context through an ordered stage pipeline, and dispatches to one of three runners (one-shot print,
+> NDJSON wire, or interactive REPL). The machinery lives in `indusagi.shell_app`; the console scripts
+> map to `indusagi.shell_app.cli:run`.
+
+## Table of Contents
+
+- [Invocation](#invocation)
+- [Flags](#flags)
+- [Modes](#modes)
+- [Auth Subcommand](#auth-subcommand)
+- [Environment Variables](#environment-variables)
+- [State Directory](#state-directory)
+- [Settings](#settings)
+- [Exit Codes](#exit-codes)
+- [Public API](#public-api)
+- [Programmatic Use](#programmatic-use)
+- [See Also](#see-also)
+
+## Invocation
+
+Install the package and both console scripts (`indusagi` and `pindusagi`, identical entry points)
+become available:
+
+```bash
+pip install indusagi                 # core only
+pip install "indusagi[mcp,tui]"      # add MCP server mounting + the Textual TUI
+```
+
+```bash
+pindusagi [options] [prompt...]
+```
+
+Everything after the option flags is collected into a free-text `prompt`. A bare `--` terminator
+forces every remaining token to be treated as a positional, even if it looks like a flag. The parser
+([`tokenize_invocation`](#public-api)) is pure and table-driven — there are no per-flag branches —
+and supports long (`--name`), short (`-x`), glued (`--name=value`, `-xvalue`), clustered
+(`-ip` = `-i -p`), and repeatable forms. A malformed invocation (unknown flag, missing value,
+unparseable number) is reported to stderr and exits `2`.
+
+## Flags
+
+Every flag is one declarative row in `FLAG_SPECS`; the `--help` text is generated from the same
+table. Requires Python 3.11+.
+
+| Flag | Aliases | Value | Purpose |
+|------|---------|-------|---------|
+| `--model` | `-m` | string | Choose the model to run, by catalog id or alias. |
+| `--print` | `-p` | boolean | Emit a single answer to stdout and exit (one-shot mode). |
+| `--json` | `--rpc`, `--wire` | boolean | Speak the JSON line protocol over stdio (wire mode). |
+| `--interactive` | `-i` | boolean | Force the read-eval-print loop even with a prompt present. |
+| `--cwd` | — | string | Run as if started from this working directory. |
+| `--system` | — | string | Override the system prompt with the given text. |
+| `--no-tools` | — | boolean | Disable every tool; the model may only produce text. |
+| `--mcp` | — | string (repeatable) | Attach an MCP server (see grammar below). |
+| `--help` | `-h` | boolean | Show usage and exit. |
+| `--version` | `-v` | boolean | Print the version and exit. |
+
+```bash
+export ANTHROPIC_API_KEY="sk-..."
+
+# One-shot: print a single answer and exit
+pindusagi -m claude-sonnet-4 -p "summarize the package.json in this repo"
+
+# Wire mode: speak the JSON line protocol over stdio (also --rpc / --wire)
+pindusagi -m claude-sonnet-4 --json
+
+# Interactive REPL (the default when attended with no prompt)
+pindusagi -m claude-sonnet-4
+
+# Run from elsewhere, override the system prompt, no tools
+pindusagi --cwd /repo --system "Be terse." --no-tools -p "what does this do?"
+```
+
+### `--mcp` value grammar
+
+`--mcp` is repeatable; each occurrence accumulates and attaches one external Model Context Protocol
+server. The value's shape decides the transport:
+
+- An `http(s)://` URL connects over SSE; the server id is derived from the URL hostname.
+- Anything else is `shlex.split` into a stdio command (the id is the command's basename).
+
+Server ids are de-duplicated with a numeric suffix against any servers already declared in settings.
+A faulted server is warned about but never blocks startup. MCP mounting requires the `mcp` extra.
+
+```bash
+pindusagi --mcp "python -m my_server --port 0" --mcp https://tools.example.com/sse -p "list tools"
+```
+
+## Modes
+
+The launcher derives a single `RunnerMode` from the parsed flags, the presence of a prompt, and
+whether the session is *attended* (both stdin and stdout are TTYs). Precedence, highest first:
+
+| Mode | Triggered by | Runner | Behaviour |
+|------|--------------|--------|-----------|
+| `help` | `--help` | — | Render usage from the flag table, exit `0`. |
+| `version` | `--version` | — | Print `indusagi <version>`, exit `0`. |
+| `wire` | `--json` / `--rpc` / `--wire` | `WireRunner` | Line-delimited JSON request/event/result protocol over stdio. |
+| `repl` | `--interactive`, or attended with no prompt | `ReplRunner` | Interactive loop; mounts the Textual UI when both streams are TTYs. |
+| `print` | a prompt is present, or unattended with no prompt | `OneShotRunner` | Stream the answer to stdout, then exit. |
+
+The `help` and `version` modes short-circuit without ever standing up an agent. For running modes,
+`select_runner` scans `RUNNERS` (`OneShotRunner`, `WireRunner`, `ReplRunner`) and returns the first
+whose `accepts()` matches the mode.
+
+```python
+from indusagi.shell_app import tokenize_invocation
+
+# Mode derivation in action
+assert tokenize_invocation(["--json"]).mode == "wire"
+assert tokenize_invocation([], attended=True).mode == "repl"
+assert tokenize_invocation([], attended=False).mode == "print"
+assert tokenize_invocation(["-p", "hello"]).mode == "print"
+```
+
+- **print** (`OneShotRunner`) streams assistant text deltas to stdout, then exits; a faulted run
+  exits `1`.
+- **wire** (`WireRunner`) reads one JSON request per line off a worker thread and emits
+  event/result/error lines, serialized byte-for-byte to a fixed JSON shape (camelCase field names,
+  optional fields omitted not nulled).
+- **repl** (`ReplRunner`) mounts the Textual interactive surface from
+  [`ui_bridge`](/python/ui/ui-bridge) when both streams are TTYs (requires the `tui` extra); without
+  a TTY it falls back to a plain-text line loop behind the `InteractiveView` seam.
+
+## Auth Subcommand
+
+`pindusagi auth ...` bypasses flag parsing entirely (its words would otherwise be read as a prompt)
+and dispatches to `run_auth_command`. It manages OAuth sign-ins for providers that support them; the
+resulting tokens land in the profile credential store and are never printed.
+
+| Subcommand | Args | Purpose |
+|------------|------|---------|
+| `auth login <provider>` | provider id | Start the PKCE authorization-code flow: print the auth URL, accept the pasted code, exchange it for tokens, persist them. |
+| `auth refresh <provider>` | provider id | Use a stored refresh token to mint a fresh access token, then write the rotated credentials back. |
+| `auth status [provider]` | optional provider id | Report which providers hold stored credentials (and their freshness), plus which provider API-key env vars are set (names only — never values). |
+
+```bash
+pindusagi auth status            # what's stored + which API-key env vars are set
+pindusagi auth login openai      # browser PKCE flow, paste the code back
+pindusagi auth refresh openai    # rotate the access token
+```
+
+This surface is **API-key-first for Anthropic**: `auth login anthropic` and `auth refresh anthropic`
+just print a pointer at `ANTHROPIC_API_KEY` and exit `0` — only OAuth-capable providers (currently
+`openai`) are advertised. The flow is paste-based: there is no local callback server, so you paste
+either the bare authorization code or the entire redirect URL (the `code=` parameter is extracted
+from the latter). The credential store at `~/.pindusagi/auth.json` is byte-compatible with the
+TypeScript builds' format but lives under this build's own profile directory and is never shared.
+
+## Environment Variables
+
+The CLI reads provider API keys through the gateway's `SECRET_TABLE` (the first present, non-empty
+variable per provider wins) — see [LLM Gateway](/python/subsystems/llm-gateway) for the full table.
+The common ones:
+
+| Variable | Provider |
+|----------|----------|
+| `ANTHROPIC_API_KEY` | Anthropic (the default `claude-sonnet-4` fallback) |
+| `OPENAI_API_KEY` | OpenAI |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Google |
+| `AZURE_OPENAI_API_KEY` / `AZURE_API_KEY` | Azure |
+| `NVIDIA_API_KEY` | NVIDIA |
+| `MOONSHOT_API_KEY` / `KIMI_API_KEY` | Kimi |
+
+| Variable | Effect |
+|----------|--------|
+| `INDUSAGI_HOME` | When set and non-empty, names the profile/state directory directly, superseding the default `~/.pindusagi`. |
+
+The framework reads every branded variable through a single env registry — subsystems never probe
+`os.environ` directly. Branded names are composed as `INDUSAGI_<SUFFIX>` (so `env_name("home")`
+yields `INDUSAGI_HOME`).
+
+## State Directory
+
+All per-user state lives under the profile directory, resolved by the `Locator`. The default is
+`~/.pindusagi` (override with `INDUSAGI_HOME`):
+
+| Path method | Default location | Holds |
+|-------------|------------------|-------|
+| `profile_dir()` | `~/.pindusagi/` | Root for all per-user state. |
+| `settings_path()` | `~/.pindusagi/settings.json` | Global settings. |
+| `auth_store_path()` | `~/.pindusagi/auth.json` | OAuth credential store. |
+| `sessions_dir()` | `~/.pindusagi/sessions/` | Persisted conversation sessions. |
+| `logs_dir()` | `~/.pindusagi/logs/` | Diagnostic and crash logs. |
+| `upgrade_marker_path()` | `~/.pindusagi/upgrades.json` | Idempotent-upgrade marker. |
+| `project_settings_path(cwd)` | `<project>/.pindusagi/settings.json` | Per-project overrides. |
+
+```python
+from indusagi.shell_app import Locator, BRAND
+
+loc = Locator()
+print(BRAND.bin_name)          # 'indusagi'
+print(loc.settings_path())     # ~/.pindusagi/settings.json
+print(loc.auth_store_path())   # ~/.pindusagi/auth.json
+```
+
+## Settings
+
+Settings merge from three layers, lowest precedence first: built-in `DEFAULT_SETTINGS` (collection
+`coding`), the global profile file, then the per-project file (`later wins`). A missing, unreadable,
+or malformed file contributes nothing rather than raising. On-disk JSON keys stay camelCase:
+
+| JSON key | Field | Meaning |
+|----------|-------|---------|
+| `defaultModel` | `default_model` | Model id when no `-m` override is given. |
+| `systemPrompt` | `system_prompt` | System preamble prepended to every run. |
+| `tools.collection` | `tools.collection` | Built-in tool collection: `read-only`, `coding`, or `all`. |
+| `mcpServers` | `mcp_servers` | External MCP servers connected at start-up. |
+| `compaction.triggerRatio` | `compaction.trigger_ratio` | Context-window fraction (0..1) at which history condensation triggers. |
+| `compaction.keepRecent` | `compaction.keep_recent` | Trailing turns kept untouched during condensation. |
+
+Model selection (`resolve_model_id`) layers the `-m` override over `settings.default_model` over the
+hard-coded `claude-sonnet-4` fallback; each candidate is validated against the catalog via
+`get_card`, so an unknown id is skipped rather than honored.
+
+```python
+import asyncio
+from indusagi.shell_app import Locator, load_settings, resolve_model_id
+
+loc = Locator()
+settings = asyncio.run(load_settings(loc, "."))
+print(resolve_model_id(settings, invocation_model="claude-sonnet-4"))
+```
+
+## Exit Codes
+
+| Code | Meaning |
+|------|---------|
+| `0` | Success (including `--help` / `--version` and API-key-first `auth login`). |
+| `1` | Startup failure or a faulted run. |
+| `2` | Bad usage — unparseable `argv` or an unknown `auth` subcommand. |
+| `130` | A `KeyboardInterrupt` (SIGINT) escaped the loop. |
+
+`main()` never calls `sys.exit` — it returns the code. Only the `run()` console-script shim maps it
+onto the process and translates `KeyboardInterrupt` to `130`. A `finally` always runs the boot
+context's `closables` in reverse registration order (suppressing `Exception`, never `CancelledError`)
+so MCP fleets and other resources close cleanly.
+
+## Public API
+
+`indusagi.shell_app` re-exports the entry points; `indusagi.shell` is an alias of the same package.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `main` | async function | `shell_app/cli.py` | Drive one CLI invocation to an exit code; never calls `sys.exit`. |
+| `run` | function | `shell_app/cli.py` | The sync console-script shim wired to `indusagi`/`pindusagi`; `asyncio.run(main())` then maps the code onto `sys.exit`. |
+| `build_boot_context` | async function | `shell_app/cli.py` | Assemble a runner-ready `CliBootContext` from a parsed invocation plus streams. |
+| `render_usage` | function | `shell_app/cli.py` | Build the full `--help` text from `FLAG_SPECS` and the brand name. |
+| `resolve_version` | function | `shell_app/cli.py` | Resolve the package version from `indusagi.__version__`; never raises. |
+| `CliStreams` | dataclass | `shell_app/cli.py` | The frozen input/output/error stream triple fed to runners. |
+| `CliBootContext` | dataclass | `shell_app/cli.py` | `BootContext` subclass adding the mutable `closables` teardown list. |
+| `tokenize_invocation` | function | `shell_app/invocation/parse.py` | Pure, table-driven parser: `argv` slice (+ `attended`) → `Invocation`; raises `InvocationError`. |
+| `Invocation` | dataclass | `shell_app/invocation/parse.py` | Parse result: `flags` dict, `positionals`, derived `prompt`, and the `mode`. |
+| `InvocationError` | class | `shell_app/invocation/parse.py` | Raised for unparseable `argv`; caught at the edge → exit `2`. |
+| `RunnerMode` | type | `shell_app/invocation/parse.py` | `Literal["print", "wire", "repl", "help", "version"]`. |
+| `FLAG_SPECS` | const | `shell_app/invocation/flags.py` | The canonical tuple of flag rows — the single source of CLI vocabulary. |
+| `FlagSpec` | dataclass | `shell_app/invocation/flags.py` | One flag's declarative description: name, kind, description, aliases, default, repeatable. |
+| `select_runner` | function | `shell_app/runners/registry.py` | Pick the first `Runner` whose `accepts()` is true; raises `NoRunnerError`. |
+| `RUNNERS` | const | `shell_app/runners/registry.py` | Ordered tuple `(OneShotRunner, WireRunner, ReplRunner)`. |
+| `Locator` | class | `shell_app/locate/locator.py` | Resolves every filesystem path from home/cwd + `BRAND`. Re-exported as `NodeLocator`. |
+| `BRAND` | const | `shell_app/locate/brand.py` | The frozen source of naming truth (app/bin name, env prefix, dir/file basenames). |
+| `load_settings` | async function | `shell_app/config/settings.py` | Merge defaults ← global ← project; never raises for an unreadable layer. |
+| `resolve_model_id` | function | `shell_app/config/settings.py` | Choose a model id: invocation override > `default_model` > `claude-sonnet-4`. |
+| `Settings` / `DEFAULT_SETTINGS` | dataclass | `shell_app/config/settings.py` | The user-tunable config surface and its minimal baseline. |
+| `run_auth_command` | async function | `shell_app/auth_cli/oauth_cli.py` | Entry point for the `auth` subcommand; returns `0`/`1`/`2`, never `sys.exit`. |
+| `AuthIO` | class | `shell_app/auth_cli/oauth_cli.py` | The minimal `print`/`warn`/`ask` terminal Protocol the auth command reads/writes through. |
+
+## Programmatic Use
+
+The whole CLI is callable in-process — useful for embedding or testing without spawning a subprocess.
+
+```python
+import asyncio
+from indusagi.shell_app import main
+
+# Equivalent to: pindusagi --print "explain this repo"
+exit_code = asyncio.run(main(["--print", "explain", "this", "repo"]))
+print("exited with", exit_code)
+```
+
+Assemble a boot context and select a runner by hand, running the teardown closables yourself:
+
+```python
+import asyncio, sys
+from indusagi.shell_app import (
+    tokenize_invocation, build_boot_context, CliStreams, select_runner,
+)
+
+async def drive():
+    inv = tokenize_invocation(["--print", "hi"], attended=False)
+    ctx = await build_boot_context(
+        inv, CliStreams(input=sys.stdin, output=sys.stdout, error=sys.stderr)
+    )
+    try:
+        runner = select_runner(inv)        # OneShotRunner accepts mode 'print'
+        return await runner.run(ctx)
+    finally:
+        for close in reversed(list(ctx.closables)):
+            await close()
+
+asyncio.run(drive())
+```
+
+Run the `auth status` subcommand with a scripted `AuthIO`:
+
+```python
+import asyncio
+from indusagi.shell_app import run_auth_command
+
+class CaptureIO:
+    def __init__(self): self.lines = []
+    def print(self, line): self.lines.append(line)
+    def warn(self, line): self.lines.append("WARN: " + line)
+    async def ask(self, prompt): return ""
+
+io = CaptureIO()
+code = asyncio.run(run_auth_command(["status"], io))
+print(code, io.lines)
+```
+
+## See Also
+
+- [Shell App](/python/subsystems/shell-app) — the full architecture of the command-line front door.
+- [Runtime](/python/subsystems/runtime) — the agent the runners drive.
+- [LLM Gateway](/python/subsystems/llm-gateway) — model cards, the `SECRET_TABLE`, and OAuth helpers.
+- [Interop](/python/subsystems/interop) — MCP server mounting behind `--mcp`.
+- [UI Bridge](/python/ui/ui-bridge) — the Textual interactive surface mounted in `repl` mode.
+- [Getting Started](/python/getting-started) — install and first run.
+- [Package Exports](/python/reference/package-exports) — the full public surface.

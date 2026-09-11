@@ -1,0 +1,95 @@
+# Streaming Model
+
+`stream` and `streamSimple` return an `AssistantMessageEventStream`, which is an
+async iterable of events. The stream is produced by provider adapters and
+normalized to a single event vocabulary.
+
+The stream/complete contract is implemented in `src/facade/ml/stream.ts`; the
+event stream class lives in `src/facade/ml/kit/event-stream.ts`.
+
+## Dispatch
+
+`stream(model, context, options?, logger?)` does the following before handing off
+to a backend:
+
+1. `validateContext(context)` checks message and tool shapes.
+2. The model descriptor is shape-checked (`api`, `id`, `provider` must be non-empty strings).
+3. `getApiProvider(model.api)` resolves the registered backend, throwing if none is wired in.
+4. An optional `logger.debug` trace (`ai.stream.start`) is emitted.
+5. The backend's `stream` (or `streamSimple`) method runs.
+
+`complete` and `completeSimple` are thin wrappers that await `result()`.
+`streamByApi(api, model, ...)` throws on an `api` / `model.api` mismatch, then delegates to `stream`.
+
+## Event Types
+
+`AssistantMessageEvent` (in `src/facade/ml/types.ts`) is a discriminated union:
+
+- `start` with a partial `AssistantMessage`.
+- `text_start`, `text_delta`, `text_end` for text blocks (carry `contentIndex`).
+- `thinking_start`, `thinking_delta`, `thinking_end` for reasoning blocks.
+- `toolcall_start`, `toolcall_delta`, `toolcall_end` for tool calls.
+- `done` with `reason` (`"stop" | "length" | "toolUse"`) and the final `message`.
+- `error` with `reason` (`"aborted" | "error"`) and an `error` assistant message.
+
+## Event Order
+
+A typical streaming response:
+
+- `start`
+- zero or more block events, in any order
+- `done` or `error`
+
+Tool-call events can interleave with text or thinking blocks depending on the
+provider. The final message can contain multiple blocks in `message.content`.
+
+## Result Handling
+
+`AssistantMessageEventStream` extends the generic `EventStream<T, R>`. It settles
+its result on the first `done` (resolving to `message`) or `error` (resolving to
+`error`). Useful methods:
+
+- `result()` resolves to the final `AssistantMessage`.
+- `resultWithTimeout(timeoutMs)` rejects if no terminal event arrives in time.
+- `filter(predicate)` and `map(mapper)` return derived async iterables.
+- `getHistory()` returns buffered events (bounded by `historyLimit`).
+
+Producers push events with `push(event)` or the typed helpers (`pushStart`,
+`pushTextDelta`, `pushToolCallEnd`, `pushDone`, `pushError`, etc.).
+`createAssistantMessageEventStream(options?)` constructs a fresh instance.
+
+## Tool Calls
+
+Tool calls are represented as content blocks:
+
+- `ToolCall` carries `id`, `name`, `arguments`, and an optional Gemini
+  `thoughtSignature`.
+- Streamed argument fragments are parsed best-effort with `parseStreamingJson`.
+
+Adapters internally normalize messages through `transformMessages` (in
+`src/facade/ml/adapters/transform-messages.ts`) before sending — normalizing
+tool-call ids, stripping signatures other providers cannot replay, and inserting
+synthetic results for orphaned tool calls. `transformMessages` is an internal
+adapter helper and is not re-exported from `indusagi/ai`.
+
+## Aborts
+
+All streaming functions accept an `AbortSignal` via `StreamOptions.signal`.
+Providers check the signal and surface it as `stopReason: "aborted"` (an `error`
+event with `reason: "aborted"`).
+
+## Reasoning and Thinking
+
+`streamSimple`/`completeSimple` take `SimpleStreamOptions`, which add `reasoning`
+(a `ThinkingLevel`: `"minimal" | "low" | "medium" | "high" | "xhigh"`) and an
+optional `thinkingBudgets` override. Adapters map these through the helpers in
+`src/facade/ml/adapters/simple-options.ts`:
+
+- `buildBaseOptions(model, options?, apiKey?)` derives the base request options,
+  bounding `maxTokens` by the model's max and a 32,000-token ceiling.
+- `clampReasoning(level)` collapses `"xhigh"` to `"high"` for providers that do
+  not support it.
+- `mapThinkingLevel(level, "supports-xhigh" | "clamp-xhigh")` chooses whether to
+  preserve or clamp `"xhigh"`.
+- `adjustMaxTokensForThinking(...)` reserves token headroom for the visible answer
+  when a reasoning budget is applied.

@@ -1,0 +1,305 @@
+# Addons
+
+> The addon system is `induscode`'s frozen-contract extension layer — it discovers, imports, and folds locally-authored Python modules under a workspace's `.indus/addons` directory into a single wired runtime of lifecycle hooks, tool-boundary interceptors, slash commands, and contributed tools, with every fault isolated so one broken addon never crashes the agent. Reach it with `from induscode.addons import create_addon_host`; it is currently a built-but-unwired capability layer exported through the package barrel (`induscode.addons`).
+
+An addon is a plain `.py` module (or a package directory holding `__init__.py`) that exposes a single `register(surface)` entry point. The defining stance is **return-a-manifest registration**: `register` only *records* its intent onto a per-addon surface; it never mutates global agent state. The host reads each addon's `RegisteredManifest` back out and folds the four contribution streams — subscriptions, interceptors, commands, tools — into one shared, conflict-resolved registry, then builds the dispatch and interception runtimes over it. Every failure path (load, register, handler, command, conflict) is captured as a typed `AddonFault` routed to listeners rather than raised.
+
+## Table of Contents
+
+- [Layout and Reachability](#layout-and-reachability)
+- [Authoring an Addon](#authoring-an-addon)
+- [The Registration Surface](#the-registration-surface)
+- [Discovery and Loading](#discovery-and-loading)
+- [Hosting Addons](#hosting-addons)
+- [The Event Dispatcher](#the-event-dispatcher)
+- [The Tool Interceptor Chain](#the-tool-interceptor-chain)
+- [Slash Commands and Framework Handles](#slash-commands-and-framework-handles)
+- [Faults](#faults)
+- [Public Surface](#public-surface)
+- [Notes and Parity](#notes-and-parity)
+
+## Layout and Reachability
+
+The subsystem lives under `src/induscode/addons/` and is built in three layers, all written against one frozen type seam (`contract.py`):
+
+| Module | Role |
+|--------|------|
+| `contract.py` | The frozen type surface every other module is written against — manifests, the event taxonomy, interceptor shapes, capability types, faults, the loader/discovery Protocols. Composes (never re-declares) framework anchors. |
+| `loader.py` | The default importlib-backed `ModuleLoader` plus path-hygiene helpers (`scrub_invisible`, `expand_path`, `resolve_path`). |
+| `manifest.py` | Filesystem discovery — scan a `.indus/addons` directory, fold an `AddonDiscovery` config into id-stamped `AddonSource` records. |
+| `surface.py` | The recording registration API (`RecordingSurface` / `create_surface`). |
+| `dispatch/event_dispatcher.py` | The `AddonEventDispatcher` (observe / transform / gate) plus the `EVENT_TRAITS` table, the derived `RESERVED_EVENTS`, and the `subscription` minter. |
+| `dispatch/tool_interceptor.py` | The `AddonInterceptorChain` (enter / exit onion) plus the `interceptor` minter. |
+| `host.py` | The assembly point — discover, load, register, fold; build and wire the runtimes. |
+
+The barrel re-exports the full surface, and the top-level package registers it as a lazy submodule (`src/induscode/__init__.py` maps `"addons": "addons"`):
+
+```python
+import induscode.addons as addons
+from induscode.addons import create_addon_host, FrameworkHandles
+```
+
+As checked in, the layer has a standalone test suite (`tests/addons/test_addons.py`, 14 tests) but is **not yet wired** into any agent-session, console, or tool-execution call site — see [Notes and Parity](#notes-and-parity).
+
+## Authoring an Addon
+
+Drop a `.py` file (or a package directory holding `__init__.py`) under `<workspace>/.indus/addons/`. The module exposes a callable `register`; two optional attributes (`id`, `version`) are duck-read by the host — when `id` is omitted it is derived from the path.
+
+```python
+# <workspace>/.indus/addons/redact.py
+# Recorded onto the surface; never mutates global state.
+from induscode.addons import (
+    CommandSpec, GateDecision, ObserveHandler, InterceptorStage,
+)
+
+id = "redact"          # optional; else derived from the path
+version = "1.0.0"      # optional
+
+def register(surface):
+    # Observe every tool call (fire-and-forget)
+    surface.on("tool:before", ObserveHandler(lambda p: print("tool about to run", p)))
+
+    # Block a tool's args by name via an enter stage
+    def enter(ctx):
+        if "secret" in ctx.args:
+            return GateDecision(stop=True, reason="blocked secret arg")
+        return None
+    surface.intercept_tool("shell", InterceptorStage(enter=enter))
+
+    # Contribute a slash command (an effect, not a console state transition)
+    surface.add_command("hello", CommandSpec(
+        summary="say hi",
+        run=lambda cctx: print("hi from", cctx.cwd),
+    ))
+```
+
+`register` may be synchronous or `async`; the host awaits it either way. Any raise from `register` is captured as a `register` fault and the addon contributes nothing — it never aborts the others.
+
+## The Registration Surface
+
+The host hands each addon a fresh `AddonSurface` (concrete: `RecordingSurface`) scoped to that addon's `AddonId` and the session's `FrameworkHandles`. Each method *records* a contribution; nothing dispatches, loads, or resolves conflicts at this stage.
+
+| Method | Records |
+|--------|---------|
+| `surface.on(event, handler)` | An `EventSubscription` — a `HookHandler` bound to a colon-named `HookEvent`. |
+| `surface.intercept_tool(name, stage)` | A `ToolInterceptor` — an `InterceptorStage` (enter/exit) for a tool name or `"*"`. |
+| `surface.add_command(name, spec)` | An `AddonCommand` from a `CommandSpec` (summary + run). |
+| `surface.add_tool(card)` | A framework `AgentTool` supplied directly (not wrapped). |
+| `surface.manifest()` | The accumulated `RegisteredManifest` — read back by the host to fold. |
+| `surface.id` / `surface.handles` | The scoped `AddonId` and read-only `FrameworkHandles`. |
+
+The surface stamps each recorded shape with the owning `AddonId` (so a later fault is attributable) and fills the `match` / `name` provenance fields the methods take separately from the handler object. `manifest()` returns an **immutable snapshot** — a frozen dataclass over tuples — so a stray later surface call cannot retroactively alter a manifest the host has already read.
+
+## Discovery and Loading
+
+`discover_sources(AddonDiscovery)` walks `<workspace>/.indus/addons` one level deep via `discover_addons`, recognizing exactly two shapes — a bare `*.py` file, or a directory holding `__init__.py`. Hidden entries (dot-files and dot-directories, including `__pycache__`) are skipped, results are sorted for a deterministic load order, then any `explicit_paths` are concatenated, duplicates collapsed (first wins), and each surviving path stamped with a derived `AddonId` into an `AddonSource`.
+
+```python
+from induscode.addons import AddonDiscovery, discover_sources, ADDONS_DIR
+
+print(ADDONS_DIR)   # '.indus/addons'  (verbatim from the lineage, NOT '.indusagi')
+
+cfg = AddonDiscovery(
+    workspace="/abs/path/to/workspace",
+    explicit_paths=["/abs/path/to/always-on.py"],
+)
+for src in discover_sources(cfg):
+    print(src.id, src.path)
+```
+
+A source is *where* (the absolute entry path + a derived id); a manifest is *what* the loaded module declares. Loading is abstracted behind the injectable `ModuleLoader` Protocol — `async load(path) -> AddonManifest`. The default (`create_module_loader()`) is importlib-backed: it normalizes the path through `resolve_path` (`scrub_invisible` + `expand_path` + abspath), spec-loads the module under a *fresh synthetic module name* so an edited addon re-executes on the next load, and accepts a module-level `register` or a `manifest`/`default` object exposing one (copying `id`/`version` only if they are strings). A test injects a scripted fake instead — no real import, no disk:
+
+```python
+from induscode.addons import create_addon_host, AddonSource, addon_id
+
+class FakeLoader:
+    def __init__(self, table): self.table = table
+    async def load(self, path):
+        return self.table[path]   # an object with .register / optional .id/.version
+
+host = create_addon_host(loader=FakeLoader({"/x": my_manifest}))
+await host.load_one(AddonSource(id=addon_id("x"), path="/x"))
+```
+
+The default loader leaves the synthetic module registered in `sys.modules` (popped only on exec failure) — required for dataclass and relative-import machinery during exec.
+
+## Hosting Addons
+
+`create_addon_host(...)` is the single sanctioned entry point. Every dependency is optional with a live default — production code passes nothing (or just `handles`); a test overrides exactly the seam it needs.
+
+| Parameter | Default | Purpose |
+|-----------|---------|---------|
+| `loader` | importlib-backed | The `ModuleLoader` turning a source path into an `AddonManifest`. |
+| `handles` | empty `FrameworkHandles` | Threaded into every addon surface and command context. |
+| `dispatcher` | `AddonEventDispatcher.from_subscriptions` | How the dispatcher is built from folded subscriptions. |
+| `chain` | `AddonInterceptorChain.from_interceptors` | How the interceptor chain is built from folded interceptors. |
+| `reserved_actions` | `help quit exit clear model compact` | Core command names addon commands may not shadow. |
+
+`load_all(where)` discovers, loads, registers, and folds every addon, then returns the wired `AddonSurfaceBundle`. A bare string is treated as the workspace whose `.indus/addons` is scanned; an `AddonDiscovery` is passed through unchanged. `on_fault(listener)` is the single fault stream — registered before `load_all` it captures load-time faults, and the runtimes built by `load_all` are wired into the same sink so later dispatch/chain faults reach the same listeners.
+
+```python
+import asyncio
+from induscode.addons import create_addon_host, FrameworkHandles
+
+async def main():
+    host = create_addon_host(handles=FrameworkHandles(
+        send_message=lambda m: print(m),
+    ))
+    host.on_fault(lambda f: print("addon fault", f.kind, f.message, f.addon))
+
+    bundle = await host.load_all("/abs/path/to/workspace")  # scans .indus/addons
+    print("loaded:", bundle.loaded)
+    print("commands:", [c.name for c in bundle.commands])
+    # Wire bundle.dispatch into agent event points,
+    # bundle.interceptors into the tool boundary.
+
+asyncio.run(main())
+```
+
+The fold preserves registration order across addons, so the dispatcher's middleware order and the chain's onion order equal load order. Subscriptions and interceptors are appended unconditionally; commands and tools are name-checked against the claimed sets (commands seeded with the 6 reserved names) — a clash drops the contribution with a `conflict` fault, first claimant wins (tools dedupe on `AgentTool.name`). `host.registry` exposes the merged `AddonRegistry` at any point; the `AddonSurfaceBundle` exposes `dispatch`, `interceptors`, `commands`, `tools`, and `loaded`.
+
+## The Event Dispatcher
+
+`AddonEventDispatcher` is one fan-out / transform / veto engine over the unified colon-named event taxonomy — it replaces a split lifecycle-bus + mutation-hooks system. A subscription's handler kind selects its behavior:
+
+- **`ObserveHandler`** — fire-and-forget; sees the payload untouched, returns nothing, cannot alter or veto.
+- **`TransformHandler`** — returns a replacement payload threaded forward into every later handler and back to the caller.
+- **`GateHandler`** — returns a `GateDecision`; the first `stop=True` short-circuits the walk into `DispatchOutcome.gate`.
+
+The `HookEvent` vocabulary is colon-segmented (`scope:phase`):
+
+| Event | Gate-bearing | Meaning |
+|-------|--------------|---------|
+| `session:start` / `session:end` | — | A session opened / closed. |
+| `turn:start` / `turn:end` | — | An assistant turn began / settled. |
+| `tool:before` / `tool:after` | `tool:before` | Straddle a single tool execution. |
+| `chat:params` | — | The model request options are being built. |
+| `chat:message` | — | An assistant message was assembled. |
+| `shell:env` | — | The environment for a shell action is being prepared. |
+| `input:submit` | yes | User input is entering the loop. |
+| `context:build` | — | The message context is being assembled. |
+| `compact:build` | — | The condensed summary is being built. |
+| `compact:before` | yes | The transcript is about to be condensed. |
+
+```python
+import asyncio
+from induscode.addons import (
+    AddonEventDispatcher, subscription, addon_id, TransformHandler,
+)
+
+A = addon_id("demo")
+disp = AddonEventDispatcher.from_subscriptions([
+    subscription(A, "chat:params", TransformHandler(lambda p: {**p, "temperature": 0})),
+])
+
+async def run():
+    out = await disp.dispatch("chat:params", {"model": "x"})
+    print(out.payload, out.gate)   # transformed payload, no gate
+
+asyncio.run(run())
+```
+
+The **gate-bearing** (reserved) set is *data-sourced*: `RESERVED_EVENTS` is derived at import from the `EVENT_TRAITS.guards` table — reclassifying an event is a one-row edit, not a parallel literal to keep in sync. The dispatcher exposes it as `.reserved`. Note the deliberate decoupling: `dispatch` reports `DispatchOutcome.gate` for *any* event a gate handler vetoes; only `RESERVED_EVENTS` (`tool:before`, `input:submit`, `compact:before`) are the ones the host is *expected* to act on.
+
+Faults fail safe: a handler raise becomes a `handler` fault routed to listeners and is swallowed — `observe`/`transform` continue with the prior payload, and a **gate that raises fails open** (no veto), so an erroring guard never wedges the agent.
+
+## The Tool Interceptor Chain
+
+`AddonInterceptorChain` folds the matching `ToolInterceptor` stages around a single tool execution as a reduce. A stage's `match` is an exact tool name or `"*"`:
+
+1. **enter, forward.** Each matching stage's `enter` runs in registration order. It may rewrite the decoded args (`ArgsRewrite`) or block the call (`GateDecision(stop=True)`). A block short-circuits: no later enter runs, the tool never executes, and the result carries `blocked`.
+2. **execute, once.** With the final args, the real `ExecuteFn` is invoked exactly once.
+3. **exit, reverse.** Each matching stage's `exit` runs in *reverse* order (onion ordering — the first-entered stage wraps outermost). A stage may rewrite the `AgentToolResult`.
+
+```python
+import asyncio
+from induscode.addons import (
+    AddonInterceptorChain, interceptor, addon_id,
+    InterceptorStage, ArgsRewrite, ToolEnterContext,
+)
+
+A = addon_id("demo")
+chain = AddonInterceptorChain.from_interceptors([
+    interceptor(A, "shell", InterceptorStage(
+        enter=lambda c: ArgsRewrite(args={**c.args, "safe": True}),
+    )),
+])
+
+async def run():
+    res = await chain.run(
+        ToolEnterContext(tool="shell", call_id="1", args={"cmd": "ls"}),
+        execute=lambda args: _fake_result(args),   # ExecuteFn -> AgentToolResult
+    )
+    print(res.result, res.blocked)
+
+asyncio.run(run())
+```
+
+A raise from any `enter`/`exit` stage is isolated into a `handler` fault and treated as a no-op for that stage. An error *from the real tool* is not swallowed: it is offered to the exit stages via `ToolExitContext.error` and re-raised unless an exit stage returns a replacement `AgentToolResult` (a deliberate recovery). `_read_enter` tolerates both the typed dataclasses and plain mappings carrying `stop`/`args` keys, mirroring the TS structural guards.
+
+## Slash Commands and Framework Handles
+
+Addon commands are deliberately a *different* shape from the console's `SlashCommand` — they describe an **effect**, not a console state transition. An `AddonCommand` carries a `name` (the invocation token, no leading slash), a one-line `summary`, and a `run` callback over a `CommandContext` (parsed `args` string, `cwd`, and `FrameworkHandles`). The model never calls a command; the user does, by name.
+
+The `FrameworkHandles` bag is the controlled channel an addon acts through instead of importing agent internals. Every handle is optional — a print/JSON run mode supplies fewer than an interactive TUI:
+
+| Handle | Effect |
+|--------|--------|
+| `send_message(str)` | Inject an assistant-visible message into the active turn. |
+| `set_model(str)` | Switch the active model by canonical id. |
+| `set_thinking(level)` | Adjust the reasoning-effort level for subsequent turns. |
+| `render(component)` | Render an ephemeral TUI component (absent outside interactive mode). |
+| `exec(str)` | Run a shell command and resolve its captured `ExecOutcome` (stdout/stderr/code). |
+
+These handles and the colon `HookEvent` taxonomy are the intended integration points with the [conductor](/python-cli/subsystems/conductor) session, the [console](/python-cli/console/overview), and the tool boundary.
+
+## Faults
+
+`AddonFault` is a frozen *record* (not an `Exception` subclass) — faults are always routed to `on_fault` listeners and swallowed, never raised into the agent loop. A throwing fault listener is itself guarded so fan-out continues. The closed set of kinds:
+
+| Kind | Raised when |
+|------|-------------|
+| `load` | Resolving/importing an addon module failed. |
+| `register` | An addon's `register` entry point raised. |
+| `handler` | An event handler or interceptor stage raised at runtime. |
+| `command` | A slash command handler raised. |
+| `conflict` | Two addons claimed the same command name, or a tool id, or an addon claimed a reserved action name. |
+
+Construct one with `addon_fault(kind, message, addon=..., cause=...)`; each carries optional originating-addon provenance and an underlying `cause`.
+
+## Public Surface
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `create_addon_host` | function | `host.py` | Build an `AddonHost`; all deps optional with live defaults. |
+| `AddonHost` | class | `host.py` | Assembly point — `load_all(where)`, `load_one(source)`, `on_fault`, `registry`. |
+| `AddonRegistry` | dataclass | `host.py` | Merged conflict-resolved registry (subscriptions/interceptors/commands/tools). |
+| `AddonSurfaceBundle` | dataclass | `host.py` | The wired runtime `load_all` produces (`dispatch`, `interceptors`, `commands`, `tools`, `loaded`). |
+| `AddonSurface` | Protocol | `contract.py` | Registration API `register` receives (`on`/`intercept_tool`/`add_command`/`add_tool`/`manifest`). |
+| `RecordingSurface` / `create_surface` | class / function | `surface.py` | The concrete per-addon recording surface and its minter. |
+| `AddonManifest` | Protocol | `contract.py` | What an addon module provides: a `register` plus duck-read `id`/`version`. |
+| `RegisteredManifest` / `empty_manifest` | dataclass / function | `contract.py` | Frozen read-back of recorded contributions, and its empty seed. |
+| `ModuleLoader` / `create_module_loader` | Protocol / function | `contract.py` / `loader.py` | The injectable load seam and the default importlib loader. |
+| `scrub_invisible` / `expand_path` / `resolve_path` | function | `loader.py` | Path-hygiene helpers. |
+| `discover_addons` / `discover_sources` | function | `manifest.py` | Scan one directory; fold an `AddonDiscovery` into id-stamped sources. |
+| `AddonDiscovery` / `AddonSource` / `ADDONS_DIR` | dataclass / dataclass / const | `contract.py` | Discovery config, one discovered source, the `'.indus/addons'` default. |
+| `AddonEventDispatcher` / `subscription` | class / function | `dispatch/event_dispatcher.py` | The dispatch runtime and its subscription minter. |
+| `EVENT_TRAITS` / `RESERVED_EVENTS` / `EventTrait` | const / const / dataclass | `dispatch/event_dispatcher.py` | The per-event trait table and the derived gate-bearing set. |
+| `AddonInterceptorChain` / `interceptor` | class / function | `dispatch/tool_interceptor.py` | The tool-boundary runtime and its interceptor minter. |
+| `HookEvent` / `HookKind` / `HookHandler` | type | `contract.py` | The event vocabulary, middleware kinds, and the discriminated handler union. |
+| `ObserveHandler` / `TransformHandler` / `GateHandler` | dataclass | `contract.py` | The three frozen handler dataclasses with `ClassVar` `kind` tags. |
+| `GateDecision` / `DispatchOutcome` / `EventSubscription` | dataclass | `contract.py` | A veto, a dispatch result, one recorded subscription. |
+| `ToolInterceptor` / `InterceptorStage` / `ToolEnterContext` / `ToolExitContext` | dataclass | `contract.py` | The interceptor, its enter/exit pair, and the enter/exit contexts. |
+| `ArgsRewrite` / `InterceptResult` | dataclass | `contract.py` | The args-replacement enter outcome and the chain's run result. |
+| `AddonCommand` / `CommandSpec` / `CommandContext` / `FrameworkHandles` / `ExecOutcome` | dataclass | `contract.py` | Slash-command types and the framework-handles bag. |
+| `AddonTool` | type | `contract.py` | Alias of framework `AgentTool` — supplied directly, not wrapped. |
+| `AddonId` / `addon_id` | type / function | `contract.py` | Branded addon identifier and its minter. |
+| `AddonFault` / `AddonFaultKind` / `AddonFaultListener` / `addon_fault` | dataclass / type / type / function | `contract.py` | The typed failure record, its kinds, listener type, and minter. |
+| `BUNDLED_NAMESPACES` / `Schema` | const / type | `contract.py` | Vestigial parity vocabulary; a JSON-schema mapping stand-in. |
+
+## Notes and Parity
+
+- **Built on the framework, not duplicating it.** `contract.py` composes (never re-declares) `AgentTool` / `AgentToolResult` / `ThinkingLevel` from [`indusagi.agent`](/python/facades/agent), `AgentMessage` / `Model` from [`indusagi.ai`](/python/facades/ai) (note `AgentMessage` lives in `.ai`, not `.agent`), and `Component` / `KeyId` from [`indusagi.tui`](/python/ui/tui) — all re-exported through the barrel. `AddonTool` is a plain alias of the framework's `AgentTool`, so the agent loop consumes contributed tools directly.
+- **Onion ordering is load-order-driven** with no priority field: a gate registered earlier wins over a transform registered later, and an interceptor's exit runs in reverse so the first-entered stage wraps outermost. The host controls precedence purely through load order.
+- **The clean-room Python port drops the TS lineage's sandbox.** The jiti / virtual-module bridge is gone — Python addons are plain modules and `import indusagi.*` just works. `BUNDLED_NAMESPACES` is explicitly *vestigial* (parity/introspection only; no code consumes it), the `package.json indusAddon` pointer + `index.*` probing collapse to the `__init__.py` rule, `@sinclair/typebox` becomes the plain `Schema` mapping, `ENTRY_EXTENSIONS` collapses to `('.py',)`, and `ADDONS_DIR` is verbatim `'.indus/addons'`. See [parity](/python-cli/reference/parity) for the full TS-to-Python map.
+- **Biggest gap: not yet consumed.** As checked in, the subsystem is exported via the lazy package barrel (`induscode.addons`) and exercised by `tests/addons/test_addons.py` (14 tests), but it is not yet wired into any agent-session, console, or tool-execution call site. It is a built-but-unwired capability layer; the `FrameworkHandles` bag and the `HookEvent` taxonomy mark the intended integration seams.

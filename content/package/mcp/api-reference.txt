@@ -1,0 +1,599 @@
+# MCP Module - API Reference
+
+Two import sites cover MCP in indusagi:
+
+- `indusagi/mcp` — the self-contained MCP implementation (`src/facade/mcp.ts` → `src/facade/mcp-core/`).
+- `indusagi/interop` — the SDK-backed protocol bridge (`src/interop/`), built on `@modelcontextprotocol/sdk`.
+
+Every symbol below is exported from one of those two subpaths. Both halves are documented here.
+
+---
+
+## Part 1 — `indusagi/mcp`
+
+All of the following are re-exported by `src/facade/mcp.ts` from `src/facade/mcp-core/index.ts`.
+
+### Classes
+
+#### MCPClient
+Source: `src/facade/mcp-core/client.ts`. One connection to one server (stdio subprocess or HTTP).
+
+```typescript
+class MCPClient {
+  readonly serverName: string;
+  readonly config: MCPServerConfig;
+  readonly timeout: number;
+  get connected(): boolean;
+  get roots(): MCPRoot[];
+
+  constructor(options: MCPClientOptions);
+
+  connect(): Promise<void>;
+  disconnect(): Promise<void>;
+
+  listTools(): Promise<MCPToolDefinition[]>;
+  callTool(name: string, args: Record<string, unknown>): Promise<MCPToolCallResult>;
+
+  listResources(): Promise<MCPResource[]>;
+  readResource(uri: string): Promise<unknown>;
+  subscribeResource(uri: string): Promise<void>;
+  unsubscribeResource(uri: string): Promise<void>;
+
+  listPrompts(): Promise<MCPPrompt[]>;
+  getPrompt(name: string, args?: Record<string, unknown>): Promise<unknown>;
+
+  setRoots(roots: MCPRoot[]): Promise<void>;
+  setResourceUpdatedHandler(handler: (params: { uri: string }) => void): void;
+  setResourceListChangedHandler(handler: () => void): void;
+  setPromptListChangedHandler(handler: () => void): void;
+  setElicitationHandler(handler: MCPElicitationHandler): void;
+  setProgressHandler(handler: MCPProgressHandler): void;
+}
+```
+
+Notes:
+- Identity reported on `connect()` is `{ name: "new_indusvx", version: "1.0.0" }`; protocol version `"2024-11-05"`.
+- Default request timeout is 60000 ms; stdio servers are given ~500 ms to start.
+- `connect()` is idempotent (returns the in-flight or existing connection).
+
+#### MCPClientPool
+Source: `src/facade/mcp-core/client-pool.ts`.
+
+```typescript
+class MCPClientPool {
+  constructor(options: MCPClientPoolOptions);
+
+  connectAll(): Promise<void>;        // per-server errors are logged, not thrown
+  disconnectAll(): Promise<void>;
+
+  getClient(name: string): MCPClient | undefined;
+  getAllClients(): MCPClient[];
+  isConnected(name: string): boolean;
+
+  getStatus(): Promise<MCPServerStatus[]>;   // async
+  listAllTools(): Promise<Record<string, MCPToolDefinition[]>>;
+  listAllResources(): Promise<Record<string, MCPResource[]>>;
+  listAllPrompts(): Promise<Record<string, MCPPrompt[]>>;
+
+  reload(): Promise<void>;
+  addServer(config: MCPConnectionOptions): Promise<boolean>;
+  removeServer(name: string): Promise<boolean>;
+}
+```
+
+#### MCPServer
+Source: `src/facade/mcp-core/server.ts`. Exposes `AgentTool`s as an MCP server over stdio.
+
+```typescript
+class MCPServer {
+  readonly name: string;
+  readonly version: string;
+
+  constructor(options: MCPServerOptions);
+
+  startStdio(): Promise<void>;        // reads stdin, writes stdout; never resolves
+  stop(): Promise<void>;
+
+  addTool(tool: AgentTool<any>): void;
+  removeTool(name: string): boolean;
+  listTools(): MCPConvertedTool[];   // MCPConvertedTool is an internal type, not exported from indusagi/mcp
+}
+```
+
+Server handles `initialize`, `tools/list`, `tools/call`; answers `resources/list` and `prompts/list` with empty lists. Protocol logging goes to stderr to keep stdout clean for the protocol. (`MCPConvertedTool` — `{ name, description?, inputSchema, outputSchema?, execute }` — is defined privately in `server.ts`; the `listTools()` return is internal-only and not part of the exported type surface.)
+
+### Functions
+
+#### initializeMCP
+```typescript
+async function initializeMCP(
+  registry: ToolRegistry,   // from indusagi/agent
+  cwd?: string,             // defaults to process.cwd()
+): Promise<{ pool: MCPClientPool; toolCount: number }>;
+```
+Loads config, connects all servers, registers each client's tools into `registry`. Returns the pool and total tool count.
+
+#### createMCPServer
+```typescript
+function createMCPServer(options: MCPServerOptions): MCPServer;
+```
+
+#### registerMCPToolsInRegistry
+```typescript
+async function registerMCPToolsInRegistry(
+  registry: ToolRegistry,
+  client: MCPToolClient,
+  tools: MCPToolDefinition[],
+): Promise<number>;   // count of tools registered
+```
+Each tool is registered under the namespaced name `${client.serverName}_${tool.name}` with `category: "mcp"`.
+
+#### createMCPAgentToolFactory
+```typescript
+function createMCPAgentToolFactory(
+  mcpTool: MCPToolDefinition,
+  client: MCPToolClient,
+): () => AgentTool<TSchema, MCPToolCallResult>;
+```
+
+#### createMCPToolsMap
+```typescript
+function createMCPToolsMap(
+  tools: MCPToolDefinition[],
+  client: MCPToolClient,
+): Map<string, AgentTool<TSchema, MCPToolCallResult>>;
+```
+
+#### createMCPToolsRecord
+```typescript
+function createMCPToolsRecord(
+  tools: MCPToolDefinition[],
+  client: MCPToolClient,
+): Record<string, AgentTool<TSchema, MCPToolCallResult>>;
+```
+
+Note: in `createMCPToolsMap`, `createMCPToolsRecord`, and `createMCPAgentToolFactory`, the argument order is `(tools|mcpTool, client)` — tool(s) first, client second.
+
+#### Schema conversion (`src/facade/mcp-core/schema-converter.ts`)
+```typescript
+function jsonSchemaToTypeBox(schema: JSONSchema): TSchema;
+function applyPassthrough(schema: TSchema): TSchema;
+function convertMCPInputSchema(inputSchema: Record<string, unknown>): TSchema;
+function convertMCPOutputSchema(outputSchema: Record<string, unknown> | undefined): TSchema | undefined;
+```
+`convertMCPInputSchema` = `jsonSchemaToTypeBox` then `applyPassthrough`.
+
+#### Configuration (`src/facade/mcp-core/config.ts`)
+```typescript
+function loadMCPConfig(configPathOrCwd?: string): MCPConnectionOptions[];
+function getUserConfigPath(): string;       // $XDG_CONFIG_HOME/indusvx/mcp.json
+function getProjectConfigPath(cwd?: string): string;  // <cwd>/.indusvx/mcp.json
+function ensureUserConfigDir(): string;
+function ensureProjectConfigDir(cwd?: string): string;
+function saveConfig(path: string, config: MCPConfigFile): void;
+function saveUserConfig(config: MCPConfigFile): void;
+function saveProjectConfig(config: MCPConfigFile, cwd?: string): void;
+function createDefaultConfig(): MCPConfigFile;     // { servers: [] }
+const EXAMPLE_CONFIG: MCPConfigFile;
+```
+
+### Error Handling (`src/facade/mcp-core/errors.ts`)
+
+```typescript
+class MCPError extends Error {
+  readonly code: MCPErrorCode;
+  readonly details?: unknown;
+  readonly serverName?: string;
+  readonly toolName?: string;
+  constructor(
+    message: string,
+    code: MCPErrorCode,
+    details?: unknown,
+    options?: { serverName?: string; toolName?: string; cause?: Error },
+  );
+  toJSON(): Record<string, unknown>;
+  toString(): string;
+}
+
+function isMCPError(error: unknown): error is MCPError;
+function isSessionError(error: unknown): boolean;  // true for SESSION_ERROR or NOT_CONNECTED
+
+// Error factories:
+function createConnectionError(serverName: string, cause?: Error): MCPError;
+function createTimeoutError(operation: string, serverName?: string): MCPError;
+function createToolNotFoundError(toolName: string, serverName?: string): MCPError;
+function createInvalidParametersError(toolName: string, details: unknown, serverName?: string): MCPError;
+function createServerError(message: string, serverName?: string, details?: unknown): MCPError;
+function createNotConnectedError(serverName?: string): MCPError;
+function createConfigError(message: string, details?: unknown): MCPError;
+function createSchemaConversionError(toolName: string, details: unknown, serverName?: string): MCPError;
+```
+
+#### MCPErrorCode
+```typescript
+enum MCPErrorCode {
+  CONNECTION_FAILED = "CONNECTION_FAILED",
+  TIMEOUT = "TIMEOUT",
+  TOOL_NOT_FOUND = "TOOL_NOT_FOUND",
+  INVALID_PARAMETERS = "INVALID_PARAMETERS",
+  SERVER_ERROR = "SERVER_ERROR",
+  TRANSPORT_ERROR = "TRANSPORT_ERROR",
+  NOT_CONNECTED = "NOT_CONNECTED",
+  PROTOCOL_ERROR = "PROTOCOL_ERROR",
+  CONFIG_ERROR = "CONFIG_ERROR",
+  SCHEMA_CONVERSION_ERROR = "SCHEMA_CONVERSION_ERROR",
+  RESOURCE_NOT_FOUND = "RESOURCE_NOT_FOUND",
+  PROMPT_NOT_FOUND = "PROMPT_NOT_FOUND",
+  SESSION_ERROR = "SESSION_ERROR",
+}
+```
+
+### Type Definitions (`src/facade/mcp-core/types.ts`)
+
+#### MCPClientOptions (`src/facade/mcp-core/client.ts`)
+```typescript
+interface MCPClientOptions {
+  name: string;
+  config: MCPServerConfig;
+  timeout?: number;
+  logger?: MCPLogHandler;
+  enableServerLogs?: boolean;       // default: true
+  enableProgressTracking?: boolean; // default: false
+  roots?: MCPRoot[];
+}
+```
+
+#### MCPClientPoolOptions / MCPServerStatus (`src/facade/mcp-core/client-pool.ts`)
+```typescript
+interface MCPClientPoolOptions {
+  servers: MCPConnectionOptions[];
+}
+
+interface MCPServerStatus {
+  name: string;
+  connected: boolean;
+  toolCount?: number;
+  resourceCount?: number;
+  promptCount?: number;
+}
+```
+
+#### MCPServerOptions (`src/facade/mcp-core/server.ts`)
+```typescript
+interface MCPServerOptions {
+  name: string;
+  version?: string;        // default: "1.0.0"
+  tools: AgentTool<any>[];
+  description?: string;
+}
+```
+
+#### MCPToolClient (`src/facade/mcp-core/tool-factory.ts`)
+```typescript
+interface MCPToolClient {
+  readonly serverName: string;
+  readonly connected: boolean;
+  callTool(name: string, args: Record<string, unknown>): Promise<MCPToolCallResult>;
+}
+```
+
+#### Server configuration
+```typescript
+interface StdioServerConfig {
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  cwd?: string;
+}
+
+interface HttpServerConfig {
+  url: URL;                          // note: URL object, not a string
+  headers?: Record<string, string>;
+  fetch?: typeof fetch;
+}
+
+type MCPServerConfig = StdioServerConfig | HttpServerConfig;
+
+interface MCPConnectionOptions {
+  name: string;
+  config: MCPServerConfig;
+  timeout?: number;
+}
+```
+
+#### Protocol types
+```typescript
+interface MCPToolDefinition {
+  name: string;
+  description?: string;
+  inputSchema: Record<string, unknown>;
+  outputSchema?: Record<string, unknown>;
+}
+
+interface MCPResource {
+  uri: string;
+  name?: string;
+  mimeType?: string;
+  description?: string;
+}
+
+interface MCPPrompt {
+  name: string;
+  description?: string;
+  arguments?: Array<{ name: string; description?: string; required?: boolean }>;
+}
+
+interface MCPInitializeResult {
+  protocolVersion: string;
+  serverInfo: { name: string; version?: string };
+  capabilities: Record<string, unknown>;
+}
+```
+
+#### Tool execution
+```typescript
+type MCPContentBlock =
+  | { type: "text"; text: string }
+  | { type: "image"; data: string; mimeType: string }
+  | { type: "resource"; resource: MCPResource };
+
+interface MCPToolCallRequest {
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+interface MCPToolCallResult {
+  content: MCPContentBlock[];
+  isError?: boolean;
+  structuredContent?: unknown;
+}
+```
+
+#### Configuration file
+```typescript
+interface MCPServerConfigEntry {
+  name: string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;          // string here (config file), parsed to URL on load
+  headers?: Record<string, string>;
+  timeout?: number;
+  enabled?: boolean;     // default: true
+}
+
+interface MCPConfigFile {
+  servers: MCPServerConfigEntry[] | Record<string, MCPServerConfigValue>;
+}
+```
+
+Note: `MCPServerConfigValue` is the name-less variant used in the object form of `servers`. It is declared in `types.ts` and appears inside the `MCPConfigFile` definition, but it is **not** re-exported from `indusagi/mcp` — only `MCPServerConfigEntry` and `MCPConfigFile` are importable.
+
+#### Logging / progress / elicitation / roots
+```typescript
+type MCPLoggingLevel =
+  | "debug" | "info" | "notice" | "warning"
+  | "error" | "critical" | "alert" | "emergency";
+
+interface MCPLogMessage {
+  level: MCPLoggingLevel;
+  message: string;
+  timestamp: Date;
+  serverName: string;
+  details?: Record<string, unknown>;
+}
+type MCPLogHandler = (logMessage: MCPLogMessage) => void;
+
+interface MCPProgressNotification {
+  progressToken: string | number;
+  progress: number;
+  total?: number;
+  message?: string;
+}
+type MCPProgressHandler = (params: MCPProgressNotification) => void;
+
+interface MCPElicitRequest { message: string; requestedSchema: Record<string, unknown>; }
+interface MCPElicitResult { action: "accept" | "decline" | "cancel"; content?: Record<string, unknown>; }
+type MCPElicitationHandler = (request: MCPElicitRequest) => Promise<MCPElicitResult>;
+
+interface MCPRoot { uri: string; name?: string; }
+
+interface BaseServerOptions {
+  logger?: MCPLogHandler;
+  timeout?: number;
+  enableServerLogs?: boolean;
+  enableProgressTracking?: boolean;
+  roots?: MCPRoot[];
+}
+
+interface MCPClientState {
+  connected: boolean;
+  serverName: string;
+  tools: MCPToolDefinition[];
+  resources: MCPResource[];
+  prompts: MCPPrompt[];
+}
+```
+
+### Configuration File Format
+
+`loadMCPConfig` accepts both an array and an object form for `servers`, and reads from several locations (see "Configuration files" in `developer-guide.txt`):
+
+```json
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"],
+      "enabled": true
+    },
+    {
+      "name": "github",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "your-github-token" },
+      "enabled": true
+    },
+    {
+      "name": "remote-server",
+      "url": "http://localhost:8080/mcp",
+      "headers": { "Authorization": "Bearer your-token" },
+      "enabled": false
+    }
+  ]
+}
+```
+
+This is the exact shape of the exported `EXAMPLE_CONFIG`. A server with `enabled: false` is skipped on load. A `url` entry becomes HTTP transport; a `command` entry becomes stdio transport.
+
+### Environment Variables
+
+- `XDG_CONFIG_HOME` - base for the user config path (defaults to `~/.config`)
+- `INDUSAGI_DEBUG` - when set, `MCPClient` emits debug/info logs to the console (errors always log)
+- Provider-specific variables (e.g. `GITHUB_TOKEN`) are passed through per-server via the `env` field
+
+---
+
+## Part 2 — `indusagi/interop`
+
+Source: `src/interop/index.ts`, re-exporting `src/interop/protocol-bridge/`. Built on `@modelcontextprotocol/sdk`.
+
+### Values
+
+```typescript
+// Client side — one endpoint per external server
+class ServerEndpointImpl implements ServerEndpoint { /* see below */ }
+function createServerEndpoint(config: ServerConfig, transport?: Transport): ServerEndpointImpl;
+
+// Client side — a fleet of endpoints under one lifecycle
+class ServerFleetImpl implements ServerFleet { /* see below */ }
+function startServerFleet(config: BridgeConfig): Promise<ServerFleetImpl>;
+
+// Client side — graft remote tools into the kernel ToolRegistry
+function mountProtocolBridge(config: BridgeConfig): Promise<MountedProtocolBridge>;
+
+// Provider host — expose this agent's tools to external clients
+function createProviderHost(box: ToolBox, info?: ProviderHostInfo): ProviderHost;
+
+// Fault model
+class ProtocolFault extends Error { readonly kind: FaultKind; }
+function protocolFault(kind: FaultKind, message: string, cause?: unknown): ProtocolFault;
+function isProtocolFault(value: unknown): value is ProtocolFault;
+
+// Phase predicates
+function isUsablePhase(phase: EndpointPhase): boolean;   // true only for "ready"
+function isTerminalPhase(phase: EndpointPhase): boolean; // true for "closed" | "faulted"
+
+// Naming
+const QUALIFIER: "__";
+function qualifyToolName(ref: RemoteToolRef): string;    // `${ref.server}__${ref.name}`
+
+// Schema
+function normalizeSchema(input: unknown): JsonSchema;
+```
+
+### Interfaces (behavioural)
+
+```typescript
+interface ServerEndpoint {
+  readonly config: ServerConfig;
+  readonly phase: EndpointPhase;
+  open(): Promise<void>;
+  listTools(): Promise<readonly RemoteTool[]>;
+  invoke(name: string, args: unknown): Promise<RemoteCallResult>;
+  status(): EndpointStatus;
+  close(): Promise<void>;
+}
+
+interface ServerFleet {
+  spinUp(): Promise<void>;
+  tearDown(): Promise<void>;
+  endpoint(server: string): ServerEndpoint | undefined;
+  endpoints(): readonly ServerEndpoint[];
+  status(): FleetStatus;
+}
+
+interface ProviderHost {
+  connect(transport: Transport): Promise<void>;   // Transport from @modelcontextprotocol/sdk
+}
+
+interface ProviderHostInfo {
+  readonly name: string;     // default: "indus-provider-host"
+  readonly version: string;  // default: "0.1.0"
+}
+
+interface MountedProtocolBridge {
+  readonly box: ToolBox;       // runtime ToolBox of grafted remote tools
+  readonly fleet: ServerFleet;
+}
+```
+
+Note: `ServerEndpointImpl` and `ServerFleetImpl` carry extra concrete methods beyond the interface. `ServerEndpointImpl` adds `connect()` (an alias `open()` delegates to), `tools()` (cached snapshot), and an `id` getter. `ServerFleetImpl` adds `start(config)` (which `spinUp()` and `startServerFleet()` call) and `close()` (aliased by `tearDown()`).
+
+### Contract types
+
+```typescript
+type FaultKind =
+  | "transport" | "protocol" | "timeout"
+  | "tool_error" | "not_connected" | "spawn_failed";
+
+type EndpointPhase =
+  | "idle" | "connecting" | "ready" | "closing" | "closed" | "faulted";
+
+interface StdioServerConfig {
+  readonly id: string;
+  readonly kind: "stdio";
+  readonly command: string;
+  readonly args?: readonly string[];
+  readonly env?: Readonly<Record<string, string>>;
+}
+
+interface SseServerConfig {
+  readonly id: string;
+  readonly kind: "sse";
+  readonly url: string;
+  readonly headers?: Readonly<Record<string, string>>;
+}
+
+type ServerConfig = StdioServerConfig | SseServerConfig;
+type TransportKind = ServerConfig["kind"];   // "stdio" | "sse"
+
+interface BridgeConfig {
+  readonly servers: readonly ServerConfig[];
+}
+
+interface RemoteToolRef {
+  readonly server: string;   // owning ServerConfig.id
+  readonly name: string;     // unqualified, server-side tool name
+}
+
+interface RemoteTool {
+  readonly ref: RemoteToolRef;
+  readonly descriptor: ToolDescriptor;   // from indusagi/llmgateway; carries the qualified name
+}
+
+interface RemoteCallResult {
+  readonly content: readonly unknown[];  // MCP content blocks, opaque
+  readonly isError: boolean;
+}
+
+interface EndpointStatus {
+  readonly server: string;
+  readonly phase: EndpointPhase;
+  readonly toolCount: number;
+  readonly fault?: ProtocolFault;
+}
+
+type FleetStatus = Readonly<Record<string, EndpointStatus>>;
+
+interface MountedBridge {
+  readonly fleet: ServerFleet;
+  readonly toolBox: ToolBox;
+  readonly toolCount: number;
+}
+```
+
+The interop client identity advertised on connect is `{ name: "indus-protocol-bridge", version: "0.1.0" }`. The provider host's default identity is `{ name: "indus-provider-host", version: "0.1.0" }`.
+
+For runnable examples on both sides, see `developer-guide.txt`.

@@ -1,0 +1,131 @@
+# Runtime
+
+> `src/runtime` is the L2 Agent layer — it owns the model conversation loop. The
+> host-facing `createAgent` returns an `Agent` that drives one prompt to settlement.
+> Imported as `indusagi/runtime`, or as the `runtime` namespace from `indusagi`.
+
+The runtime is split into a pure transition machine (the `cadence` reducer, which
+returns `Effect`s and never side-effects) and a single stateful conductor (which
+performs those effects: reach the model, run tools, persist, condense, publish). A
+host only needs `createAgent`; advanced hosts can drive the FSM directly.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-directories](#sub-directories)
+- [Driving an agent](#driving-an-agent)
+- [The pure FSM seam](#the-pure-fsm-seam)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+From `src/runtime/index.ts`:
+
+| Export | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `createAgent` | function | `conductor/agent.ts` | The host-facing factory; returns an `Agent` |
+| `Agent` | type | `conductor/agent.ts` | The driveable handle (`submit`/`subscribe`/`abort`/`snapshot`/`resume`) |
+| `AgentDeps` | type | `conductor/agent.ts` | Injectable collaborators (`invokeModel`/`store`/`ledger`) |
+| `AgentEventHandler` | type | `conductor/agent.ts` | The subscribe callback shape |
+| `runError` | function | `contract` | Construct a `RunError` |
+| `step` | function | `cadence` | Alias of `cadence` — the bound `step(state, signal)` factory |
+| `cadence` | function | `cadence` | The pure transition machine factory |
+| `initialSnapshot` | function | `cadence` | Seed a fresh `RunSnapshot` |
+
+Public types branched on by callers: `RunSnapshot`, `RunPhase`, `PendingTool`,
+`RunEvent`, `AgentConfig`, `CompactionPolicy`, `ToolBox`, `ToolRunner`, `ToolCall`,
+`ToolOutcome`, `RunError`, `RunErrorKind`, `ModelInvoker` (all from `contract`), plus
+`StepFn` and `Transition` (from `cadence`).
+
+Note: the gateway's types (`Conversation`, `Turn`, `Block`, `ToolDescriptor`,
+`Reply`, `Emission`, `Channel`, `StreamOptions`, …) are intentionally **not**
+re-exported here — import those from `indusagi/llmgateway` or `.../llmgateway/contract`.
+
+## Sub-directories
+
+| Directory | Holds |
+|-----------|-------|
+| `conductor/` | `agent.ts` — the only stateful, side-effecting layer; `createAgent` lives here |
+| `cadence/` | `reducer.ts`, `fold.ts` — the pure FSM; the `cadence(config)` factory yields `step` |
+| `contract/` | The type vocabulary: `config.ts`, `run-state.ts`, `events.ts`, `signal.ts`, `effect.ts`, `session.ts`, `tools.ts`, `errors.ts` |
+| `turn/` | `driver.ts` — adapts a gateway `Channel` into runtime `Signal`s (`driveTurn`) |
+| `dispatch/` | `scheduler.ts` — bounded-concurrency tool dispatch (`createScheduler`) |
+| `memory/` | `compactor.ts`, `estimate.ts` — context condensation (`compact`/`findCutPoint`/`shouldCompact`) |
+| `ledger/` | `bus.ts`, `accumulator.ts` — the `RunLedger` event hub and its subscribers |
+| `store/` | `dag.ts`, `hash.ts`, `persist.ts` — the content-addressed `SessionGraph` / `SessionStore` |
+| `wire/` | `projectors.ts` — projections of run state onto the wire protocol |
+
+## Driving an agent
+
+```ts
+import { runtime, capabilities } from "indusagi";
+
+const agent = runtime.createAgent({
+  model: "claude-sonnet-4",
+  tools: capabilities.toolBox("coding"),
+  // optional: system, maxOutputTokens, thinking, compaction, maxTurns
+});
+
+const unsubscribe = agent.subscribe((event) => {
+  if (event.kind === "text_delta") process.stdout.write(event.delta);
+});
+
+const snapshot = await agent.submit("explain this repo");
+console.log(snapshot.phase); // "settled" or "faulted"
+unsubscribe();
+```
+
+The `Agent` handle exposes five methods: `submit(input)` drives one prompt
+(`Turn[]` or a bare string) to settlement and resolves the terminal `RunSnapshot` —
+a submit landing while a run is in flight is folded in as steering rather than
+starting a competing run; `subscribe(handler)` taps the live `RunEvent` stream and
+returns a disposer; `abort()` cancels the model stream and tool dispatch and faults
+the run; `snapshot()` reads the latest state; and `resume(sessionId)` rehydrates an
+earlier session from the store.
+
+`AgentConfig` is the immutable setup: `model` (required), optional `system`,
+`tools` (a `ToolBox`), `maxOutputTokens`, `thinking` (a `ThinkingLevel`),
+`compaction` (a `CompactionPolicy` with `triggerRatio` and `keepRecent`), and
+`maxTurns` — the per-run model-turn ceiling that force-faults a looping model,
+defaulting to **64**.
+
+The model entrypoint is injectable through `AgentDeps`: by default the conductor
+binds the gateway's `stream` to `config.model`, but a test passes a scripted
+`ModelInvoker` so a run is deterministic with no network. A `store` (a
+`SessionStore`) enables persistence and `resume`; a `ledger` (a `RunLedger`)
+receives published events.
+
+## The pure FSM seam
+
+The conductor threads a serial stream of `Signal`s through the pure reducer, which
+returns a `Transition` (`{ state, effects }`). The conductor performs each `Effect`
+(`publish`, `invoke_model`, `run_tool`, `compact`, `persist`) and folds the
+resulting signals back in, turning over until a terminal `RunPhase` (`settled` or
+`faulted`). Advanced hosts can drive that machine themselves:
+
+```ts
+import { cadence, initialSnapshot } from "indusagi/runtime";
+
+const step = cadence(config);            // StepFn bound to the config
+let snapshot = initialSnapshot(sessionId, config.model);
+const transition = step(snapshot, { kind: "submit", input: turns });
+snapshot = transition.state;             // apply, then perform transition.effects
+```
+
+Before each `invoke_model`, the conductor checks accumulated history against the
+model's context window (`shouldCompact`) and condenses the older prefix when it
+crosses `triggerRatio`, preserving the most recent `keepRecent` turns — but only
+when the cut genuinely shrinks history, so a model is never trapped in a compaction
+loop.
+
+## Relationship to neighbors
+
+The runtime reaches the [LLM Gateway](/docs/subsystems/llm-gateway) for every model
+turn and the [Capabilities](/docs/subsystems/capabilities) layer for tool execution
+(its `ToolBox` / `ToolRunner` / `ToolCall` / `ToolOutcome` contracts are the
+boundary tools satisfy). [Tracing](/docs/subsystems/tracing) consumes the runtime's
+`RunEvent` stream through `traceAgentRun`; [Swarm](/docs/subsystems/swarm) and
+[Smithy](/docs/subsystems/smithy) both build their agents with `createAgent`; and
+the [Shell App](/docs/subsystems/shell-app) runners wrap an `Agent` for each mode.
+
+Back to the [Architecture overview](/docs/architecture).

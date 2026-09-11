@@ -1,0 +1,148 @@
+# Hooks
+
+Hooks are the colon-named **event taxonomy** an addon subscribes to. They are not a
+separate system from extensions — in this rebuild, lifecycle observation, payload
+transformation, and veto are unified into one `EventDispatcher` that an addon feeds
+through `surface.on(...)`. The dotted-name "hook factory" model from older docs no
+longer exists.
+
+The implementation is `indus-code-rebuild/src/addons/dispatch/event-dispatcher.ts`,
+with the types declared in `src/addons/contract.ts`. See [extensions](extensions.md)
+for how to register a handler.
+
+> **Status:** The dispatcher is fully implemented and tested, but the events are
+> **not yet emitted by the conductor** — the engine exists and runs, but the
+> coding-agent loop does not currently dispatch these events through it. There is no
+> `--hook` flag and no `hooks` directory. This page documents the contract; see
+> `FEATURE_GAP_ROADMAP.md` for the integration status.
+
+## The Three Handler Kinds
+
+Every handler picks exactly one `HookKind`, which selects what its `run` callback
+returns:
+
+```typescript
+type HookHandler<TPayload> =
+  | { kind: "observe";   run(p: TPayload): void | Promise<void> }
+  | { kind: "transform"; run(p: TPayload): TPayload | Promise<TPayload> }
+  | { kind: "gate";      run(p: TPayload): GateDecision | void | Promise<GateDecision | void> };
+```
+
+| Kind | Returns | Effect |
+|------|---------|--------|
+| `observe` | nothing | fire-and-forget; cannot alter or veto |
+| `transform` | a replacement payload | threaded into later handlers and back to the caller |
+| `gate` | a `GateDecision` | `{ stop: true }` short-circuits the event |
+
+A `GateDecision` is `{ stop: boolean; reason?: string }`.
+
+## The Events
+
+The full `HookEvent` set (`src/addons/contract.ts`). The "Guards" column marks the
+**reserved**, gate-bearing events — the ones that front a side-effecting step the
+host can refuse to take:
+
+| Event | Guards | Description |
+|-------|:------:|-------------|
+| `session:start` | | a session opened |
+| `session:end` | | a session closed |
+| `turn:start` | | an assistant turn began |
+| `turn:end` | | an assistant turn settled |
+| `tool:before` | ✓ | straddles a tool execution — a gate blocks the call |
+| `tool:after` | | a tool finished — observe/transform the result |
+| `chat:params` | | the model request options are being built |
+| `chat:message` | | an assistant message was assembled |
+| `shell:env` | | the environment for a shell action is being prepared |
+| `input:submit` | ✓ | user input entering the loop — a gate drops the turn |
+| `context:build` | | the message context is being assembled |
+| `compact:build` | | the transcript condense input is being built |
+| `compact:before` | ✓ | the transcript is about to be condensed — a gate refuses it |
+
+The reserved set is **derived from a data table** (`EVENT_TRAITS` in
+`src/addons/dispatch/event-dispatcher.ts`), not a separate hand-maintained
+constant. `AddonEventDispatcher.reserved` exposes the derived set. A `gate` handler
+may attach to any event, but only the reserved events front an action the host is
+expected to actually stop.
+
+## Subscribing
+
+A handler is recorded against an event with `surface.on(event, handler)` inside an
+addon's `register`:
+
+```typescript
+import type { addons } from "indusagi-coding-agent";
+
+const addon: addons.AddonManifest = {
+  id: "logger",
+  register(surface) {
+    // observe: log every assistant turn boundary
+    surface.on("turn:start", {
+      kind: "observe",
+      run() {
+        console.log("turn started");
+      },
+    });
+
+    // transform: prepend context to an assembled assistant message
+    surface.on<{ content: { type: string; text?: string }[] }>("chat:message", {
+      kind: "transform",
+      run(payload) {
+        return {
+          ...payload,
+          content: [{ type: "text", text: "[audited] " }, ...payload.content],
+        };
+      },
+    });
+
+    // gate: refuse a compaction during a critical section
+    surface.on("compact:before", {
+      kind: "gate",
+      run() {
+        return { stop: true, reason: "compaction paused" };
+      },
+    });
+  },
+};
+
+export default addon;
+```
+
+## Dispatch Semantics
+
+When an event is dispatched, the engine walks that event's subscriptions in
+**registration (load) order**:
+
+- `observe` handlers see the current payload and return nothing.
+- `transform` handlers fold their return value forward (a transform that throws is
+  isolated and treated as a no-op — the prior payload is kept).
+- The first `gate` that returns `{ stop: true }` short-circuits the walk; its
+  decision is surfaced as `DispatchOutcome.gate`.
+
+Because a gate stops the walk, a gate registered earlier wins over a transform
+registered later — precedence is controlled purely through load order, with no
+priority field.
+
+```typescript
+interface DispatchOutcome<TPayload> {
+  payload: TPayload;     // after every transform ran
+  gate?: GateDecision;   // the first stopping decision, if any
+}
+```
+
+## Fault Isolation
+
+A handler that throws is converted to an `AddonFault` (`kind: "handler"`) routed to
+the dispatcher's `onFault` listeners and then swallowed — `observe`/`transform`
+continue with the prior payload, and a `gate` **fails open** (no veto) rather than
+wedging the agent. A throwing fault listener cannot break fan-out to the others.
+
+## Construction Helper
+
+For hosts/tests assembling subscriptions by hand without the full surface builder,
+`subscription(addon, event, handler)` mints the recorded `EventSubscription` shape,
+and `AddonEventDispatcher.from(subscriptions)` builds the engine.
+
+## Related
+
+- [Extensions](extensions.md) — the addon API and registration surface
+- [Loading Extensions](loading-extensions.md) — discovery and the loader

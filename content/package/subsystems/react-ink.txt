@@ -1,0 +1,81 @@
+# React-Ink
+
+> `src/react-ink` is the Ink component library for the terminal UI — message rows,
+> dialogs, and markdown/diff renderers. It is part of the optional UI stack, not the
+> toolkit-free core. Imported as `indusagi/react-ink`.
+
+Where the non-UI layers (gateway, runtime, capabilities, …) deliberately import no
+terminal toolkit, react-ink is the React/Ink presentation layer a richer interactive
+view is built from. The shell app's `InteractiveView` seam is satisfied by mounting
+these components through `src/ui-bridge`, so the agent runtime stays UI-agnostic.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-directories](#sub-directories)
+- [Components](#components)
+- [Markdown and diff renderers](#markdown-and-diff-renderers)
+- [The theme adapter](#the-theme-adapter)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+`src/react-ink/index.ts` re-exports its modules with `export * from "./..."` — the
+types, the theme adapter, all components and dialogs, the message rows, the diff and
+markdown renderers, and the `message-groups` / `selection-dialog` / `tool-display`
+util helpers (the `utils/session-browser.ts` module exists but is not re-exported
+from the barrel). The components are React/Ink elements (`.tsx`); the package targets
+the host React loaded by `indusagi/react-host`.
+
+## Sub-directories
+
+| Directory | Holds |
+|-----------|-------|
+| `types.ts` | The view-model types (`StatusMessage`, `ToolExecutionState`, `PendingMessageItem`, …) |
+| `theme-adapter.ts` | `InkThemeAdapter`, `ThemeRole`/`ThemeRoleKeys`, `createThemeAdapter` |
+| `components/` | The top-level rows and panels (below), plus `dialogs/` and `messages/` |
+| `components/dialogs/` | Modal dialogs: `DialogFrame`, `LoginDialog`, `ModelDialog`, `OAuthDialog`, `ScopedModelsDialog`, `SelectableDialog`, `SessionDialog`, `SettingsDialog`, `StartupSessionPicker`, `ThemeDialog`, `TreeDialog`, `UserMessageDialog` |
+| `components/messages/` | Per-message rows: `AssistantMessage`, `BashMessage`, `BranchSummaryMessage`, `CompactionMessage`, `CustomMessage`, `SkillInvocationMessage`, `ToolCallMessage`, `ToolResultBlock`, `UserMessage` |
+| `diff/` | `Diff.tsx` (the `Diff` component), `structured.ts` (`buildStructuredDiff`), `word-diff.ts` (`wordDiffLine`) |
+| `markdown/` | `Markdown.tsx`, `StreamingMarkdown.tsx`, `MarkdownTable.tsx`, `format-token.ts`, `highlight.ts` |
+| `utils/` | `message-groups.ts`, `selection-dialog.ts`, `session-browser.ts`, `tool-display.ts` |
+
+## Components
+
+The top-level `components/` modules are `ChangelogBlock`, `DisplayBlockView`,
+`Footer`, `MessageList`, `MessageRow`, `StatusLine`, `TaskPanel`, and
+`ToolEventBlock`. `MessageList` renders a scroll of `MessageRow`s; the `messages/`
+modules are the per-kind rows (assistant text, bash output, tool calls and results,
+compaction/branch markers, user input). The `dialogs/` modules are modal overlays
+(`DialogFrame` is the shared chrome) for login, model/theme/settings pickers, the
+OAuth flow, session browsing, and the like.
+
+## Markdown and diff renderers
+
+`Markdown` renders a markdown string into Ink nodes (with optional syntax
+highlighting via `highlight.ts`); `StreamingMarkdown` renders incrementally as text
+arrives; `MarkdownTable` lays out tables. The diff renderers project a unified diff:
+`buildStructuredDiff(oldStr, newStr, filePath)` produces a `StructuredDiff` of
+`DiffHunk`s and `DiffLine`s (with `CONTEXT_LINES` of context), `wordDiffLine`
+computes intra-line word spans, and the `Diff` component paints the result.
+
+## The theme adapter
+
+`createThemeAdapter` builds an `InkThemeAdapter` that the markdown / diff /
+syntax-highlight render path resolves named colour roles against. A `ThemeRole`
+(`codeInline`, `heading`, `blockquoteBar`, the `diff*` and `syn*` scopes — see
+`ThemeRoleKeys`) maps to a flat colour key, so a host theme only has to populate the
+matching keys; the role → key indirection lives in the adapter and degrades
+gracefully when a key is absent.
+
+## Relationship to neighbors
+
+react-ink is the presentation layer for the [Shell App](/docs/subsystems/shell-app)'s
+interactive runner: its components are mounted into the `InteractiveView` seam by
+`src/ui-bridge`, which feeds them runtime data (the `ui-bridge` adapter projects
+[Runtime](/docs/subsystems/runtime) turns and gateway usage into the view models in
+`types.ts`). It sits alongside `indusagi/tui` (lower-level TUI primitives) and
+`indusagi/react-host` (the host-React loader) in the UI stack. None of the non-UI
+capability layers depend on it.
+
+Back to the [Architecture overview](/docs/architecture).

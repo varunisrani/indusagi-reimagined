@@ -1,0 +1,366 @@
+# MCP (Model Context Protocol) - Developer Guide
+
+> indusagi ships two MCP layers. `indusagi/mcp` is a self-contained implementation that adapts MCP tools into `AgentTool`s. `indusagi/interop` is the clean-room bridge built on `@modelcontextprotocol/sdk` that grafts remote tools into the kernel `ToolRegistry` and can host the agent's own tools. This guide covers connecting clients and servers on both layers.
+
+## Table of Contents
+
+1. Connecting to a server with `MCPClient`
+2. Managing many servers with `MCPClientPool`
+3. Adapting MCP tools into `AgentTool`s
+4. One-call setup with `initializeMCP`
+5. Hosting your tools with `MCPServer`
+6. Configuration files
+7. Schema conversion
+8. Error handling
+9. The interop bridge: endpoints, fleets, mounting
+10. The interop provider host
+
+---
+
+## 1. Connecting to a server with `MCPClient`
+
+Source: `src/facade/mcp-core/client.ts`. A client wraps one server. Stdio servers are spawned as subprocesses; HTTP servers are reached per-request.
+
+```typescript
+import { MCPClient } from "indusagi/mcp";
+
+const client = new MCPClient({
+  name: "filesystem",
+  config: {
+    command: "npx",
+    args: ["-y", "@modelcontextprotocol/server-filesystem", "."],
+  },
+  timeout: 60000,
+  logger: (msg) => console.log(`[${msg.level}] ${msg.message}`),
+  enableServerLogs: true,
+});
+
+await client.connect();
+
+const tools = await client.listTools();
+console.log(tools.map((t) => t.name).join(", "));
+
+const result = await client.callTool("read_file", { path: "./README.md" });
+// result is an MCPToolCallResult: { content: MCPContentBlock[], isError?, structuredContent? }
+
+await client.disconnect();
+```
+
+`callTool` returns the structured `MCPToolCallResult`. Resources and prompts are also available:
+
+```typescript
+const resources = await client.listResources();   // [] if the server has no resources capability
+const content = await client.readResource("file:///path/to/file");
+
+const prompts = await client.listPrompts();        // [] if no prompts capability
+const prompt = await client.getPrompt("review", { language: "typescript" });
+```
+
+HTTP transport uses a `URL` object (not a string):
+
+```typescript
+const http = new MCPClient({
+  name: "remote",
+  config: {
+    url: new URL("http://localhost:8080/mcp"),
+    headers: { Authorization: "Bearer token" },
+  },
+});
+await http.connect();
+```
+
+The HTTP path accepts both plain JSON and SSE-framed (`event:` / `data:`) responses.
+
+## 2. Managing many servers with `MCPClientPool`
+
+Source: `src/facade/mcp-core/client-pool.ts`.
+
+```typescript
+import { MCPClientPool } from "indusagi/mcp";
+
+const pool = new MCPClientPool({
+  servers: [
+    { name: "filesystem", config: { command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "."] } },
+    { name: "github", config: { command: "npx", args: ["-y", "@modelcontextprotocol/server-github"], env: { GITHUB_TOKEN: process.env.GITHUB_TOKEN || "" } } },
+  ],
+});
+
+await pool.connectAll();   // a server that fails to connect is logged and skipped, not fatal
+
+for (const client of pool.getAllClients()) {
+  console.log(`Connected: ${client.serverName}`);
+}
+
+const status = await pool.getStatus();   // NOTE: getStatus() is async
+// [{ name: "filesystem", connected: true, toolCount: 8, resourceCount: 0, promptCount: 0 }, ...]
+
+await pool.disconnectAll();
+```
+
+Note that the server `env` lives on the inner `config` object (`config.env`), matching `StdioServerConfig`. Dynamic add/remove return a boolean instead of throwing:
+
+```typescript
+const added = await pool.addServer({
+  name: "postgres",
+  config: { command: "npx", args: ["-y", "@modelcontextprotocol/server-postgres"], env: { DATABASE_URL: "postgresql://..." } },
+});
+// added === false if the name already exists or the connection failed
+
+await pool.removeServer("postgres");   // false if no such server
+await pool.reload();                    // disconnectAll() then connectAll()
+```
+
+Aggregate listings are also available: `listAllTools()`, `listAllResources()`, `listAllPrompts()` each return a `Record<serverName, ...>`.
+
+## 3. Adapting MCP tools into `AgentTool`s
+
+Source: `src/facade/mcp-core/tool-factory.ts`. Adapted tools are namespaced `${serverName}_${toolName}` with `category: "mcp"`. The argument order is **tools/tool first, client second**.
+
+```typescript
+import {
+  registerMCPToolsInRegistry,
+  createMCPAgentToolFactory,
+  createMCPToolsMap,
+  createMCPToolsRecord,
+} from "indusagi/mcp";
+import { ToolRegistry } from "indusagi/agent";
+
+const registry = new ToolRegistry();
+const mcpTools = await client.listTools();
+
+// Register all tools (returns count)
+const count = await registerMCPToolsInRegistry(registry, client, mcpTools);
+
+// Or build a single tool factory
+const factory = createMCPAgentToolFactory(mcpTools[0], client);
+const agentTool = factory();
+
+// Or build a Map / Record of namespaced tools
+const toolMap = createMCPToolsMap(mcpTools, client);       // Map<"filesystem_read_file", AgentTool>
+const toolRecord = createMCPToolsRecord(mcpTools, client); // Record<"filesystem_read_file", AgentTool>
+```
+
+Inside the generated `AgentTool.execute`, the result's text blocks are truncated for display (first 4 lines / 500 chars) while the full `MCPToolCallResult` is preserved in `details`. Image blocks are passed through. Any `MCPError` is converted into an `isError: true` result rather than thrown.
+
+## 4. One-call setup with `initializeMCP`
+
+```typescript
+import { initializeMCP } from "indusagi/mcp";
+import { ToolRegistry } from "indusagi/agent";
+
+const registry = new ToolRegistry();
+const { pool, toolCount } = await initializeMCP(registry, process.cwd());
+
+console.log(`Connected to ${pool.getAllClients().length} servers with ${toolCount} tools`);
+```
+
+`initializeMCP` calls `loadMCPConfig(cwd)`, connects the pool, and registers every client's tools. With no configured servers it returns an empty pool and `toolCount: 0`.
+
+## 5. Hosting your tools with `MCPServer`
+
+Source: `src/facade/mcp-core/server.ts`. `MCPServer` exposes existing `AgentTool`s (not free-form handlers) over stdio. Provide the tools at construction or add them later.
+
+```typescript
+import { MCPServer, createMCPServer } from "indusagi/mcp";
+import { createBashTool } from "indusagi/agent";   // createBashTool(cwd, options?)
+
+const server = createMCPServer({
+  name: "My Tools Server",
+  version: "1.0.0",
+  tools: [createBashTool(process.cwd())],
+});
+
+server.addTool(someOtherAgentTool);
+server.removeTool("some_tool");
+
+await server.startStdio();   // reads JSON-RPC from stdin, writes to stdout; never resolves
+```
+
+The server answers `initialize`, `tools/list`, and `tools/call`; `resources/list` and `prompts/list` return empty lists. All diagnostics print to stderr so stdout stays a clean protocol stream — wire this server into a client (e.g. Claude Desktop, Cursor) as a stdio command.
+
+## 6. Configuration files
+
+Source: `src/facade/mcp-core/config.ts`. `loadMCPConfig(configPathOrCwd)`:
+
+- If the argument is an existing **file**, it is parsed directly.
+- Otherwise the argument is treated as a working directory, and these files are merged in order:
+  1. Project: `<cwd>/.indusvx/mcp.json`
+  2. User (XDG): `$XDG_CONFIG_HOME/indusvx/mcp.json` (defaults to `~/.config/indusvx/mcp.json`)
+  3. Legacy: `~/.indusvx/agent/mcp.json`
+  4. Legacy alt: `~/.indusvx/agent/mcp-servers.json`
+
+The `servers` field may be an array or an object keyed by server name. Entries with `enabled: false` are skipped. A `url` entry yields HTTP transport (the string is parsed into a `URL`); a `command` entry yields stdio transport.
+
+```typescript
+import {
+  loadMCPConfig,
+  saveUserConfig,
+  saveProjectConfig,
+  saveConfig,
+  getUserConfigPath,
+  getProjectConfigPath,
+  createDefaultConfig,
+  EXAMPLE_CONFIG,
+} from "indusagi/mcp";
+
+const configs = loadMCPConfig(process.cwd());   // MCPConnectionOptions[]
+
+// Save an MCPConfigFile (not a single entry):
+saveProjectConfig({ servers: [{ name: "fs", command: "npx", args: ["-y", "@modelcontextprotocol/server-filesystem", "."] }] });
+saveUserConfig(EXAMPLE_CONFIG);
+saveConfig("/abs/path/mcp.json", createDefaultConfig());
+
+getUserConfigPath();      // $XDG_CONFIG_HOME/indusvx/mcp.json
+getProjectConfigPath();   // <cwd>/.indusvx/mcp.json
+```
+
+`saveConfig`, `saveUserConfig`, and `saveProjectConfig` all take a whole `MCPConfigFile` (`{ servers: [...] }`) and are synchronous.
+
+## 7. Schema conversion
+
+Source: `src/facade/mcp-core/schema-converter.ts`. MCP tool `inputSchema` (JSON Schema) is converted to a TypeBox `TSchema`, then made permissive so unexpected server fields never fail validation.
+
+```typescript
+import {
+  jsonSchemaToTypeBox,
+  convertMCPInputSchema,
+  convertMCPOutputSchema,
+  applyPassthrough,
+} from "indusagi/mcp";
+
+const schema = convertMCPInputSchema({
+  type: "object",
+  properties: { name: { type: "string" }, age: { type: "number" } },
+  required: ["name"],
+});
+// jsonSchemaToTypeBox() followed by applyPassthrough()
+```
+
+`jsonSchemaToTypeBox` handles primitives, objects, arrays/tuples, `enum`, `const`, `oneOf`/`anyOf` (union), and `allOf` (intersect). Properties not in `required` become optional. `applyPassthrough` recursively sets `additionalProperties: true` on object schemas.
+
+## 8. Error handling
+
+Source: `src/facade/mcp-core/errors.ts`. Failures are `MCPError`s with an `MCPErrorCode`.
+
+```typescript
+import { MCPError, MCPErrorCode, isMCPError, isSessionError } from "indusagi/mcp";
+
+try {
+  await client.callTool("missing_tool", {});
+} catch (error) {
+  if (isMCPError(error)) {
+    if (error.code === MCPErrorCode.TOOL_NOT_FOUND) {
+      console.log("tool not found");
+    } else if (isSessionError(error)) {
+      // SESSION_ERROR or NOT_CONNECTED — reconnect
+      await client.connect();
+    }
+    console.error(error.toString(), error.serverName, error.toolName);
+  }
+}
+```
+
+Set `INDUSAGI_DEBUG` in the environment to surface the client's debug/info logs on the console (errors always log, even without it).
+
+---
+
+## 9. The interop bridge: endpoints, fleets, mounting
+
+Source: `src/interop/`, imported from `indusagi/interop`. This layer is built on `@modelcontextprotocol/sdk` and integrates with the kernel `capabilities`/`runtime` contracts rather than the `AgentTool` facade.
+
+A `ServerConfig` is discriminated by its `kind` and carries a stable `id` used to namespace tools:
+
+```typescript
+import { createServerEndpoint, startServerFleet, mountProtocolBridge } from "indusagi/interop";
+import type { ServerConfig, BridgeConfig } from "indusagi/interop";
+
+const fs: ServerConfig = {
+  id: "filesystem",
+  kind: "stdio",
+  command: "npx",
+  args: ["-y", "@modelcontextprotocol/server-filesystem", "."],
+};
+
+const remote: ServerConfig = {
+  id: "remote",
+  kind: "sse",
+  url: "http://localhost:8080/sse",
+  headers: { Authorization: "Bearer token" },
+};
+```
+
+### A single endpoint
+
+```typescript
+const endpoint = createServerEndpoint(fs);
+await endpoint.open();                       // idle -> connecting -> ready (or faulted)
+const tools = await endpoint.listTools();    // readonly RemoteTool[], cached after first call
+const out = await endpoint.invoke("read_file", { path: "./README.md" });
+// out: RemoteCallResult { content: unknown[], isError: boolean }
+console.log(endpoint.status());              // { server, phase, toolCount, fault? }
+await endpoint.close();
+```
+
+`invoke` uses the **unqualified** server-side name. A result the server flagged `isError` is returned faithfully (not thrown); only genuine transport/protocol failures throw a `ProtocolFault`.
+
+### A fleet (failure isolation)
+
+```typescript
+const config: BridgeConfig = { servers: [fs, remote] };
+const fleet = await startServerFleet(config);  // connects all in parallel, isolating per-server failures
+
+for (const ep of fleet.endpoints()) {
+  console.log(ep.config.id, ep.phase);
+}
+console.log(fleet.status());                   // FleetStatus: Record<id, EndpointStatus>
+await fleet.tearDown();
+```
+
+A server that fails to connect is left in the `faulted` phase with its fault recorded; its healthy peers keep serving.
+
+### Mounting into the kernel
+
+```typescript
+import { mountProtocolBridge } from "indusagi/interop";
+
+const { box, fleet } = await mountProtocolBridge({ servers: [fs, remote] });
+// box: a runtime ToolBox of every grafted remote tool, named "<id>__<tool>"
+// fleet: the live ServerFleet backing those tools
+```
+
+`mountProtocolBridge` starts the fleet, lists each `ready` endpoint's tools, normalizes each remote `inputSchema` with `normalizeSchema`, and registers each as a kernel tool under its qualified `${id}__${tool}` name (`QUALIFIER` is `"__"`). Remote tools run with inert filesystem/shell backends since they execute on the remote server.
+
+### Fault handling
+
+```typescript
+import { isProtocolFault, isUsablePhase, isTerminalPhase } from "indusagi/interop";
+
+try {
+  await endpoint.invoke("do_thing", {});
+} catch (err) {
+  if (isProtocolFault(err)) {
+    // err.kind: "transport" | "protocol" | "timeout" | "tool_error" | "not_connected" | "spawn_failed"
+    console.error(err.kind, err.message);
+  }
+}
+
+isUsablePhase(endpoint.phase);    // true only when "ready"
+isTerminalPhase(endpoint.phase);  // true when "closed" or "faulted"
+```
+
+## 10. The interop provider host
+
+Source: `src/interop/protocol-bridge/host.ts`. `createProviderHost` stands up an SDK `Server` that publishes a runtime `ToolBox`'s tools to an external MCP client.
+
+```typescript
+import { createProviderHost } from "indusagi/interop";
+
+const host = createProviderHost(box, { name: "my-host", version: "1.0.0" });
+await host.connect(transport);   // transport is an @modelcontextprotocol/sdk Transport
+```
+
+The host registers `tools/list` (mapping each `box.descriptors()` entry to `{ name, description, inputSchema }`) and `tools/call` (routing into `box.runner.run` and projecting the `ToolOutcome` to `{ content: [{ type: "text", text }], isError }`). It is inert until `connect` binds it to a transport (stdio pipe, SSE stream, or an in-memory pair). When `info` is omitted it defaults to `{ name: "indus-provider-host", version: "0.1.0" }`.
+
+---
+
+For the complete export and type surface, see `api-reference.txt`. For the module map and the two-layer overview, see `README.txt`.

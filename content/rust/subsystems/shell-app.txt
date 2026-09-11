@@ -1,0 +1,558 @@
+# Shell App
+
+> `indusagi::shell_app` is the command-line front door: it turns an `argv` slice into a
+> running agent and back into a process exit code. It owns the four concerns a CLI needs —
+> parse the command line (`invocation`), resolve where state lives and what the user
+> configured (`locate` + `config`), assemble everything into an immutable `BootContext`
+> through an ordered `Stage` pipeline (`boot`), and dispatch to one of three stream-oriented
+> `Runner`s (`runners`) — plus two side concerns: idempotent startup upgrades (`upgrade`)
+> and an `auth` OAuth-helper subcommand (`auth_cli`). It is the layer the `indusagi`
+> binary composes via the single call `indusagi::shell_app::run(argv)`.
+
+This is the Rust edition of the shell-app layer documented for
+[Python](/python/subsystems/shell-app); both port the TypeScript `shell-app/` subsystem
+module-for-module and keep the same control flow (parse → boot pipeline → runner dispatch).
+The Rust port unifies on one `BootContext` (the TS split a narrower runner-side context),
+returns exit codes by `std::process::ExitCode` value instead of setting `process.exitCode`,
+and threads the boot pipeline as boxed `Stage` trait objects over an immutable context.
+
+The user-facing flag table lives on the [CLI reference](/rust/reference/cli); this page
+documents the internal structure.
+
+## Table of Contents
+
+- [Quickstart](#quickstart)
+- [Module map](#module-map)
+- [Public surface](#public-surface)
+- [Control flow](#control-flow)
+- [Invocation parsing](#invocation-parsing)
+- [The flag table](#the-flag-table)
+- [The boot pipeline](#the-boot-pipeline)
+- [Tool-box composition](#tool-box-composition)
+- [Runners](#runners)
+- [Locate and config](#locate-and-config)
+- [Upgrades](#upgrades)
+- [The auth CLI](#the-auth-cli)
+- [Notable behavior](#notable-behavior)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Quickstart
+
+`run(argv)` drives one invocation to an exit code without ever exiting the process; the thin
+`fn main()` in the `indusagi` crate is the only place the returned `ExitCode` reaches the OS.
+
+```rust
+use indusagi::shell_app::run;
+
+#[tokio::main]
+async fn main() -> std::process::ExitCode {
+    // Equivalent to: indusagi --print "explain this repo"
+    let argv = vec!["--print".into(), "explain".into(), "this repo".into()];
+    run(argv).await
+}
+```
+
+The binary itself is a three-line shim: collect `std::env::args_os().skip(1)` (lossy-UTF-8,
+matching the JS string model), drive `indusagi::shell_app::run` on a current-thread Tokio
+runtime, and return its `ExitCode`. Because `run` sets the code by value and `main` returns
+`ExitCode` (never `std::process::exit`), every destructor runs on the way out — the TUI
+restores the terminal, the MCP fleet closes, buffered writers flush.
+
+```bash
+indusagi --version                  # prints: indusagi <CARGO_PKG_VERSION>
+indusagi -p "summarize this repo"   # one-shot print mode, then exit
+indusagi --json                     # line-delimited JSON wire protocol over stdio
+indusagi                            # interactive REPL (ratatui TUI when attended)
+```
+
+## Module map
+
+`shell_app` is one module of the `indusagi` library crate. Its submodules:
+
+| Module | File | Holds |
+|--------|------|-------|
+| `cli` | `cli.rs` | The OS↔app seam: `run()` orchestrator, `render_usage`/`resolve_version`, and the `StdioSink`/`StdinSource` adapters bridging the real process streams to the boot I/O seams. |
+| `invocation` | `invocation/{mod,flags,parse}.rs` | argv → `ParsedInvocation`. `flags.rs` is the declarative 10-row `FLAG_SPECS` table + pure spelling lookups; `parse.rs` is the generic table-driven tokenizer and `Mode` derivation (incl. JS-faithful `Number()` coercion). |
+| `config` | `config/{mod,settings,locator}.rs` | Settings resolution. `settings.rs` loads/merges/normalizes three settings layers and resolves model ids (`FALLBACK_MODEL_ID`); `locator.rs` re-exports the reconciled `BRAND`/`Brand`/`Locator`/`LocatorOverrides`/`ShellLocator` so the old `config::{Locator,Brand}` barrel still resolves. |
+| `locate` | `locate/{mod,brand,locator}.rs` | Naming + path truth. Re-exports `crate::core::{BRAND, Brand, env_name, Locator, LocatorOverrides}` and adds the `ShellLocator` upgrade-marker extension trait. |
+| `boot` | `boot/{mod,context,pipeline,stages}.rs` | Startup assembly. `context.rs` defines `BootContext` + I/O seams; `pipeline.rs` the generic `Stage`/`run_stages` reducer; `stages.rs` the five concrete stages, `compose_tool_boxes`, and `build_boot_context`. |
+| `runners` | `runners/{mod,contract,registry,one_shot,wire,repl}.rs` | The three concrete runners behind the `Runner` trait (`contract.rs`) and the registry/`select_runner` (`registry.rs`). |
+| `upgrade` | `upgrade/{mod,upgrades.rs}` | Idempotent startup upgrades: the `Upgrade` record, the id-keyed `UPGRADES` set, and `apply_upgrades` with its byte-compatible marker file. |
+| `auth_cli` | `auth_cli/{mod,oauth_cli.rs}` | The `auth login/refresh/status` OAuth helper: `run_auth_command`, the `AuthIo` terminal seam, and the `CredentialStore`/`StoredCredential` on-disk types. |
+
+## Public surface
+
+Everything below is re-exported from `indusagi::shell_app` (`mod.rs`).
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `run` | async fn | `cli.rs` | Parse argv, short-circuit help/version, boot, dispatch, run closables. Returns `ExitCode` by value; never exits. |
+| `render_usage` | fn | `cli.rs` | Build the full `--help` text from `FLAG_SPECS` and `BRAND.bin_name` (byte-exact to the TS `renderUsage`). |
+| `resolve_version` | fn | `cli.rs` | Return the compile-time `crate::core::VERSION` (`CARGO_PKG_VERSION`); no fs walk, no `"0.0.0"` fallback. |
+| `tokenize_invocation` | fn | `invocation/parse.rs` | Pure, table-driven parser: `(&[String], TokenizeOptions) -> Result<ParsedInvocation, InvocationError>`. |
+| `ParsedInvocation` | struct | `invocation/parse.rs` | Parse result: `flags` map, `positionals`, derived `prompt`, and the dispatch `mode`. |
+| `Mode` | enum | `invocation/parse.rs` | `Print` / `Wire` / `Repl` / `Help` / `Version` — the single dispatch key. |
+| `TokenizeOptions` | struct | `invocation/parse.rs` | The one knob the pure parser can't discover: `attended: bool`. |
+| `InvocationError` | struct | `invocation/parse.rs` | Malformed-invocation error whose `Display` reproduces the TS message bytes. |
+| `FLAG_SPECS` | static | `invocation/flags.rs` | The canonical 10-row `&[FlagSpec]` table: the single source of CLI vocabulary. |
+| `FlagSpec` / `FlagKind` / `FlagValue` | struct/enum | `invocation/flags.rs` | One flag's declarative row; the three value shapes; the parsed value union. |
+| `Settings` / `DEFAULT_SETTINGS` | struct/fn | `config/settings.rs` | The user-tunable config surface (all fields optional) and the minimal baseline. |
+| `load_settings` / `resolve_model_id` | async fn / fn | `config/settings.rs` | Merge defaults ← global ← project (never raising); choose a catalog-validated model id. |
+| `ToolCollectionName` / `ToolSettings` / `CompactionSettings` | enum/struct | `config/settings.rs` | The settings sub-shapes. |
+| `Locator` / `ShellLocator` | struct / trait | `locate/` | The reconciled path/brand locator and the shell's upgrade-marker extension. |
+| `BootContext` / `BootIo` / `Stage` | struct/trait | `boot/` | The assembled startup context, its I/O pair, and the pipeline step trait. |
+| `build_boot_context` / `run_stages` | async fn | `boot/` | Assemble a runner-ready context; reduce an initial context through a stage list. |
+| `Closable` / `InputSource` / `OutputSink` | type/trait | `boot/context.rs` | The teardown closure type and the two narrow I/O seams. |
+| `Runner` / `select_runner` / `RUNNERS` | trait/fn | `runners/` | The runner contract, the first-accepts selector, and the ordered registry. |
+| `NoRunnerError` | struct | `runners/registry.rs` | Raised when no runner accepts a mode (a launcher bug). |
+| `OneShotRunner` / `WireRunner` / `ReplRunner` | struct | `runners/` | The three concrete runners (print / wire / repl). |
+| `InteractiveView` / `TextView` / `EndOfInput` / `AgentDeps` | trait/struct | `runners/` | The REPL UI seam, its plain-text default, the EOF marker, the re-exported runtime deps. |
+| `apply_upgrades` / `UPGRADES` / `Upgrade` | async fn / static / struct | `upgrade/upgrades.rs` | Run not-yet-applied id-keyed upgrades; the declared set; the upgrade record. |
+| `run_auth_command` / `AuthIo` | async fn / trait | `auth_cli/oauth_cli.rs` | Entry point for the `auth` subcommand; the terminal seam it reads/writes through. |
+| `CredentialStore` / `StoredCredential` | struct | `auth_cli/oauth_cli.rs` | The on-disk credential store and one provider's stored OAuth record. |
+
+## Control flow
+
+`run(argv)` (in `cli.rs`) is the orchestrator. Unlike the Python/TS edition, which bypasses
+parsing when `argv[0] == "auth"`, the Rust `run` parses straight into a `Mode`; the `auth`
+subcommand is reached through the standalone `run_auth_command` entry, not through `run`.
+
+```rust
+pub async fn run(argv: Vec<String>) -> ExitCode {
+    let attended = std::io::stdout().is_terminal() && std::io::stdin().is_terminal();
+    let invocation = match tokenize_invocation(&argv, TokenizeOptions { attended }) {
+        Ok(invocation) => invocation,
+        Err(error) => { /* write to stderr */ return ExitCode::from(2); }
+    };
+    match invocation.mode {
+        Mode::Help    => { /* render_usage()        */ return ExitCode::from(0); }
+        Mode::Version => { /* BRAND.bin_name + ver  */ return ExitCode::from(0); }
+        Mode::Print | Mode::Wire | Mode::Repl => {}
+    }
+    let io = BootIo { output: Arc::new(StdioSink), input: Arc::new(StdinSource::new()) };
+    let mut ctx: BootContext = build_boot_context(invocation, io).await;
+    let code: i32 = match select_runner(&ctx.invocation) {
+        Ok(runner) => runner.run(&ctx).await,
+        Err(error) => { /* "run failed: {error}" */ 1 }
+    };
+    for close in std::mem::take(&mut ctx.closables).into_iter().rev() {
+        close().await;
+    }
+    ExitCode::from((code & 0xff) as u8)
+}
+```
+
+1. **Attended probe.** Attended ⇔ both stdout *and* stdin are TTYs (`IsTerminal`). Biases an
+   ambiguous, prompt-less launch toward the interactive loop only on a real terminal.
+2. **Parse.** A malformed invocation writes its byte-exact message to stderr and returns
+   `ExitCode::from(2)` — the parser never partially proceeds.
+3. **Output-only short-circuit.** `Help` renders from the flag table; `Version` prints
+   `BRAND.bin_name` + `resolve_version()`. Both return `0` without booting an agent.
+4. **Boot.** For running modes, `build_boot_context` threads the invocation + the real-stream
+   I/O seams through every stage. The Rust builder is **infallible** (per-stage faults are
+   absorbed internally), so the TS "startup failed → exit 1" catch is structurally
+   unreachable — boot always yields a context.
+5. **Dispatch.** `select_runner` linearly scans `RUNNERS` for the first whose `accepts()` is
+   true and calls `runner.run(&ctx).await`. The `Err` arm is the launcher-bug guard (only the
+   output-only modes, already handled, lack a runner) → exit `1`.
+6. **Teardown.** Closables always run in reverse registration order, swallowing failures so a
+   flaky teardown never masks the run's exit code.
+
+Exit codes are clamped to the `0..=255` byte the OS accepts (`code & 0xff`); the runners only
+ever return `0`/`1` in practice.
+
+## Invocation parsing
+
+`tokenize_invocation` turns a raw argv slice into a `ParsedInvocation`. It is **pure** — it
+reads only the argv sequence and the `attended` flag, never the process, environment,
+filesystem, or a TTY — and does a single left-to-right cursor walk with **zero per-flag
+branches**: every flag is a `FlagSpec` row looked up by spelling.
+
+```rust
+pub struct ParsedInvocation {
+    pub flags: HashMap<String, FlagValue>,
+    pub positionals: Vec<String>,
+    pub prompt: Option<String>,
+    pub mode: Mode,
+}
+
+pub fn tokenize_invocation(
+    argv: &[String],
+    options: TokenizeOptions,
+) -> Result<ParsedInvocation, InvocationError>;
+```
+
+It understands long flags (`--name`, `--name=value`, `--name value`), short flags (`-x`,
+`-x=value`, glued `-xvalue`), clustered short booleans (`-ip` ⇒ `-i -p`), a value-taking
+short ending a cluster (`-ipm gpt` ⇒ `-i -p -m gpt`), the bare `--` terminator (everything
+after it is positional), a lone `-` (a positional, e.g. stdin), and the repeatable `--mcp`
+flag that accumulates into a `FlagValue::List`. Number-kind values go through `js_number`,
+which mimics JS `Number(raw)` (empty/whitespace ⇒ `0`, non-numeric ⇒ `NaN`, which is
+rejected) so the port matches byte-for-byte. Malformed input returns an `InvocationError`
+whose `Display` reproduces the TS strings exactly, e.g.:
+
+- `unrecognised flag "--bogus".`
+- `flag "--print" takes no value but got "=1".`
+- `flag "--model" expects a value.`
+- `flag "--model" expects a number but got "x".`
+
+`Mode` is derived by `derive_mode` from the parsed flags, prompt presence, and TTY
+attendance, via a fixed precedence ladder (highest first):
+
+```
+help  >  version  >  json/wire  >  interactive/repl  >  prompt/print  >  attended ? repl : print
+```
+
+```rust
+let inv = tokenize_invocation(
+    &["-p".into(), "--model".into(), "claude-sonnet-4".into(), "hello".into()],
+    TokenizeOptions { attended: false },
+)?;
+assert_eq!(inv.mode, Mode::Print);
+assert_eq!(inv.flags.get("model"), Some(&FlagValue::Str("claude-sonnet-4".into())));
+assert_eq!(inv.prompt.as_deref(), Some("hello"));
+```
+
+## The flag table
+
+`FLAG_SPECS` is the single source of truth for the CLI vocabulary — a `static &[FlagSpec]`
+of ten rows in help-render order. The parser reads it, the help renderer derives its text
+from it, and a new flag is one appended row. A `FlagSpec` carries `name` (canonical long
+name, without dashes), `aliases`, `kind`, `description`, an optional `default:
+Option<FlagDefault>` (a const-friendly `Bool`/`Str`/`Num` enum, kept compile-time so the
+table can stay a `static`), and a `repeatable` flag. A lazily-built `SpellingIndex` (`OnceLock<HashMap<&str, &FlagSpec>>`)
+maps every accepted spelling to its owning spec and **panics on a duplicate spelling** at
+first use, so a table mistake fails loudly at startup.
+
+| Flag | Aliases | Kind | Mode / effect |
+|------|---------|------|---------------|
+| `--model` | `-m` | String | Choose the model to run, by catalog id or alias. |
+| `--print` | `-p` | Boolean | One-shot answer to stdout, then exit (`Mode::Print`). |
+| `--json` | `--rpc`, `--wire` | Boolean | The JSON line protocol over stdio (`Mode::Wire`). |
+| `--interactive` | `-i` | Boolean | Force the REPL even with a prompt present (`Mode::Repl`). |
+| `--cwd` | — | String | Run as if started from this working directory. |
+| `--system` | — | String | Override the system prompt with the given text. |
+| `--no-tools` | — | Boolean | Disable every tool; the model may only produce text. |
+| `--mcp` | — | String (repeatable) | Attach an external MCP server. |
+| `--help` | `-h` | Boolean | Show usage and exit (`Mode::Help`). |
+| `--version` | `-v` | Boolean | Print the version and exit (`Mode::Version`). |
+
+`FlagValue` is the parsed-value union: `Bool(bool)`, `Str(String)`, `Num(f64)` (IEEE-754 to
+match JS), and `List(Vec<String>)` for repeatables. `default_flags()` seeds the parse with an
+empty `List` for every repeatable spec (today only `mcp`); no flag declares a non-repeatable
+default. Accessors `as_str` / `as_bool` / `is_true` / `as_list` mirror the TS guards.
+
+## The boot pipeline
+
+Startup is factored into ordered `Stage` objects reduced left-to-right by `run_stages`. Each
+stage is **immutable** — it treats `ctx` as logically immutable and returns a new context
+(conventionally `BootContext { field, ..ctx }`) — so a forgotten field is a visible bug and
+boot order is *data* (a `Vec`), not call structure.
+
+```rust
+#[async_trait]
+pub trait Stage<C>: Send + Sync {
+    fn name(&self) -> &str;
+    async fn apply(&self, ctx: C) -> C;
+}
+
+pub async fn run_stages<C: Send>(initial: C, stages: &[Box<dyn Stage<C>>]) -> C;
+```
+
+`boot_stages()` (with the alias `BOOT_STAGES()` — the only one re-exported at the `boot`
+module level) returns the five `Box<dyn Stage<BootContext>>` in order; it is a function, not
+a `static`, because each stage is a boxed trait object and stages 4/5 share a freshly-minted
+tool-box hand-off cell per build:
+
+| # | Stage | `name()` | Does |
+|---|-------|----------|------|
+| 1 | `ResolveLocator` | `resolveLocator` | Mint the production `Locator` rooted at the resolved cwd (so per-project settings resolve under it). |
+| 2 | `LoadConfiguration` | `loadConfiguration` | `load_settings` merges defaults ← global ← project, then `apply_upgrades` runs housekeeping (its `Err` is swallowed). |
+| 3 | `ResolveModel` | `resolveModel` | `pick_model_id(invocation --model, settings.default_model)` → first catalog-valid candidate (`get_card`), else `FALLBACK_MODEL_ID`. |
+| 4 | `AssembleTools` | `assembleTools` | Build the built-in `tool_box` for `collection_for(settings)` (wrapped in `CapabilitiesToolBox`); under the `mcp` feature, when `settings.mcp_servers` is non-empty `mount_protocol_bridge(to_bridge_config(servers))`, register the fleet teardown as a `Closable`, and `compose_tool_boxes([builtin, remote])` (built-in wins ties). |
+| 5 | `BuildAgentFactory` | `buildAgentFactory` | Build the immutable `AgentConfig` (model id, `settings.system_prompt` preamble, the composite box, and `to_compaction_policy(settings)`) and close over it into a `make_agent` factory that runs `create_agent(config.clone(), deps)` per call. |
+
+`build_boot_context` seeds an initial context (its `--cwd` flag overrides
+`std::env::current_dir()`), installs a panicking `make_agent` stand-in (mirrors the TS
+`unbuiltAgentFactory` — calling it before stage 5 installs the real one is a loud failure),
+and runs every stage:
+
+```rust
+pub async fn build_boot_context(invocation: ParsedInvocation, io: BootIo) -> BootContext;
+```
+
+The assembled `BootContext` is everything a runner needs and nothing it recomputes: the
+`invocation`, the merged `settings`, the `locator`, the validated `model_id`, the absolute
+`cwd`, the `make_agent: MakeAgent` factory, the `output: Arc<dyn OutputSink>` / `input:
+Arc<dyn InputSource>` seams, and the `closables: Vec<Closable>` teardown list.
+`ctx.make_default_agent()` builds an agent with default deps.
+
+The two I/O fields are deliberately narrow seams, not concrete terminals. `OutputSink::write`
+takes raw text and the *caller* terminates its own lines (so streamed assistant deltas render
+un-framed); `InputSource::next_line` is async and yields `None` at EOF. The `cli.rs`
+production bindings are `StdioSink` (best-effort raw writes to stdout/stderr, a closed pipe is
+swallowed) and `StdinSource` (a `BufReader` `Lines` iterator behind a `Mutex`, advanced on a
+`tokio::task::spawn_blocking` thread so the async loop never stalls).
+
+## Tool-box composition
+
+`compose_tool_boxes(boxes: Vec<Arc<dyn ToolBox>>) -> Arc<dyn ToolBox>` merges several boxes
+into one composite. The composite's `descriptors()` are every box's descriptors concatenated
+in order (built-in first), and its runner routes each `ToolCall` to the box that **first**
+claimed the named tool — so built-in tools shadow same-named remote tools, and an unknown
+tool name resolves to an `is_error` `ToolOutcome` (`no tool named "<n>" is available`) rather
+than panicking. It is backed by `CompositeToolBox` (the union of boxes) and `CompositeRunner`
+(a `HashMap<String, Arc<dyn ToolRunner>>` route table).
+
+```rust
+let builtin: Arc<dyn ToolBox> =
+    Arc::new(CapabilitiesToolBox::new(tool_box(collection, Some(cwd))));
+let composite = compose_tool_boxes(vec![builtin, remote]); // built-in wins any name tie
+```
+
+## Runners
+
+A `Runner` is one self-describing way to drive the agent: an `id`, an
+`accepts(&ParsedInvocation) -> bool`, and an `async run(&BootContext) -> i32`. The trait is
+`#[async_trait(?Send)]`: the returned future borrows the (intentionally non-`Sync`)
+`BootContext` and the launcher drives it inline on one task, faithful to the single-threaded
+JS event loop. `run` must **not** exit the process — the boot layer stays in control of
+teardown.
+
+```rust
+#[async_trait(?Send)]
+pub trait Runner: Send + Sync {
+    fn id(&self) -> &str;
+    fn accepts(&self, invocation: &ParsedInvocation) -> bool;
+    async fn run(&self, ctx: &BootContext) -> i32;
+}
+```
+
+`runners()` (aka `RUNNERS()`) lists the three concrete runners; `select_runner` returns the
+first that accepts, else `Err(NoRunnerError { mode })` (message `no runner accepts invocation
+mode '<mode>'`). The registry covers only the running modes; `help`/`version` are output-only
+and short-circuited by `run` before they reach it.
+
+| Runner | `id()` | Mode | Behavior |
+|--------|--------|------|----------|
+| `OneShotRunner` | `one-shot` | `Print` | Subscribe to the agent's `RunEvent` stream, forward each `TextDelta` straight to the sink, then terminate the line. Empty/whitespace prompt is a no-op success (no model round). A faulted run writes `run failed[: <message>]` to stderr and returns `1`. If nothing streamed but the run settled cleanly, it falls back to the last assistant text in the snapshot so `--print` is never silently empty. |
+| `WireRunner` | `wire` | `Wire` | Pull complete lines from the input seam, ignore blanks, and handle each: parse JSON, narrow to `{ "type": "submit", "input": <str> }` via `as_submit_request`, stream that submit's events as `event` lines, then emit one `result` line with the terminal `RunSnapshot`. Malformed/unrecognised lines emit an `error` line and the loop continues. EOF ⇒ exit `0`. |
+| `ReplRunner` | `repl` | `Repl` | Under the `tui` feature, when attended (both stdio TTYs) it mounts the live ratatui `InteractiveApp` via `crate::tui_render::mount_interactive`; otherwise it runs the plain-text `TextView` loop over the boot seams. |
+
+### The wire protocol
+
+Every message is one newline-terminated line of JSON. The response shape is the
+`#[serde(tag = "type", rename_all = "lowercase")]` enum `WireResponse` (`Event { event }` /
+`Result { snapshot }` / `Error { message }`), serialized via `serde_json::to_string` over
+types whose field renames and `preserve_order` insertion order reproduce the TS
+`JSON.stringify` byte-for-byte. The TS owned the raw byte stream (buffering, cross-chunk
+reassembly, a promise-chain serializer); the Rust port collapses that to a plain
+`while let Some(line) = ctx.input.next_line().await` loop because the line seam already
+reassembles partial lines beneath it — each `submit` is awaited to settlement (events
+streamed via a per-submit subscription, detached after the await) before the next line is
+read, preserving the contiguous-per-request event order.
+
+### The interactive view seam
+
+The REPL keeps presentation behind the `InteractiveView` trait (`render`/`prompt`/`close`),
+so the read/submit/render loop knows nothing about *how* a turn is shown.
+
+```rust
+#[async_trait]
+pub trait InteractiveView: Send + Sync {
+    fn render(&self, event: &RunEvent);
+    async fn prompt(&self) -> Result<String, EndOfInput>;
+    fn close(&self);
+}
+```
+
+`prompt` signals end-of-input by **returning `Err(EndOfInput)`** rather than a sentinel, so an
+empty line stays a legitimate submittable value (`EndOfInput` is a zero-sized `std::error::Error`
+whose `Display` is `end of interactive input`). `TextView` is the default plain-text
+implementation over the boot seams: it writes `TextDelta`s inline, brackets tool lifecycle
+(`\n[tool <name> running]\n`, `[tool <name> done]\n`), reports faults (`\n[run failed:
+<msg>]\n`), and breaks the open line on `Settled`. The loop skips blank lines, leaves on the
+`exit`/`quit` words (`is_exit_word`, trimmed + case-insensitive), and ends cleanly on EOF
+(exit `0`). The richer surface is the ratatui app, mounted only when both streams are TTYs
+and the `tui` feature is compiled in; `--no-default-features` always falls through to
+`TextView`. See [the UI render layer](/rust/ui/tui-render) for the live mount.
+
+## Locate and config
+
+The `locate` module is naming + path truth. It re-exports the reconciled core types —
+`BRAND`, `Brand`, `env_name`, `Locator`, `LocatorOverrides` — rather than duplicating them
+(the TS had two `Locator`s and two `Brand`s; `indusagi_core` reconciled them into one of
+each, honoring `INDUSAGI_HOME` on every state path). The shell adds exactly one thing: the
+upgrade-marker path, as the `ShellLocator` extension trait on the core `Locator` so the one
+type stays the single source of truth.
+
+```rust
+pub trait ShellLocator {
+    fn upgrade_marker_path(&self) -> PathBuf; // <profile>/upgrades.json
+}
+```
+
+`BRAND` is the frozen ten-field naming record: `app_name`/`bin_name` = `"indusagi"`,
+`env_prefix` = `"INDUSAGI_"`, `profile_dir_name` = `".indusagi"`, `settings_file_name` =
+`"settings.json"`, `auth_store_file_name` = `"auth.json"`, `sessions_dir_name` =
+`"sessions"`, `logs_dir_name` = `"logs"`, `project_settings_file_name` = `"settings.json"`,
+and `project_dir_name` = `".indusagi"`. `env_name("api key")` ⇒ `"INDUSAGI_API_KEY"` (trim,
+fold `[\s-]+` to `_`, uppercase); `env_name_with(suffix, &brand)` is the same grammar over an
+explicit brand's `env_prefix` (the shell re-exports `env_name`; the `locate::brand` submodule
+additionally re-exports `env_name_with`). `LocatorOverrides { home, cwd }` sandboxes both
+roots for tests/embeds; the `home` precedence is override → `INDUSAGI_HOME` → OS home.
+
+`config::settings` resolves *what* the user configured. `Settings` is the user-tunable
+surface — every field optional — and merges in three shallow "later wins" layers:
+
+```rust
+pub struct Settings {
+    pub default_model: Option<String>,
+    pub system_prompt: Option<String>,
+    pub tools: Option<ToolSettings>,
+    #[cfg(feature = "mcp")] pub mcp_servers: Option<Vec<ServerConfig>>,
+    pub compaction: Option<CompactionSettings>,
+}
+
+pub async fn load_settings(locator: &Locator, cwd: &str) -> Settings;
+```
+
+`load_settings` reads the global file (`<profile>/settings.json`) and the project file
+(`<cwd>/.indusagi/settings.json`) concurrently (`tokio::join!`), then merges
+`default_settings()` ← global ← project. It **never raises**: a missing, unreadable, non-UTF-8,
+malformed-JSON, or wrong-top-level-shape file degrades to "nothing supplied at this layer".
+`normalize_settings` is the trust boundary — it keeps only well-typed fields (camelCase JSON
+keys: `defaultModel`, `systemPrompt`, `tools.collection`, `mcpServers`, `compaction.{triggerRatio,
+keepRecent}`) and silently drops the rest. `DEFAULT_SETTINGS()` is the minimal baseline:
+`tools.collection = "coding"`.
+
+`resolve_model_id(settings, invocation_model)` applies the fallback ladder — invocation
+override > `settings.default_model` > `FALLBACK_MODEL_ID` (`"claude-sonnet-4"`) — validating
+each candidate against the catalog with `crate::llmgateway::get_card`.
+
+## Upgrades
+
+`apply_upgrades` runs each `Upgrade` (keyed by a stable `id`, not a version number) at most
+once per install, tracked in a byte-compatible `upgrades.json` marker under the profile dir.
+
+```rust
+pub struct Upgrade {
+    pub id: &'static str,
+    pub description: &'static str,
+    pub apply: UpgradeApply, // for<'a> fn(&'a Locator) -> UpgradeFuture<'a>
+}
+
+pub async fn apply_upgrades(locator: &Locator) -> std::io::Result<Vec<String>>;
+```
+
+`read_applied` reads the marker forgivingly (a missing/corrupt/wrong-shape file ⇒ "nothing
+has run yet"; non-string entries discarded into a sorted `BTreeSet`). `apply_upgrades`
+applies each `UPGRADES` entry whose id is absent, in declaration order, records each success,
+and flushes the marker once at the end — **flush-then-propagate**: if one upgrade fails, the
+ids that already succeeded this pass are still persisted before the error propagates. It
+returns the ids applied this pass (empty when already fully upgraded). The marker is written
+as a 2-space-indented sorted JSON array with a trailing newline
+(`"[\n  \"ensure-profile-dir\",\n  \"ensure-sessions-dir\"\n]\n"`), byte-identical to the TS
+`JSON.stringify(ids, null, 2) + "\n"`.
+
+The declared `UPGRADES` are `ensure-profile-dir` (create the profile dir) and
+`ensure-sessions-dir` (create the sessions subdir). The boot layer swallows the runner's
+`Err`, so housekeeping never blocks startup.
+
+## The auth CLI
+
+`run_auth_command(argv, io)` is the `auth` subcommand entry. It is a standalone public
+function (a launcher or test calls it directly with the slice after the `auth` word); note
+that `shell_app::run` does **not** itself dispatch `auth` in the Rust edition. It returns an
+exit code — `EXIT_OK` (0), `EXIT_USAGE` (2), or `EXIT_FAILURE` (1) — and never exits the
+process.
+
+```rust
+#[async_trait]
+pub trait AuthIo: Send + Sync {
+    fn print(&self, line: &str);
+    fn warn(&self, line: &str);
+    async fn ask(&self, prompt: &str) -> String;
+}
+
+pub async fn run_auth_command(argv: &[String], io: &dyn AuthIo) -> i32;
+```
+
+All terminal interaction goes through the `AuthIo` seam (so the command is deterministic and
+free of direct stdio coupling), and all PKCE/OAuth math comes from the `crate::llmgateway`
+re-exports (`create_pkce_pair`, `build_auth_url`, `oauth_config_for`, `AuthUrlInputs`,
+`exchange_code`, `refresh_token`, `OAuthTokens`, `OAuthConfig`, `ProviderId`). The three
+subcommands (narrowed from the verb by `as_subcommand` into the `Subcommand` enum
+`Login`/`Refresh`/`Status`):
+
+- **`login <provider>`** — resolve the provider's OAuth config, mint a 64-char PKCE pair and
+  a CSRF `state`, print the authorization URL, read the pasted code (`extract_code` accepts a
+  bare code, a `code#state` form, or a full redirect URL with a percent-decoded `code=` query
+  param), exchange it for tokens, and persist them. An empty paste aborts with `EXIT_FAILURE`
+  before any network call.
+- **`refresh <provider>`** — read the stored refresh token, mint a fresh access token, carry
+  the prior refresh token forward if the server didn't rotate one, and write the rotated
+  credentials back.
+- **`status [provider]`** — list the providers holding stored credentials with each one's
+  freshness (`valid for ~<n> min` / `expired` / `no expiry recorded`) and refreshability.
+
+Auth is OAuth-paste-based (no local callback server). The credential store `CredentialStore`
+is a struct wrapping a `providers: indexmap::IndexMap<String, StoredCredential>` keyed by the
+provider's serde name; `StoredCredential` carries `access_token`, optional `refresh_token`,
+optional `expires_at`, and an `updated_at` stamp. The store is serialized as pretty JSON at
+`Locator::auth_store_path()` with camelCase field names (`accessToken`, `refreshToken`,
+`expiresAt`, `updatedAt`) and a trailing newline for byte-compatibility; absent optional
+fields are skipped, and a missing/corrupt store loads as empty. The full provider set is
+`KNOWN_PROVIDERS` (anthropic, openai, google, google-vertex, amazon, azure, nvidia, kimi,
+ollama, mock), but only the OAuth-capable ones are advertised (`oauth_provider_names()` ⇒
+`anthropic`, `openai`). The two network seams (`exchange_code_seam` / `refresh_token_seam`)
+wrap the gateway over a one-shot crate-local `reqwest::Client` (`auth_http_client()`) — the
+only socket touch-points, reached only by the live `login`/`refresh` flows, never by a unit
+test.
+
+## Notable behavior
+
+- Of the value/effect flags, only `--cwd` and `--model` are actually read off the invocation
+  during boot (`read_cwd_flag` while seeding the context in `build_boot_context`, then stage 1
+  roots the `Locator` at that cwd; `read_model_flag` in stage 3). The system preamble, MCP
+  servers, and tool collection are sourced from the merged
+  *settings* (`settings.system_prompt`, `settings.mcp_servers`, `settings.tools.collection`) —
+  the `--system`, `--mcp`, and `--no-tools` flags are declared in `FLAG_SPECS` and parsed into
+  the flag bag, but no boot stage consumes them today, so they are inert as flags (the wiring
+  point is the invocation→settings overlay, not yet present).
+- `build_boot_context` is infallible by construction, so the TS "startup failed → exit 1"
+  catch has no Rust analogue.
+- The wire runner pins its JSON output via serde field renames + `preserve_order`, matching
+  the TS `JSON.stringify` key order and number formatting byte-for-byte.
+- `resolve_version` has no fs walk and no `"0.0.0"` fallback — every crate reads the single
+  compile-time `crate::core::VERSION` (`CARGO_PKG_VERSION`).
+- The exit code is clamped to a `0..=255` byte (`code & 0xff`) before becoming an `ExitCode`.
+- `TextView` and the REPL's plain loop are explicit placeholders — the real interactive
+  surface is the ratatui app, mounted only when both streams are TTYs under the `tui` feature.
+- A duplicate flag spelling in `FLAG_SPECS` panics at first index build — a table mistake
+  fails loudly at startup.
+
+## Relationship to neighbors
+
+`shell_app` sits at the top of the stack and consumes the published seams of its neighbors:
+
+- [Runtime](/rust/subsystems/runtime) — `create_agent`, `Agent`, `AgentConfig`, `AgentDeps`,
+  `CompactionPolicy`, `ToolBox`/`ToolRunner`/`ToolCall`/`ToolOutcome`, and the
+  `RunEvent`/`RunSnapshot`/`RunPhase` contract the runners project.
+- [Capabilities](/rust/subsystems/capabilities) — `tool_box`, `ToolCollection`, and the
+  `CapabilitiesToolBox` runtime adapter.
+- [Interop](/rust/subsystems/interop) — `mount_protocol_bridge`, `BridgeConfig`,
+  `ServerConfig` (gated behind the `mcp` feature), and the fleet teardown.
+- [LLM Gateway](/rust/subsystems/llm-gateway) — `get_card` as the model-validity oracle;
+  `ProviderId`; and the OAuth helpers (`create_pkce_pair`, `build_auth_url`, `oauth_config_for`,
+  `exchange_code`, `refresh_token`, `OAuthTokens`, `OAuthConfig`, `GatewayError`) the auth CLI
+  drives.
+- [Core](/rust/subsystems/core) — `BRAND`, `Brand`, `env_name`, `Locator`,
+  `LocatorOverrides`, `VERSION`, `now_ms`, `new_id`, and the cancellation token.
+- [UI render](/rust/ui/tui-render) — `mount_interactive` and `MountOptions`, resolved only
+  under the `tui` feature so a non-TTY launch or `--no-default-features` build falls back to
+  the text loop.
+
+The `indusagi` binary's `fn main()` composes this layer with a single call:
+`runtime.block_on(indusagi::shell_app::run(argv))`. Back to the
+[Architecture overview](/rust/architecture).

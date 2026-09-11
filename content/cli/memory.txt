@@ -1,0 +1,105 @@
+# Memory
+
+> Memory in indusagi is a **working-memory scratch note** the agent reads and updates with a tool, plus **project-context files** (`AGENTS.md` / `CLAUDE.md`) that are inlined into the system prompt. There is no vector store, embeddings, or semantic search.
+
+Two distinct mechanisms give the agent durable context:
+
+1. The **working-memory capability** — a model-callable `memory` tool that maintains a small text note surviving across turns within a session.
+2. **Project-context documents** — `AGENTS.md` and `CLAUDE.md` files, discovered at startup and inlined into the briefing as standing instructions.
+
+## Table of Contents
+
+- [Working Memory](#working-memory)
+- [The `memory` Tool](#the-memory-tool)
+- [The `/memory` Command](#the-memory-command)
+- [Project-Context Files](#project-context-files)
+- [Source Files](#source-files)
+
+## Working Memory
+
+The working-memory card ships as one of the app's novel capability cards. It gives the agent a single mutable text buffer — a scratchpad for durable facts, decisions, or reminders it wants to keep even after older messages scroll out of context.
+
+The store is a narrow three-method port:
+
+```typescript
+interface MemoryStore {
+  read(): string;
+  replace(content: string): void;
+  append(line: string): void;
+}
+```
+
+The default implementation is `InMemoryStore` — an in-process buffer scoped to one built capability (one session). It is **not persisted to disk**: the note lives in memory for the life of the session.
+
+A host may wire a framework-backed store in via the deck context under the `MEMORY_HANDLE_KEY` (`"memoryStore"`); when no handle is wired, the card falls back to a fresh `InMemoryStore`. The framework's `indusagi/memory` facade does not yet export a public working-memory store, so the in-memory default is what runs today.
+
+## The `memory` Tool
+
+The agent calls the capability as a tool named `memory`. Its parameters key on an `action` discriminant:
+
+| `action` | Effect |
+|----------|--------|
+| `read` | Return the current note. |
+| `replace` | Overwrite the note with `content`. |
+| `append` | Add `content` as a single line to the end of the note. |
+
+```jsonc
+// read the note
+{ "action": "read" }
+
+// overwrite it
+{ "action": "replace", "content": "Project uses pnpm; tests run with vitest." }
+
+// add a line
+{ "action": "append", "content": "Decision: switch the cache layer to Redis." }
+```
+
+Each call returns the note's text and a structured detail:
+
+```typescript
+interface MemoryDetails {
+  readonly action: "read" | "replace" | "append";
+  readonly ok: boolean;
+  readonly length: number;  // length of the note after the call
+}
+```
+
+The tool is a scratchpad, not a log — `content` is ignored for `read`, and `append` is a no-op when no `content` is supplied.
+
+## The `/memory` Command
+
+In the interactive console, `/memory` opens a plugin overlay describing the capability and offers a few sub-commands:
+
+| Verb | Effect |
+|------|--------|
+| `/memory status` | Show the memory state and tool name in an overlay. |
+| `/memory on` | Mark the working-memory surface active (session-local toggle). |
+| `/memory off` | Mark the working-memory surface inactive. |
+| `/memory tools` | List the model-facing tool name(s) the card contributes. |
+
+The `on`/`off` toggle is a **best-effort, session-local** flag so a user can mark the surface inactive without rebuilding the deck; it does not delete a note. If the working-memory card is not registered in the running build, the verbs report that instead of pretending to act.
+
+## Project-Context Files
+
+Beyond the working-memory note, the agent reads **project-context documents** at startup. The startup scan looks, in display order, for:
+
+```
+AGENTS.md
+CLAUDE.md
+```
+
+It checks two roots — the current working directory and the home directory (`~`, **not** `~/.indusagi`) — joining each filename directly onto the root, and surfaces each file that exists (de-duplicated). When a context document is provided to the briefing, the **Project context** section inlines it under its own sub-heading and frames it as a standing instruction:
+
+> The following project documents describe conventions for this repository. Treat them as standing instructions.
+
+This is how repository conventions enter the system prompt. Unlike the working-memory note (a tool the model drives at runtime), context files are read once at startup and composed into the briefing.
+
+## Source Files
+
+Internal source (`indus-code-rebuild/src`):
+
+- `capability-deck/cards/memory-card.ts` — `MemoryStore`, `InMemoryStore`, `buildMemoryCapability`, `memoryCard`, `MEMORY_HANDLE_KEY`, the `memory` tool contract.
+- `capability-deck/cards/index.ts` — `APP_NOVEL_CARDS` (includes `memoryCard`).
+- `console/slash/commands/integrations.ts` — the `/memory` command and its `status`/`on`/`off`/`tools` sub-commands.
+- `console/startup.ts` — `CONTEXT_FILES` (`AGENTS.md`, `CLAUDE.md`) discovery.
+- `briefing/compose.ts` — the **Project context** briefing section that inlines context docs.

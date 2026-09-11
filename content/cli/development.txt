@@ -1,0 +1,134 @@
+# Development
+
+> Building and contributing to the indusagi coding agent. The package is `indusagi-coding-agent`; it runs entirely on the `indusagi` framework (one dependency). It is built from scratch against the framework's public API — see [`CREDITS.md`](https://www.npmjs.com/package/indusagi-coding-agent) and `NOTICE`.
+
+## Requirements
+
+- **Node.js >= 20** (the bin targets `node20`).
+- The `indusagi` framework, pulled in as a dependency (`"indusagi": "^0.12.34"`).
+
+## Setup
+
+```bash
+npm install
+```
+
+## Scripts
+
+Every workflow is a `package.json` script. There is no `Makefile` and no shell wrapper.
+
+| Script | Command | What it does |
+|--------|---------|--------------|
+| `build` | `node build.mjs` | esbuild bundle → `dist/entry.js`, then `tsc` emits `.d.ts` → `dist/types` |
+| `typecheck` | `tsc -p tsconfig.json --noEmit` | Type-check the whole tree without emitting |
+| `test` | `vitest --run` | Run the Vitest suite once |
+| `test:watch` | `vitest` | Run Vitest in watch mode |
+| `lineage-scan` | `node scripts/lineage-scan.mjs` | Clean-room guard (see below); exits non-zero on any upstream marker |
+
+```bash
+npm run build          # bundle the bin + emit declarations
+npm run typecheck      # tsc --noEmit
+npm test               # vitest --run
+npm run lineage-scan   # clean-room guard
+```
+
+## The build
+
+`build.mjs` does two things:
+
+1. **Bundle the bin.** esbuild bundles `src/entry.ts` → `dist/entry.js` as an ESM
+   module (`platform: "node"`, `target: "node20"`). All dependencies stay
+   **external** (`packages: "external"`) and resolve at runtime from
+   `node_modules` — `indusagi`, `react`, `ink`, and the rest are not inlined.
+   JSX is compiled with `jsx: "automatic"` and `jsxImportSource:
+   "indusagi/react-host"` (the framework's React host runtime), so esbuild reads
+   `tsconfig.json` for the JSX and path settings. The script then guarantees
+   exactly one `#!/usr/bin/env node` shebang at the top of `dist/entry.js` and
+   `chmod`s it to `0o755`.
+
+2. **Emit declarations.** It shells out to
+   `tsc -p tsconfig.json --emitDeclarationOnly --declaration --outDir dist/types`,
+   producing the `.d.ts` tree the package's `types` field points at
+   (`./dist/types/index.d.ts`).
+
+The output of a successful build is just `dist/` (the bin plus types):
+
+```
+dist/
+  entry.js        # the runnable bin (chmod 0755, shebang)
+  types/          # emitted .d.ts declarations
+```
+
+`build.mjs` clears `dist/` first; if the directory cannot be removed wholesale
+(for example a stray root-owned file left by a `sudo` build) it falls back to
+wiping only `dist/entry.js` and `dist/types` so the build still proceeds.
+
+## Package layout
+
+The binary is `src/entry.ts` (installed as both `indus` and `indusagi`). Each
+subsystem is a self-contained module and is also re-exported as a namespace from
+`src/index.ts` for embedding and testing.
+
+| Module | Responsibility |
+|--------|----------------|
+| `boot` | argv → invocation, workspace prep, runner selection |
+| `workspace` | per-project + global dirs, settings, session paths |
+| `launch` | flag grammar, `@file` attachments, credentials, model catalog & pickers |
+| `conductor` | the conversation loop — turns, tool invocation, retry, branch/resume, compaction |
+| `window-budget` | token accounting + context-window compaction policy |
+| `capability-deck` | the tool registry (read/write/edit/bash/grep/find/web…) and dynamic MCP enrollment |
+| `runtime-bridge` | provider routing — framework network stream vs. external CLI/peer runtimes |
+| `addons` | loadable extensions: skills & subagents |
+| `console` | the interactive Ink/React surface |
+| `channels` | print + line-protocol headless surfaces |
+| `briefing` | system prompt / context assembly |
+| `transcript-export` | session persistence + HTML/markdown export |
+| `insight` | tracing, sinks, replay, secret redaction |
+| `sessions` | session record format and persistence |
+| `settings` | the typed preference record |
+| `kit` | leaf helpers (image sniff, managed-binary fetch, shell quoting) |
+
+The root barrel re-exports each as a namespace:
+
+```typescript
+import { boot, conductor, capabilityDeck, runtimeBridge, VERSION } from "indusagi-coding-agent";
+```
+
+## Clean-room posture
+
+The agent is an independent implementation written from a behavioral spec and
+the framework's public API — no third-party application source was copied.
+`npm run lineage-scan` runs `scripts/lineage-scan.mjs`, which walks `src/` and
+exits non-zero if any **non-test** file carries an upstream-source marker
+(word-boundary regexes such as `pi-mono`, `pi-ai`, `pi-agent`, `pi-tui`,
+`pi-mcp`, `pi-coding-agent`, `@mariozechner`). Test files are excluded on
+purpose — several of them assert the *absence* of those markers, so they quote
+them legitimately. `node_modules/` and `dist/` are skipped. Run it as part of
+every release check:
+
+```bash
+npm run lineage-scan
+# lineage-scan: PASS — no upstream markers in non-test source.
+```
+
+## Versioning
+
+The product version lives in exactly one place: the `VERSION` constant in
+`src/workspace/brand.ts`, co-located with the `BRAND` record so `boot` reads it
+without importing the index barrel. Bump that one line per release (and keep
+`package.json`'s `version` in step). `indus --version` / `-v` prints it.
+
+## Rebranding
+
+Every identity literal — product name, profile-directory leaf, bin names, env
+var namespace, share-viewer origin — lives in the single frozen `BRAND` record
+in `src/workspace/brand.ts`. A rebrand edits that record (and `package.json`'s
+`bin`) and nothing else. The shape is enforced by the `Brand` type from the boot
+contract, so a drift is a compile error rather than a runtime surprise.
+
+## See also
+
+- [README](README.md) - Overview and quick start
+- [Settings](settings.md) - Preference keys and config tiers
+- [Features](features.md) - Capability summary
+- [MCP](mcp.md) - Attaching external MCP servers

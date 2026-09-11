@@ -1,0 +1,182 @@
+# Sessions & Branching
+
+> The `induscode.sessions` subpackage is the catalog-and-navigation layer over a workspace's persisted conversations. Where the [conductor](/python-cli/subsystems/conductor) owns one live transcript at a time, `SessionLibrary` owns the whole directory of saved sessions — listing, opening, renaming, and deleting them, and projecting a loaded transcript tree into flat shapes a chooser UI can resume, branch, and fork from. Reached via `from induscode.sessions import SessionLibrary`, and wired by boot to honor the `--continue` / `--resume` flags.
+
+## Table of Contents
+
+- [What this is](#what-this-is)
+- [Public API](#public-api)
+- [The branchable transcript tree](#the-branchable-transcript-tree)
+- [Listing sessions: shallow vs deep](#listing-sessions-shallow-vs-deep)
+- [Opening and resuming](#opening-and-resuming)
+- [Navigation projections: tree and prior turns](#navigation-projections-tree-and-prior-turns)
+- [Forking from a prior turn](#forking-from-a-prior-turn)
+- [Rename and delete](#rename-and-delete)
+- [Per-cwd session scoping](#per-cwd-session-scoping)
+- [How boot wires it](#how-boot-wires-it)
+- [Console overlay bridge](#console-overlay-bridge)
+- [Gotchas](#gotchas)
+
+## What this is
+
+The sessions subpackage is a thin reader/manager over the conductor's persisted NDJSON transcripts. It re-implements **no** transcript parsing or message serialization — that all lives in the [conductor](/python-cli/subsystems/conductor), which is the writer of the append-only tree (one parent-linked node per message, plus a head line tracking the active leaf). `SessionLibrary` is the reader/manager of the *collection*: its own logic is purely directory enumeration, tree flattening, and text reduction to short previews.
+
+The whole subpackage is three files — `__init__.py`, `contract.py`, and `library.py` — and is fully implemented and tested, not a placeholder.
+
+```python
+from induscode.sessions import SessionLibrary, SavedSession, BranchNode, PriorTurn
+```
+
+## Public API
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `SessionLibrary` | class | `induscode/sessions/library.py` | Collection-level handle over a workspace `sessions/` directory. `async list()`/`open()`/`rename()`/`remove()` manage files; pure `tree()`/`prior_turns()` project a loaded `TranscriptStore`; `path_of()`/`directory` expose locations. |
+| `SavedSession` | dataclass | `induscode/sessions/contract.py` | Frozen, slotted catalog row for one persisted session: `id` (filename stem), `path`, plus best-effort `name`/`lastModified`/`size`/`messageCount`/`preview` that may be `None` on a shallow listing. |
+| `BranchNode` | dataclass | `induscode/sessions/contract.py` | Frozen, slotted row in the flattened transcript tree: `id`, `parent`, render-ready `label`, `depth`, `isLeaf`, `isCurrent`. |
+| `PriorTurn` | dataclass | `induscode/sessions/contract.py` | Frozen, slotted fork candidate: a past user turn with `entryId` (fork-target node id), full `text`, and a trimmed single-line `preview`. |
+
+`SessionLibrary` carries `__slots__ = ("_dir", "_backend")`. The constructor takes a single keyword arg `sessions_dir` and builds a conductor `fs_backend` rooted at that directory. All disk I/O runs through `asyncio.to_thread` so the async surface never blocks the event loop.
+
+The three dataclasses are deliberately minimal display-only records carrying stable string ids and short text previews — no framework `AgentMessage` payloads — so a UI can list, rename, delete, walk, and fork without rehydrating message content. Field names keep the camelCase spelling (`lastModified`, `messageCount`, `entryId`, `isLeaf`, `isCurrent`) per the port convention.
+
+## The branchable transcript tree
+
+The [conductor](/python-cli/subsystems/conductor) persists a conversation as an append-only **tree**, not a flat list. Each `TranscriptEntry` names its `parent`, and a separate head leaf marks the active tip. The active conversation — what the agent would replay — is the root→leaf branch reachable by walking `parent` links up from the head leaf (the store's `path_to()`).
+
+Branching/forking is simply repointing the head at an earlier node: the conductor's `store.branch_at(id)` rewrites the head line so the next `append` becomes that node's child, leaving every existing node untouched. This is what lets you resume a session and then re-ask an earlier prompt down a fresh branch without destroying the old one.
+
+`SessionLibrary` gives a UI the two views it needs over this structure:
+
+- `tree(store)` flattens the **whole** tree (every root and all of its descendants) into an ordered list of `BranchNode`s.
+- `prior_turns(store)` walks **only** the active root→leaf branch and returns the user prompts on it as `PriorTurn` fork candidates.
+
+## Listing sessions: shallow vs deep
+
+`list(deep=False)` returns rows built from file metadata only — `id`, `path`, `size`, and `lastModified` — so a large directory lists fast. It scans the directory via `os.listdir`, keeps only files ending in `.ndjson`, and stats each for its byte size and modification time. A missing directory yields an empty list rather than an error. Rows are returned **newest-modified first** (ties broken by id).
+
+`list(deep=True)` additionally opens each transcript to fill `messageCount` (the count of conversational `user`/`assistant`/`tool` nodes along the active branch) and the opening-turn `preview`/`name` (a short excerpt of the first user prompt).
+
+```python
+from induscode.sessions import SessionLibrary
+
+lib = SessionLibrary(sessions_dir="/abs/path/to/workspace/sessions/--my-proj--")
+
+rows = await lib.list()            # shallow: newest-modified first; [] if dir missing
+if rows:
+    newest = rows[0]               # SavedSession
+
+rows = await lib.list(deep=True)   # deep: also fills messageCount + opening-turn preview
+for r in rows:
+    print(r.id, r.messageCount, r.preview)   # preview/name = first user prompt
+```
+
+The console picker seeds with a shallow list for responsiveness and loads the deep list lazily (e.g. when the all-scope toggle is flipped).
+
+## Opening and resuming
+
+`open(id)` hydrates a saved session back into a live `TranscriptStore`, or returns `None` when no file with that id exists:
+
+```python
+store = await lib.open("alpha")    # TranscriptStore | None
+```
+
+The library adds nothing to the rehydration beyond binding the filesystem backend: `open` delegates to `TranscriptStore.open(id, backend=...)`, which reads the backend, parses the NDJSON, and rebuilds state through the conductor's pure `replay()` reducer — pinning the head leaf from the head line (or the deepest leaf when a file has no head line).
+
+`id` is always the **bare filename stem**, never a path — that is what the conductor's `resume` loads by.
+
+## Navigation projections: tree and prior turns
+
+Both `tree()` and `prior_turns()` are **pure** — they do no I/O and require a pre-opened store.
+
+`tree(store)` reads `store.state().nodes` and `store.head.leaf`, builds a children-of map keyed by parent, then depth-first walks every root (a node whose `parent` is `None`), emitting one `BranchNode` per node:
+
+- `label` — a depth-indented, role-aware one-liner (`user: <preview>`, `assistant`, `tool: <toolName>`, `condense`, `system`, or `note`).
+- `depth` — distance from the root (root is depth 0).
+- `isLeaf` — true when no node names this node as `parent`.
+- `isCurrent` — true when this node equals the active head leaf.
+
+`prior_turns(store)` walks `store.path_to()` (the active branch), keeps the `user`-role nodes whose reduced text is non-empty, and emits one `PriorTurn` each with `entryId`, full `text`, and a single-line `preview`.
+
+```python
+store = await lib.open("alpha")
+
+for node in lib.tree(store):           # list[BranchNode] — the whole tree
+    print("  " * node.depth, node.label, node.isCurrent, node.isLeaf)
+
+for turn in lib.prior_turns(store):    # list[PriorTurn] — along active branch only
+    print(turn.entryId, turn.preview)
+```
+
+## Forking from a prior turn
+
+To re-ask or re-edit an earlier prompt, pick a `PriorTurn` and hand its `entryId` to the conductor's branch verb — the library produces the candidate; the conductor performs the fork:
+
+```python
+# pick a candidate from prior_turns(store), then fork the live store at it:
+await store.branch_at(turn.entryId)    # conductor verb; raises ValueError for an unknown id
+# the next store.append(...) now becomes a child of that node, on a new branch
+```
+
+The library's job ends at projection — it never mutates the transcript tree itself. Forking, resetting, and starting a new session are all conductor verbs (`branch_at`, `reset`, `start_new_session`).
+
+## Rename and delete
+
+These are the two file-level mutations a session manager needs. Both run their disk work through `asyncio.to_thread`.
+
+```python
+new_path = await lib.rename("alpha", "renamed")  # returns new abs path
+removed   = await lib.remove("renamed")           # True removed, False already-absent
+```
+
+`rename(from_id, to_id)` validates that the source file exists and the target id is absent, then performs a plain `os.rename`. It **raises `ValueError`** if the source is missing or the target already exists. Note that rename is a pure file move — it does *not* rewrite the in-file head line (which still names the old id); the store tolerates this on the next load because the head's *leaf* is what matters, not its session label.
+
+`remove(id)` unlinks the file idempotently: it returns `True` when a file was removed and `False` when there was nothing to delete — it never raises on an already-absent session.
+
+## Per-cwd session scoping
+
+Sessions live under a workspace `sessions/` root in per-cwd `--<slug>--` subdirectories, so conversations from different working directories never collide. `SessionLibrary` always receives the **already-scoped** directory — it does no slugging of its own.
+
+The slug helper lives in [boot](/python-cli/subsystems/boot): `boot/runners/session.py#session_scope_dir` regex-slugs the cwd into the `--<slug>--` form. The conductor (the writer) and the library (the reader) must agree on this layout, which is why the slug helper is owned in one place and shared.
+
+## How boot wires it
+
+Boot's `_build_services` in `boot/runners/repl_runner.py` constructs the library against the cwd-scoped directory and uses it to honor the resume flags before mounting the console:
+
+```python
+library = SessionLibrary(
+    sessions_dir=session_scope_dir(ctx.workspace.sessions_dir, cwd)
+)
+rows = await library.list()
+# --continue (continue_latest): resume rows[0].id — the newest row
+# --resume: project rows to ResumeRef (_to_resume_ref) and run pick_resume_target
+```
+
+| Flag | Behavior |
+|------|----------|
+| `--continue` | Resume the newest session in this cwd. Boot takes `rows[0].id` from the library's newest-first list and resumes by that bare id. |
+| `--resume` | Project the rows to the framework `ResumeRef` shape and run the shared `pick_resume_target` picker, which resolves the session id to resume (or `None` to start fresh). |
+
+Both loaders share the single `list()` call; the conductor always resumes by the bare session **id** (the filename stem), never a path. See [launch](/python-cli/subsystems/launch) for the picker and resume-deps machinery.
+
+## Console overlay bridge
+
+The sessions subpackage itself imports nothing from the [indusagi framework](/python). The bridge is the console overlay adapter at `console/overlays/sessions.py`, which maps the library's display records onto the framework's [react-ink](/python/ui/react-ink) dialog options:
+
+| Library record | Adapter | Framework option | Dialog |
+|----------------|---------|------------------|--------|
+| `SavedSession` | `to_session_info` | `SessionInfo` | `SessionDialog` |
+| `BranchNode` | `to_tree_option` | `SessionTreeOption` | `TreeDialog` |
+| `PriorTurn` | `to_turn_option` | `UserMessageOption` | `UserMessageDialog` |
+
+`OverlayServices`/`ReplServices` (in `console/contract.py`) carry a `SessionLibrary` field, so the in-app `/resume`, branch-navigator, and fork dialogs all reach the library through one shared handle. See [Dialogs](/python-cli/console/dialogs) for the overlay surface.
+
+## Gotchas
+
+- **Epoch-MS timestamps.** `lastModified` is `st_mtime * 1000.0` (milliseconds, a `float`), matching the rest of the stack — not seconds.
+- **camelCase fields.** Dataclass fields use `lastModified`, `messageCount`, `entryId`, `isLeaf`, `isCurrent` despite being Python.
+- **Newest-first listing.** `list()` always returns rows sorted by most-recently-modified first, id as tiebreak.
+- **`tree()`/`prior_turns()` are pure.** They take a pre-opened `TranscriptStore` and do no I/O; call `open()` first.
+- **Rename does not rewrite the head.** The in-file head line keeps naming the old id after a rename; the store tolerates it on the next load.
+- **Scoping is boot's job.** The library never slugs the cwd; it takes the already-scoped `--<slug>--` directory.
+- **Forking is a conductor verb.** The library only produces `PriorTurn` candidates; `branch_at(entryId)` lives on the [conductor](/python-cli/subsystems/conductor)'s `TranscriptStore`.

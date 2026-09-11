@@ -1,0 +1,785 @@
+# Crate Exports
+
+> `induscode` is a single merged Rust product crate: every former `induscode-*`
+> library crate is now a `pub mod` inside `crates/induscode/src/lib.rs`, and the
+> framework arrives as the one published `indusagi` umbrella crate. Two `[[bin]]`
+> targets — `indusr` and `indusagir` — share one `async fn main() -> ExitCode` in
+> `src/bin/main.rs`. This page maps the complete public surface: every `pub mod`
+> organized by subsystem, the crate-root re-exports each barrel surfaces, the
+> feature gates, and the bin entry.
+
+## Table of Contents
+
+- [Crate root](#crate-root)
+- [Module map](#module-map)
+- [core](#core)
+- [launch](#launch)
+- [boot](#boot)
+- [conductor](#conductor)
+- [window_budget](#window_budget)
+- [deck](#deck)
+- [runtime_bridge](#runtime_bridge)
+- [addons](#addons)
+- [console](#console)
+- [channels](#channels)
+- [briefing](#briefing)
+- [transcript_export](#transcript_export)
+- [insight](#insight)
+- [Feature gates](#feature-gates)
+- [The bin entry](#the-bin-entry)
+
+## Crate root
+
+`crates/induscode/src/lib.rs` is the umbrella barrel. Unlike the framework crate it
+does **not** re-export a single `VERSION` at its own root — it only declares the 13
+subsystem modules as `pub mod`. The version constant lives one layer down in
+[`core::VERSION`](#core) (`env!("CARGO_PKG_VERSION")`), surfaced for the CLI's
+`--version`. The whole library is reached as `induscode::<module>`.
+
+```rust
+// crates/induscode/src/lib.rs
+pub mod addons;
+pub mod boot;
+pub mod briefing;
+pub mod channels;
+pub mod conductor;
+pub mod console;
+pub mod core;
+pub mod deck;
+pub mod insight;
+pub mod launch;
+pub mod runtime_bridge;
+pub mod transcript_export;
+pub mod window_budget;
+```
+
+Thirteen modules, one per former library crate. Module declaration order is the
+leaf-up dependency order of the former workspace DAG, though order is not
+load-bearing in Rust. The framework is reached as `indusagi::<module>` (`core`,
+`runtime`, `llmgateway`, `tracing`, `capabilities`, `tui`, `interop`,
+`connectors_saas`, `swarm`, `smithy`, `tui_render`, `facade`, `shell_app`) from the
+single published [`indusagi`](/rust/reference/crate-exports) crate.
+
+```rust
+use induscode::boot::boot_run;            // the boot entry the bin calls
+use induscode::core::{BRAND, VERSION};    // the brand record + single-source version
+use induscode::conductor::SessionConductor as _; // the session brain
+```
+
+This page documents the **actual Rust source**. For how the importable surface maps
+onto the runtime, see the [induscode (Rust) Overview](/rust-cli/README) and the
+[Architecture](/rust-cli/architecture). For the framework underneath, see its
+[Crate Exports](/rust/reference/crate-exports).
+
+## Module map
+
+Every former `induscode-*` library crate is now a `pub mod` of the merged crate.
+Each links to its subsystem page under `/rust-cli`.
+
+| Former crate | `pub mod` | Holds | Docs |
+|---|---|---|---|
+| `induscode-core` | `core` | Brand, single-source `VERSION`, `BIN_NAMES`, `create_workspace`, `PreferenceStore`, plus the folded `kit` / `settings` / `sessions` leaves, `boot_contract`, and lineage `guardrails`. | [Settings](/rust-cli/configuration/settings) |
+| `induscode-launch` | `launch` | The `FLAG_SPECS` flag table, the tolerant argv reader, `@file` attachments, the credential vault, OAuth flows, the model catalog, pickers, usage. | [Launch](/rust-cli/subsystems/launch) |
+| `induscode-boot` | `boot` | `boot_run(argv, BootIo) -> ExitCode`: stage pipeline, runner registry, resources, addon wiring, always-drained closables. | [Boot](/rust-cli/subsystems/boot) |
+| `induscode-conductor` | `conductor` | The session brain — wraps one `indusagi::runtime::Agent`, projects `RunEvent` into a stable `SessionSignal` stream, branchable transcript, retry/fallback, the `ModelInvoker` seam. | [Conductor](/rust-cli/subsystems/conductor) |
+| `induscode-window-budget` | `window_budget` | Token measurement, `is_over_budget` gating, slice planning, `create_condenser` → the conductor's `CondenseFn`, microcompact + rehydrate. | [Window Budget](/rust-cli/subsystems/window-budget) |
+| `induscode-deck` | `deck` | The capability deck over `indusagi::capabilities`: the `Card` trait, `CAPABILITY_CARDS`, profile provisioning, app-novel cards, the MCP bridge ledger. | [Capability Deck](/rust-cli/subsystems/capability-deck) |
+| `induscode-runtime-bridge` | `runtime_bridge` | Per-model routing — framework gateway vs. an external child runtime — as a `ModelInvoker`, plus the tracing-sink wiring. | [Runtime Bridge](/rust-cli/subsystems/runtime-bridge) |
+| `induscode-addons` | `addons` | The loadable-extension contract: hooks, tool interceptors, contributed commands/tools, the tiered TOML/subprocess loader, subagent crew. | [Addons](/rust-cli/subsystems/addons) |
+| `induscode-console` | `console` | The interactive ratatui surface: one immutable `ConsoleState`, a pure `console_reducer`, immediate-mode `view`, 14 overlays, `mount_console`. | [Console](/rust-cli/console/overview) |
+| `induscode-channels` | `channels` | The non-interactive surfaces: the one-shot text/NDJSON channel and the JSON-RPC 2.0 link server over the NDJSON framer. | [Channels](/rust-cli/subsystems/channels) |
+| `induscode-briefing` | `briefing` | The budget-aware system-prompt assembler: section composer, `CLAUDE.md`/`AGENTS.md` context docs, `$arg` macros, `SKILL.md` cards. | [Briefing](/rust-cli/subsystems/briefing) |
+| `induscode-transcript-export` | `transcript_export` | The publish-time HTML/Markdown builder: the SGR machine, WCAG `theme_bridge`, page template, `publish`. | [Transcript Export](/rust-cli/subsystems/transcript-export) |
+| `induscode-insight` | `insight` | The observability plane over `indusagi::tracing`: probe/signal vocab, NDJSON serialize/replay, an agent scrubber, a fan-out channel and collector sink. | [Insight](/rust-cli/subsystems/insight) |
+
+Per-subsystem `mod.rs` barrels follow a consistent shape: a frozen `contract`
+module owns the type seam, the behavior modules sit beside it, and the crate-root
+`pub use` re-exports the contract vocabulary plus the headline behavior functions.
+The sections below catalog every `pub mod` and the real `pub use` re-export list of
+each.
+
+## core
+
+`induscode::core` — the universal leaf, the analogue of the framework's
+`indusagi::core` one layer up. It carries no subsystem behavior; it ships the
+load-bearing primitives every module reaches for, the four sub-1k-LOC TS subsystems
+folded in as nested modules (`kit`, `settings`, `sessions`, `workspace`), the boot
+*contract* types that break the `boot` ↔ `launch`/`deck` cycle (`boot_contract`),
+and the lineage `guardrails` markers.
+
+```rust
+// crates/induscode/src/core/mod.rs
+pub mod boot_contract;
+pub mod brand;
+pub mod guardrails;
+pub mod kit;
+pub mod sessions;
+pub mod settings;
+pub mod workspace;
+```
+
+Crate-root re-exports (the headline surface):
+
+```rust
+pub use kit::image::{
+    AssetNameContext, IMAGE_SNIFF_BYTES, ImageFormat, detect_image_media_type, is_supported_image,
+    media_type_for, resolve_asset_name, sniff_image_format,
+};
+pub use kit::shell_quote::{build_shell_command, needs_quoting, quote_arg};
+pub use kit::tool_fetch::{
+    DownloadRequest, KIT_USER_AGENT, ProvisionPlan, ReleaseAsset, ReleaseInfo, ReleaseLookup,
+    ToolDescriptor, build_download_request, pick_release_asset, plan_provision,
+    resolve_managed_binary_path,
+};
+pub use kit::{ClipboardImageOptions, ExternalEditorOptions, host_platform_tag};
+
+pub use settings::{
+    DeliveryMode, EscapeAction, PermissionMode, PermissionSettings, PreferenceLocations,
+    PreferenceStore, Preferences, default_preferences,
+};
+
+pub use sessions::{BranchNode, PriorTurn, SavedSession};
+
+pub use workspace::VERSION;
+pub use brand::{BIN_NAMES, BRAND, Brand};
+pub use guardrails::{FORBIDDEN_MARKERS, READ_BEFORE_EDIT_MESSAGE};
+pub use workspace::{Packaging, Workspace, WorkspaceOverrides, create_workspace};
+```
+
+| Symbol | Kind | Source | Purpose |
+|---|---|---|---|
+| `VERSION` | `pub const &str` | `workspace.rs` | The single-source product version, `env!("CARGO_PKG_VERSION")` — the Rust collapse of the TS 3-way `VERSION` drift. |
+| `BRAND` / `Brand` / `BIN_NAMES` | const / struct / `[&str; 2]` | `brand.rs` | The byte-for-byte brand record (`app_name: "indusagi"`, `profile_dir_name: ".indusagi"`, `bin_names: ["indus", "indusagi"]`, `env_prefix: "INDUSAGI"`) and the bin-name table; `BIN_NAMES[0]` is the default process title. |
+| `create_workspace` / `Workspace` / `WorkspaceOverrides` / `Packaging` | fn / struct / struct / enum | `workspace.rs` | Pure path computation of the profile root (dirs are materialised later by the boot pipeline). |
+| `PreferenceStore` / `Preferences` / `PreferenceLocations` / `default_preferences` | struct / struct / struct / fn | `settings/` | The 23-key, project-over-global-over-default preference store; writes land in the project tier only. |
+| `PermissionMode` / `PermissionSettings` / `DeliveryMode` / `EscapeAction` | enum / struct / enum / enum | `settings/contract.rs` | The settings vocabulary the conductor re-exports. |
+| `SavedSession` / `BranchNode` / `PriorTurn` | struct | `sessions/` | The session catalog/navigator value types over the framework `SessionStore` DAG. |
+| `quote_arg` / `needs_quoting` / `build_shell_command` | fn | `kit/shell_quote.rs` | POSIX shell-argument quoting + injection-safe command assembly (the conductor's bash guard reuses these). |
+| `sniff_image_format` / `resolve_asset_name` / `media_type_for` / `ImageFormat` | fn / fn / fn / enum | `kit/image.rs` | PNG/JPEG magic-byte sniffing + the `{token}` asset-name renderer. |
+| `plan_provision` / `build_download_request` / `ReleaseLookup` / `ToolDescriptor` | fn / fn / trait / struct | `kit/tool_fetch.rs` | The managed-binary provisioner (fd / rg): the network is injected via `ReleaseLookup`, never imported. |
+| `read_clipboard_image` / `open_in_external_editor` / `host_platform_tag` | fn | `kit/` | Clipboard raster capture, `$VISUAL`/`$EDITOR` round-trip, and the Node-style platform tag (`"darwin"`/`"linux"`/`"win32"`). |
+| `FORBIDDEN_MARKERS` / `READ_BEFORE_EDIT_MESSAGE` | const | `guardrails.rs` | The lineage / clean-room markers and the read-before-edit gate message. |
+
+The four folded leaves each carry their own nested `pub mod` tree:
+`kit::{clipboard_image, external_editor, image, shell_quote, tool_fetch}`,
+`settings::{contract, store}`, `sessions::{contract, library}`. The `sessions`
+library (`SessionLibrary`, `SessionLibraryOptions`) builds over the framework
+`indusagi::runtime::store::SessionStore` / `SessionGraph`.
+
+## launch
+
+`induscode::launch` — the CLI front door: the *application* command line, distinct
+from the framework's *boot-routing* parser in `indusagi::shell_app::invocation`. It
+owns the single declarative `flags::FLAG_SPECS` table read by **both** the parser
+(`parser::read_invocation`) **and** the usage renderer (`usage::render_usage`), so
+the help text and the parser can never disagree.
+
+```rust
+// crates/induscode/src/launch/mod.rs
+pub mod attachments;   // @file inliner
+pub mod catalog;       // ModelRegistry over ModelCard (filter / sort / provider resolution)
+pub mod contract;
+pub mod credentials;   // multi-account vault + auth.json schema + command surface
+pub mod flags;         // FLAG_SPECS table + FlagSpec/FlagKind/FlagGroup/Mode types
+pub mod oauth;         // 3 OAuth providers + poll/refresh FSM
+pub mod parser;        // tokenize + parse -> Invocation, derive_mode precedence
+pub mod pickers;       // model / account / resume picker DATA only
+pub mod usage;         // render_usage from FLAG_SPECS + flag groups
+
+pub use contract::*;   // shared frozen types (Invocation, OutputMode, FlagValue, …)
+```
+
+The crate root re-exports only its frozen `contract::*`; the parser, usage, flags,
+catalog, credentials, oauth, and pickers entries are reached through their `pub`
+modules. The bin reaches them as, e.g., `launch::parser::read_invocation`,
+`launch::usage::render_usage`, `launch::catalog::print_model_catalog`,
+`launch::credentials::run_credential_command`,
+`launch::pickers::run_package_command`, and `launch::oauth::OAuthLoginCallbacks`.
+
+| Module | Public surface (selected) | Role |
+|---|---|---|
+| `contract` | `Invocation`, `OutputMode`, `FlagValue` (re-exported as `contract::*`) | The frozen invocation type seam. |
+| `flags` | `FLAG_SPECS`, `FlagSpec`, `FlagKind`, `FlagGroup`, `Mode` | The single 18-flag declarative table. |
+| `parser` | `read_invocation` | Tolerant tokenize + parse → `Invocation`, `derive_mode` precedence. |
+| `usage` | `render_usage` | Walks `FLAG_SPECS` + flag groups to render `--help`. |
+| `catalog` | `CatalogFilter`, `RegistrySource`, `StdoutCatalogIo`, `print_model_catalog` | The filtered/sorted model catalog over `indusagi::llmgateway` `ModelCard`. |
+| `credentials` | `AuthKind`, `AuthVault`, `DiskAuthVault`, `CredentialIo`, `LoginProvider`, `OAuthLoginOutcome`, `OAuthSeam`, `SecretString`, `VaultError`, `run_credential_command`, `format_credential_fault` | The multi-account vault, `auth.json` schema, and the `signin`/`signout` command surface. |
+| `oauth` | `AuthInputPrompt`, `AuthRedirectInfo`, `OAuthLoginCallbacks`, `OAuthVaultSink` | The three OAuth provider flows (Anthropic, OpenAI Codex, GitHub Copilot) over the framework PKCE/transport primitives. |
+| `pickers` | `StdioPackageIo`, `is_package_command`, `run_package_command` | The model/account/resume picker DATA + the extension-package verbs (the ratatui UI is in the console crate). |
+| `attachments` | `@file` inliner | Inline file contents into a prompt. |
+
+See [Launch](/rust-cli/subsystems/launch) for the parser internals, the
+[CLI Flags](/rust-cli/README#cli-flags) table for the full grammar, and
+[Models](/rust-cli/configuration/models) for the catalog.
+
+## boot
+
+`induscode::boot` — the launch orchestrator: it turns a sliced `argv` plus an I/O
+seam into a running agent and a process exit code. The single public function the
+bin invokes is `boot_run`.
+
+```rust
+// crates/induscode/src/boot/mod.rs
+pub mod addon_wiring;
+pub mod contract;
+pub mod pipeline;
+pub mod resources;
+pub mod runners;
+
+#[cfg(feature = "swarm")]
+pub mod delegate;
+
+pub use contract::{
+    BootContext, BootIo, BootPipeline, Closable, InputSource, Invocation, OutputSink, Runner,
+    RunnerId, RunnerRegistry, Stage, StartupResources,
+};
+```
+
+The two free functions at the crate root are the boot arc:
+
+```rust
+pub async fn boot_run(argv: Vec<String>, io: BootIo) -> std::process::ExitCode;
+pub async fn drain_closables(ctx: &BootContext);
+```
+
+| Symbol | Kind | Purpose |
+|---|---|---|
+| `boot_run` | `async fn` | The single function `main` calls: seed a `BootContext` → fold the ordered stage pipeline (`pipeline::stages`) → select a runner from `runners::registry()` (repl is the total fallback) → drain closables in reverse → return `ExitCode`. It never calls `process::exit`. |
+| `drain_closables` | `async fn` | Drains every teardown callback latest-registered-first, swallowing individual failures so one bad closer cannot mask the exit code. |
+| `BootContext` / `BootIo` / `Stage` / `BootPipeline` | struct / struct / trait / type | The seeded context (workspace + brand + invocation + I/O + `closables`), the `OutputSink`/`InputSource` seam, the ordered stage pipeline. |
+| `Runner` / `RunnerId` / `RunnerRegistry` | trait / enum / struct | The runner trio (repl / oneshot / link) + the total-dispatch registry. |
+| `Closable` / `InputSource` / `OutputSink` / `StartupResources` | type / trait / trait / struct | The teardown callback, the injectable transports, and the resolved settings/model/auth graph. |
+
+`boot_run` returns `ExitCode::from(code as u8)` — the only place inside boot a code
+becomes an OS exit value (the bin adopts it unchanged). The `delegate` module
+(feature `swarm`) bridges `addons` subagent profiles onto the deck delegate-runner
+handle. See [Boot](/rust-cli/subsystems/boot).
+
+## conductor
+
+`induscode::conductor` — the brain of the agent: the product-level orchestrator that
+wraps the framework `indusagi::runtime::Agent` and turns it into a coding-agent
+session. It drives turns, projects the framework's coarse 7-event `RunEvent` stream
+down to a stable product `SessionSignal` stream, persists every message into a
+branchable transcript, retries transient faults with backoff, swaps to a fallback
+model on overload (HTTP 529), and coordinates window-budget compaction via the
+`CondenseFn` seam.
+
+```rust
+// crates/induscode/src/conductor/mod.rs
+pub mod contract;
+
+pub mod agent_loop;    // named agent_loop, not loop — loop is a keyword
+pub mod bash_guard;
+pub mod catalog;
+pub mod permissions;
+pub mod session_ops;
+pub mod signals;
+pub mod transcript;
+```
+
+The crate root re-exports the frozen type seam (the vocabulary every collaborator is
+written against):
+
+```rust
+pub use contract::{
+    ApprovalDecision, ApprovalResolver, BashOutcome, CheckpointPort, CondenseFn, CondenseOpts,
+    ConductorDeps, ConductorFault, ConductorOptions, ConductorPhase, ConductorState,
+    ExecuteBashOptions, FaultKind, InFlightTool, MatchQuery, ModelCardRef, ModelInvoker,
+    PermissionMode, QueueMode, QueuedInput, RetryPolicy, SessionHead, SessionSignal, SignalHandler,
+    StateAction, TRANSCRIPT_SCHEMA, TranscriptEntry, TranscriptRole, conductor_fault,
+    fault_from_run_error,
+};
+```
+
+| Module | Role |
+|---|---|
+| `contract` | The frozen seam: `SessionSignal`, `ConductorFault`, `ConductorPhase`, `ConductorState`, `ConductorDeps`, the `ModelInvoker` completer trait (the seam `runtime_bridge` implements), `PermissionMode` (re-exported from `core`), and the transcript / snapshot / signal / turn types. |
+| `agent_loop` | The streaming turn loop (retry / backoff / fallback); home of the `Conductor`. |
+| `transcript` | The branch-aware product transcript store over the framework `SessionStore` DAG. |
+| `catalog` | `ModelMatcher` / `ModelCardRef` over `indusagi::llmgateway::catalog`. |
+| `signals` | The synchronous, panic-isolated signal hub + projector (`RunEvent` → `SessionSignal`). |
+| `permissions` | Live `PermissionMode` holder + `ApprovalResolver`. |
+| `bash_guard` | The bash / permission guard (quoting via `core::kit`). |
+| `session_ops` | Fork / navigate / resume / new-session branch ops. |
+
+The conductor is itself the `ModelInvoker` provider seam that `runtime_bridge`
+implements, and it consumes the `CondenseFn` from `window_budget` and the `Card`
+deck from `deck`. See [Conductor](/rust-cli/subsystems/conductor).
+
+## window_budget
+
+`induscode::window_budget` — the context-window budgeter: it keeps a long-running
+session inside the bound model's window by **measuring, gating, slicing, condensing,
+and reclaiming** the transcript, deterministically and network-free by default.
+
+```rust
+// crates/induscode/src/window_budget/mod.rs
+pub mod budget;        // estimate / gate / slice math
+pub mod condenser;
+pub mod contract;
+pub mod message;
+pub mod microcompact;
+pub mod rehydrate;
+pub mod summarize;     // prompt + model-driven digest
+```
+
+Crate-root re-exports:
+
+```rust
+pub use message::{Content, Message};
+pub use contract::{BudgetPolicy, CondensePlan, CondenseScope, Summary, TokenEstimate};
+pub use budget::{
+    budget_limit, estimate_message_tokens, estimate_tokens, is_over_budget, last_user_turn_start,
+    plan_slice, prefix_tokens,
+};
+pub use summarize::{
+    CONDENSER_BRIEF, SummarizeDeps, build_summary_prompt, condense_scope, flatten_transcript,
+    summarize,
+};
+pub use condenser::{AUTO_CONDENSE_POLICY, Condenser, CondenserDeps, condense, create_condenser};
+pub use microcompact::{
+    CLEARED_TOOL_RESULT, DEFAULT_KEEP_RECENT, clear_stale_tool_results, compactable_tool_names,
+};
+pub use rehydrate::{RESTORED_FILE_PREFIX, RehydrateOpts, rehydrate_recent_reads};
+```
+
+| Symbol | Kind | Purpose |
+|---|---|---|
+| `Message` / `Content` | enum | The rich message enum (the `AgentMessage` analog) owned HERE and re-exported, so the conductor sees one `Message` type without a `conductor ⇄ window-budget` cycle. |
+| `create_condenser` / `Condenser` / `CondenserDeps` / `AUTO_CONDENSE_POLICY` | fn / struct / struct / const | The factory whose output is the `Condenser` the conductor binds as its `CondenseFn`. |
+| `is_over_budget` / `budget_limit` / `plan_slice` | fn | The token gate the conductor's `maybe_condense` consults + the slicer. |
+| `estimate_tokens` / `estimate_message_tokens` / `prefix_tokens` / `TokenEstimate` | fn / struct | The chars/4 token estimators. |
+| `condense` / `condense_scope` / `summarize` / `Summary` | fn / struct | The direct session/branch summarization entrypoints + the digest value. |
+| `clear_stale_tool_results` / `rehydrate_recent_reads` | fn | The microcompact free pre-pass and the rehydrate post-pass — consumed by the *runner*, not by `create_condenser`. |
+| `BudgetPolicy` / `CondensePlan` / `CondenseScope` | struct / struct / enum | The frozen budget contract types. |
+
+See [Window Budget](/rust-cli/subsystems/window-budget).
+
+## deck
+
+`induscode::deck` — the capability deck: a thin **management layer** over the
+framework's `indusagi::capabilities` (the 12 built-in tools) and `indusagi::interop`
+(the MCP bridge). It does NOT author the built-ins — it *manages* them — and it
+authors the app-novel cards the framework does not provide.
+
+```rust
+// crates/induscode/src/deck/mod.rs
+pub mod contract;
+
+pub mod builtin;
+pub mod catalog;
+pub mod provision;
+
+pub mod cards;
+
+#[cfg(feature = "mcp")]
+pub mod mcp;
+
+pub use contract::{
+    Capability, CapabilityCard, CapabilityId, Card, DeckContext, DeckFault, DeckFramework,
+    DeckResult, Profile, capability_id,
+};
+```
+
+| Module | Role |
+|---|---|
+| `contract` | The stable card-writer seam: the `Card` trait, `CapabilityCard`, `DeckContext`, `Capability`/`CapabilityId`, the `Profile` enum (`authoring` / `survey` / `all`), and the exhaustive `DeckFault`. |
+| `builtin` | Bridges the framework's 12 native tool factories into deck cards, advertising the real Rust wire names verbatim (`read`/`ls`/`grep`/`find`/`websearch`/`webfetch`/`todo_read` · `write`/`edit`/`bash`/`process`/`todo_set`). |
+| `catalog` | `CAPABILITY_CARDS` — the single source-of-truth slice every index / lookup / profile query is derived from. |
+| `provision` | Provisions a `Profile` into an assembled deck the conductor wires in as its tools. |
+| `cards` | The app-novel cards (`bg_process`, `checkpoint`, `memory`, `plan`, `saas`, `task`, `todo`); `cards::app_novel_cards()` is the ordered list the `All` profile appends. |
+| `mcp` (feature `mcp`) | Grafts dynamic MCP server tools through an event-sourced enrollment `ledger` over the framework mount. |
+
+The `task` card runs over `indusagi::swarm` (feature `swarm`) and `saas` over
+`indusagi::connectors_saas` (feature `composio`) — both are always *built* as stubs
+when their feature is off, so the catalog shape is stable across feature sets. See
+[Capability Deck](/rust-cli/subsystems/capability-deck).
+
+## runtime_bridge
+
+`induscode::runtime_bridge` — the provider-routing layer: the single decision point
+that, per model, produces a turn through **either** the framework gateway
+(`indusagi::llmgateway`) **or** an external runtime — a spawned child coding-agent
+(`claude` / `codex` / a peer `indusagi`) driven over its own wire dialect — plus the
+tracing-sink wiring.
+
+```rust
+// crates/induscode/src/runtime_bridge/mod.rs
+pub mod contract;
+
+pub mod bridges;
+pub mod broker;
+pub mod sink;
+
+pub use broker::RuntimeBroker;
+pub use contract::{
+    BridgeFailure, BridgeFault, ChildMessage, ChildParser, ChildRequest, ChildTransport,
+    ChildTransportFactory, ExchangeOptions, ExternalRuntimeSpec, FinishReason, NormalizedEvent,
+    ParseStep, RUNTIME_ENDPOINT_SCHEME, RUNTIME_LINK_ENTRY, RuntimeAdapterId, RuntimeAuthMode,
+    RuntimeBridge, RuntimeLink, RuntimeLinkStore, RuntimeRoute, TransportContext, runtime_endpoint,
+    runtime_source_key,
+};
+pub use sink::EmissionSink;
+```
+
+| Symbol | Kind | Purpose |
+|---|---|---|
+| `RuntimeBroker` | struct | The broker that `impl`s `indusagi::runtime::ModelInvoker`: it wraps the gateway-backed invoker and, for runtime-annotated models, produces a bridge-backed `Channel<Emission>` instead — indistinguishable to the conductor. |
+| `EmissionSink` | struct | Maps a `NormalizedEvent` to one-or-two `indusagi::llmgateway::contract::Emission`s pushed onto an `mpsc::Sender<Emission>`. |
+| `ExternalRuntimeSpec` / `RuntimeAdapterId` / `RuntimeAuthMode` / `runtime_endpoint` | struct / enum / enum / fn | The external-runtime annotation + the `bridge:<adapter>` endpoint encoding. |
+| `NormalizedEvent` / `FinishReason` / `BridgeFailure` | enum / enum / enum | The provider-neutral event currency. |
+| `ChildTransport` / `ChildMessage` / `ChildRequest` / `ChildTransportFactory` / `TransportContext` | trait / struct / struct / trait / struct | The injectable child-process transport seam. |
+| `ChildParser` / `ParseStep` / `RuntimeBridge` / `ExchangeOptions` | trait / enum / trait / struct | The per-dialect parser, the bridge strategy, and the per-exchange options. |
+| `RuntimeRoute` / `RuntimeLinkStore` / `RuntimeLink` / `RUNTIME_LINK_ENTRY` / `runtime_source_key` | struct / trait / struct / const / fn | The broker routing surface + the resume link store. |
+| `BridgeFault` | enum | The typed fault. |
+
+The OS-touching child transport is gated behind the `cli-bridges` feature. See
+[Runtime Bridge](/rust-cli/subsystems/runtime-bridge).
+
+## addons
+
+`induscode::addons` — the loadable-extension layer. An addon is a plain descriptor
+that records (never mutates) its intent onto a per-addon `AddonSurface`: subscribe to
+a `HookEvent`, intercept a tool, add a slash command, add a tool. The `AddonHost`
+discovers, loads (via an injectable `ModuleLoader`), and folds every addon into one
+conflict-resolved `AddonBundle`.
+
+```rust
+// crates/induscode/src/addons/mod.rs
+pub mod contract;
+pub mod dispatch;
+pub mod host;
+pub mod manifest;
+pub mod sandbox;
+
+#[cfg(feature = "swarm")]
+pub mod subagents;
+
+pub use contract::{
+    ADDON_MANIFEST_FIELD, ADDONS_DIR, Addon, AddonApi, AddonCommand, AddonDiscovery, AddonFault,
+    AddonFaultKind, AddonFaultListener, AddonId, AddonManifest, AddonSource, AddonTool,
+    CommandContext, DispatchOutcome, EnterOutcome, EventSubscription, ExecOutcome, ExitOutcome,
+    FrameworkHandles, GateDecision, HookEvent, HookHandler, HookKind, InterceptResult,
+    ModuleLoader, Payload, RegisteredManifest, SubagentProfile, ToolEnterContext, ToolExitContext,
+    ToolInterceptor, ToolMatch,
+};
+pub use dispatch::{EventDispatcher, InterceptorChain};
+pub use host::{AddonBundle, AddonHost, AddonHostDeps, AddonRegistry};
+pub use manifest::{AddonDescriptor, ManifestError};
+
+#[cfg(feature = "swarm")]
+pub use subagents::SubagentCrew;
+```
+
+| Module | Role |
+|---|---|
+| `contract` | The frozen type surface: `Addon`, `AddonManifest`, the `AddonApi` limited-surface trait, `HookEvent` / `HookHandler` / `HookKind`, the `ToolInterceptor` pre/post hooks, `SubagentProfile`, and the typed `AddonFault`. |
+| `host` | The host/loader: discovery + TOML-manifest load + the limited API fold into an `AddonBundle`. |
+| `manifest` | The TOML manifest descriptor schema (`AddonDescriptor`) + parse (`ManifestError`). |
+| `dispatch` | The `EventDispatcher` (observe/transform/gate fan-out) + the `InterceptorChain` tool pre/post hooks. |
+| `sandbox` | Sandboxed execution; FS denied by default. |
+| `subagents` (feature `swarm`) | `SubagentCrew` — subagent profiles + crew/ticket-board coordination over `indusagi::swarm`. |
+
+The Rust dynamic-loading story is tiered (no JS eval): Tier 0 is declarative TOML
+discovery (the default), Tier 1 is a subprocess JSON-RPC host (behind a feature),
+Tier 2 (WASM components) is deferred. See [Addons](/rust-cli/subsystems/addons).
+
+## console
+
+`induscode::console` — the interactive ratatui REPL surface, gated behind the
+`tui` feature. The Ink/React `useReducer` + `conductor.subscribe` design becomes one
+immutable `ConsoleState`, one pure `console_reducer`, an immediate-mode `view`, and
+14 overlays.
+
+```rust
+// crates/induscode/src/console/mod.rs
+pub mod events;
+pub mod state;
+
+pub mod input;
+pub mod mount;
+pub mod reducer;
+pub mod slash;
+pub mod theme;
+pub mod tool_row;
+
+pub mod overlays;
+pub mod view;
+
+pub use events::ConsoleEvent;
+pub use mount::{MountConsoleOptions, MountResult, mount_console};
+pub use state::{
+    ConsoleState, ModalKind, ModalPayload, ModalState, NO_MODAL, ThemeScheme, ViewRow, ViewRowKind,
+    transition_modal,
+};
+```
+
+| Module | Role |
+|---|---|
+| `state` | The one immutable `ConsoleState` (composer buffer/caret, history ring, transcript rows, active overlay, status line); plus `ModalKind` / `ModalState` / `ViewRow` and `transition_modal`. Live session data is deliberately absent — it is projected on every draw from the conductor snapshot. |
+| `reducer` | The pure `console_reducer` — `(ConsoleState, ConsoleEvent) -> ConsoleState`, an exhaustive match with no I/O. |
+| `events` | The typed `ConsoleEvent` enum — the closed `domain:verb` action union the reducer folds. |
+| `view` | The immediate-mode `draw(frame, &state)` over ratatui — `banner`, `chrome`, `composer`, `diff`, `markdown`, `transcript` sub-modules. |
+| `overlays` | The 14 overlays keyed by `ModalKind`: `approval`, `approval_queue`, `approval_resolver`, `models`, `oauth`, `plugin`, `scoped_models`, `sessions`, `settings`, `signin`, `signout`, `theme`, `tree`, `user_turns`. |
+| `mount` | `mount_console` — the boot entry the `ReplRunner` TTY branch calls (`MountConsoleOptions` / `MountResult`). |
+| `slash` / `input` / `theme` / `tool_row` | The slash-command catalog, key→event input mapping, theme schemes, and the tool-row renderer. |
+
+The whole crate is gated out of a `--no-default-features` (headless) build, proving
+the rest of the agent compiles with no terminal in the loop. See
+[Console](/rust-cli/console/overview), the [overlays](/rust-cli/console/dialogs),
+and [Slash Commands](/rust-cli/console/slash-commands).
+
+## channels
+
+`induscode::channels` — the non-interactive driver surface (the first runnable
+milestone, headless, no `tui`). A *channel* drives the product conductor from
+outside the terminal: the **one-shot** channel runs prompts to settlement and writes
+clean final text (`--print`) or a streamed NDJSON event log, and the **link**
+channel is a long-lived JSON-RPC 2.0 server framed as newline-delimited JSON over
+stdio.
+
+```rust
+// crates/induscode/src/channels/mod.rs
+pub mod contract;
+
+pub mod framer;
+pub mod protocol;
+
+pub use contract::{
+    Ask, AskAnswer, ChannelContext, ChannelTimings, CycleModelParams, DEFAULT_CHANNEL_TIMINGS,
+    LineSink, LineSource, LinkSnapshot, ModelEntry, OneshotRequest, OneshotShape, OpError,
+    OpRequest, PROTOCOL_VERSION, REQUEST_ID_PREFIX, Reply, ReplyErr, ReplyOk, RequestId,
+    ResumeParams, Signal, SubmitParams, Tell, op_error,
+};
+```
+
+| Module | Role |
+|---|---|
+| `contract` | The frozen wire seam: the JSON-RPC 2.0 envelope (`OpRequest` / `Reply` / `ReplyOk` / `ReplyErr` / `OpError` / `op_error`), `RequestId`, the dialog primitives (`Ask` / `Tell` / `AskAnswer`), the uncorrelated `Signal`, the wire `LinkSnapshot`, the one-shot shapes (`OneshotShape` / `OneshotRequest`), the session-op params (`SubmitParams` / `ResumeParams` / `CycleModelParams` / `ModelEntry`), the `ChannelContext` + `LineSink` / `LineSource` seams, `ChannelTimings`, and the constants `PROTOCOL_VERSION` / `REQUEST_ID_PREFIX` / `DEFAULT_CHANNEL_TIMINGS`. |
+| `framer` | The self-contained, separator-safe NDJSON framer (the U+2028/U+2029 pin): the dependency-free `encode_line` / `LineCodec` / `decode_lines` seam over `serde` + `serde_json`. The channels crate is the framer crate-of-record — there is no `core::ndjson` module. |
+| `protocol` | The runtime face: JSON-RPC method dispatch + session-ops + print one-shot streaming + signal→frame mapping. |
+
+Every transport is a `LineSink` / `LineSource` seam (the product analogues of the
+framework's `OutputSink`/`InputSource`), so the subsystem is tested over in-memory
+pipes with zero real stdio. See [Channels](/rust-cli/subsystems/channels).
+
+## briefing
+
+`induscode::briefing` — budget-aware system-prompt assembly: it takes a read-only
+data bag (`BriefingInput`) and returns the single system-prompt `String` fed to the
+model as `AgentConfig.system`. Four cooperating engines, all pure and synchronous.
+
+```rust
+// crates/induscode/src/briefing/mod.rs
+pub mod contract;
+
+pub mod compose;
+pub mod context_docs;
+pub mod macros;
+pub mod skills;
+
+pub use contract::{
+    BriefingFault, BriefingInput, BriefingSection, ComposeOptions, ContextDoc, Macro, MacroDef,
+    MacroOrigin, MacroScope, MacroToken, SKILL_DESCRIPTION_LIMIT, SKILL_NAME_LIMIT, SectionFn,
+    SkillCard, SkillDiagnostic, SkillFrontmatter, SkillLoad, SkillOutcomeKind, SkillRoot,
+    SubagentBrief, ToolDoc,
+};
+```
+
+| Engine | Module | Produces |
+|---|---|---|
+| Section composer | `compose` | The ordered system-prompt string + tool-doc derivation + `--system`/`--append-system` overrides. |
+| Context-doc loader | `context_docs` | Ancestor-chain `CLAUDE.md`/`AGENTS.md` docs (`ContextDoc`) with `@import` expansion. |
+| Macro scanner + loader | `macros` | Single-pass `$arg` expansion (`Macro` / `MacroDef` / `MacroToken`) for `/name args` slash macros loaded from `*.md`. |
+| Skill-card loader | `skills` | Validated `SkillCard`s from `SKILL.md` walks (`SkillFrontmatter` / `SkillLoad` / `SkillDiagnostic`). |
+
+The briefing receives tool schemas as **input data** (`ToolDoc`) — there is no
+dependency on the deck. See [Briefing](/rust-cli/subsystems/briefing).
+
+## transcript_export
+
+`induscode::transcript_export` — the offline, publish-time string builder that
+renders a session transcript to a single self-contained HTML document (and a
+Markdown sibling). A pure, synchronous, offline leaf: it takes a list of
+`PublishEntry` plus `PublishOptions` and returns one `String`.
+
+```rust
+// crates/induscode/src/transcript_export/mod.rs
+pub mod contract;
+pub mod publish;
+pub mod sgr;
+pub mod template;
+pub mod theme_bridge;
+
+pub use contract::{
+    ExportTheme, FALLBACK_EXPORT_THEME, PublishError, PublishOptions, Rgb, SGR_INITIAL_STATE,
+    SgrMutation, SgrState, SgrToken, ShellSlot, ThemeMode, WidgetRender,
+};
+pub use sgr::{fold_sgr, paint_sgr, tokenize_sgr};
+pub use theme_bridge::{
+    DefaultThemeBridge, LUMINANCE_LUT, fallback_export_theme, format_color, parse_color,
+};
+pub use template::{CLIENT_SCRIPT, PAGE_SHELL, PAGE_STYLES, SHELL_SLOTS, fill};
+pub use publish::{
+    MessagePart, PublishContent, PublishEntry, PublishMessage, PublishRole, publish_transcript,
+};
+```
+
+| Module | Role |
+|---|---|
+| `contract` | The shared value types: `SgrState` / `SgrToken` / `SgrMutation`, `ExportTheme` / `Rgb` / `ThemeMode`, `WidgetRender` / `PublishOptions`, `SHELL_SLOTS` / `ShellSlot`, `PublishError`. |
+| `sgr` | The table-driven ANSI/SGR machine → styled HTML spans (`paint_sgr` / `tokenize_sgr` / `fold_sgr`). |
+| `theme_bridge` | The pure WCAG-luminance color service (`DefaultThemeBridge`, `format_color` / `parse_color`, `LUMINANCE_LUT`). |
+| `template` | The standalone styled HTML page shell + `{{TOKEN}}` `fill` (`PAGE_SHELL` / `PAGE_STYLES` / `CLIENT_SCRIPT`). |
+| `publish` | The orchestrator: role mapping, per-turn render, base64 payload, default `transcript-<ts>.html` path (`publish_transcript`, `PublishEntry` / `PublishMessage` / `PublishContent` / `PublishRole`). |
+
+See [Transcript Export](/rust-cli/subsystems/transcript-export).
+
+## insight
+
+`induscode::insight` — the agent's single observability plane, a thin wrapper over
+the framework `indusagi::tracing`. It re-expresses the agent's vocabulary
+(trail/probe/signal) and adds the four pieces the framework lacks: a fan-out
+channel, a collector sink, an agent scrubber, and an NDJSON replay reader.
+
+```rust
+// crates/induscode/src/insight/mod.rs
+pub mod fanout;
+pub mod model;
+pub mod recorder;
+pub mod redaction;
+pub mod replay;
+pub mod sampling;
+pub mod serialize;
+pub mod sinks;
+
+pub use model::{PROBE_KINDS, ProbeKind};
+```
+
+| Module | Role |
+|---|---|
+| `model` | The agent vocabulary (`Probe`/`Signal`/`TrailId`/`ProbeId` aliases) + `ProbeKind` + `PROBE_KINDS` + the `id_widths` constants. |
+| `serialize` | The durable NDJSON `{v,phase,probe,at}` record format. |
+| `recorder` | `AgentRecorder`: the framework `Recorder` + scrub interposition + sink ownership. |
+| `redaction` | `AgentScrubber` over `SecretScrubber`: token + maxLen + omitKeys + fault scrub. |
+| `sinks` | Re-exports the framework console/file/stream sinks + the agent collector (`CollectorSink`, `AgentFileSink`, `AgentFileSinkOptions`). |
+| `replay` | `readLines` / `readRecords` / `replaySignals` / `replayProbes` / `replayTrails`. |
+| `sampling` | always/never/ratio gate facades over the framework `SampleGate`. |
+| `fanout` | `FanoutChannel` — N independent readers off one producer. |
+
+Because `insight` aliases onto the framework tracing types rather than re-porting
+them, it is the agent's seam onto [tracing](/rust/subsystems/tracing). See
+[Insight](/rust-cli/subsystems/insight).
+
+## Feature gates
+
+The defaults match the former multi-crate CLI surface; a `--no-default-features`
+build drops the console and render layer for a headless agent.
+
+| Feature | Default | Gates | Forwards to |
+|---|---|---|---|
+| `rustls` | yes | TLS backend for the merged `indusagi` reqwest AND the crate-local launch OAuth reqwest | `reqwest/rustls`, `indusagi/rustls` |
+| `mcp` | yes | the deck's MCP bridge (`deck::mcp`) | `indusagi/mcp` |
+| `tui` | yes | the live ratatui `console` + the framework render layer | `indusagi/tui` |
+| `oauth` | yes | the browser sign-in flows + the connectors-saas poll FSM | (pure code gate) |
+| `composio` | no | the SaaS connector vendor adapter (`deck::cards::saas`) | `indusagi/composio` |
+| `swarm` | no | subagent delegation (`addons::subagents`, `boot::delegate`, deck `task` card) | (pure code gate; framework `swarm` is always on) |
+| `cli-bridges` | no | the OS-touching external-runtime `ChildTransport` over `tokio::process` | (pure code gate) |
+| `mimalloc` | no | the opt-in global allocator | `dep:mimalloc` |
+| `anthropic` / `openai` / `google` / `vertex` / `bedrock` | no | agent-local capability markers (currently empty) | (reserved) |
+| `providers-all` | no | all five provider markers | `anthropic + openai + google + vertex + bedrock` |
+| `full` | no | everything at once | `mcp + tui + oauth + composio + swarm + cli-bridges + providers-all` |
+
+```toml
+# crates/induscode/Cargo.toml
+[dependencies]
+indusagi = { version = "0.1.0", features = ["swarm"] }
+
+[features]
+default = ["rustls", "mcp", "tui", "oauth"]
+```
+
+```bash
+cargo build --workspace
+cargo build --release -p induscode                                  # the dist profile
+cargo build -p induscode --no-default-features --features "rustls,anthropic"  # headless
+```
+
+A headless build (`--no-default-features`) drops the entire `console` module and the
+framework render layer, leaving the print/JSON `channels` path standing alone. See
+the [Build](/rust-cli/README#build) section of the overview.
+
+## The bin entry
+
+The bin lives at `crates/induscode/src/bin/main.rs`. The crate Cargo manifest
+declares **two** `[[bin]]` targets, both pointing at that one file — the Rust
+analogue of the TS bin block `{"indus": …, "indusagi": …}`:
+
+```toml
+# crates/induscode/Cargo.toml
+[[bin]]
+name = "indusr"
+path = "src/bin/main.rs"
+
+[[bin]]
+name = "indusagir"
+path = "src/bin/main.rs"
+```
+
+| Target | Process name | Notes |
+|---|---|---|
+| `indusr` | primary | The default target users install; `cargo install induscode` registers it. |
+| `indusagir` | alias | Identical entry; both share one `main`. |
+
+Note the distinction between the **cargo bin-target names** (`indusr`, `indusagir`)
+and the **branded process names** in `core::BIN_NAMES` (`["indus", "indusagi"]`).
+`resolve_brand()` brands the running process off `argv[0]`'s basename against
+`BIN_NAMES`, falling back to `BIN_NAMES[0]` (`"indus"`) for a renamed symlink or a
+missing `argv[0]` (`.exe` suffix stripped for a Windows launch).
+
+`async fn main() -> ExitCode` is the only place an exit code reaches the OS:
+
+```rust
+// crates/induscode/src/bin/main.rs
+#[tokio::main]
+async fn main() -> ExitCode {
+    let mut args = std::env::args();
+    let argv0 = args.next();
+    let brand = resolve_brand(argv0.as_deref());   // brand off argv[0] basename
+    install_mcp_noise_filter();                    // idempotent; no-op under INDUSAGI_DEBUG
+    let rest: Vec<String> = args.collect();
+    route(brand, rest).await                        // short-circuit verbs, then boot_run
+}
+```
+
+The bin reaches into the crate's modules directly:
+
+```rust
+use induscode::boot::{BootIo, InputSource, OutputSink, boot_run};
+use induscode::core::{BIN_NAMES, BRAND, VERSION, create_workspace};
+use induscode::launch::catalog::{CatalogFilter, RegistrySource, StdoutCatalogIo, print_model_catalog};
+use induscode::launch::credentials::{AuthVault, DiskAuthVault, run_credential_command, /* … */};
+use induscode::launch::oauth::{self, OAuthLoginCallbacks, OAuthVaultSink, /* … */};
+use induscode::launch::parser::read_invocation;
+use induscode::launch::pickers::{StdioPackageIo, is_package_command, run_package_command};
+use induscode::launch::usage::render_usage;
+use indusagi::shell_app::auth_cli::{AuthIo, run_auth_command};
+```
+
+`route()` short-circuits the no-session verbs before any boot handoff: the `auth`
+subcommand (delegated to `indusagi::shell_app::auth_cli::run_auth_command` for
+`login`/`status`/`refresh`, and the agent's own `signout` path for `logout`), the
+meta flags (`--help` rendered from `render_usage()`, `--version` printing
+`"{BRAND.app_name} {VERSION}"`), `signin`/`signout`, the package verbs, and
+`--list-models`. An unknown **leading** flag is a usage error → exit `2`
+(`EXIT_USAGE`). Every other run — a bare prompt, `-p`, `--json`, `--interactive` —
+is handed to `boot_run`, whose resolved `ExitCode` `main` adopts unchanged.
+Returning `ExitCode` (rather than `process::exit`) lets the tokio runtime drain and
+destructors run, so the terminal's raw/alt-screen mode is restored on the way out.
+
+Back to the [induscode (Rust) Overview](/rust-cli/README), the
+[Architecture](/rust-cli/architecture), or the framework's
+[Crate Exports](/rust/reference/crate-exports). For the same surface in the other
+editions see the [Python package exports](/python-cli/reference/package-exports) and
+the [TS CLI](/cli).

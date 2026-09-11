@@ -1,0 +1,290 @@
+# React-Ink Widgets
+
+> `indusagi.react_ink` is the terminal-UI component library for the coding
+> agent — a streaming markdown renderer, a colored structured-diff view, twelve
+> focus-trapping modal dialogs, per-role chat widgets, chrome (Footer,
+> StatusLine, TaskPanel), a theme adapter, and a set of framework-free helper
+> modules. Built on Textual + Rich. Imported as `import indusagi.react_ink`.
+
+The package surface re-exports every widget and helper from its snake_cased
+submodules so each symbol can be reached from the top level. The pure logic
+lives in three framework-light subpackages — `diff/`, `markdown/`, and
+`utils/` — while the on-screen surfaces live under `components/`. Chat data
+flows from the [UI Bridge](/python/ui/ui-bridge) as a `SessionSnapshot` into
+`MessageList`, `Footer`, `StatusLine`, `TaskPanel`, and `StreamingMarkdown`,
+and dialogs are pushed onto the [Shell App](/python/subsystems/shell-app) as
+Textual `ModalScreen`s.
+
+## Table of Contents
+
+- [Layout](#layout)
+- [View-model types](#view-model-types)
+- [Theme adapter](#theme-adapter)
+- [Markdown stream](#markdown-stream)
+- [Diff view](#diff-view)
+- [Message list and per-role widgets](#message-list-and-per-role-widgets)
+- [Chrome widgets](#chrome-widgets)
+- [The twelve dialogs](#the-twelve-dialogs)
+- [Pure helpers](#pure-helpers)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Layout
+
+Three layers under `indusagi/react_ink/`:
+
+| Path | Holds |
+|------|-------|
+| `types.py` | Frozen view-model dataclasses (`SessionSnapshot`, `StatusMessage`, …) and type aliases |
+| `theme_adapter.py` | Palette → Rich painters, Textual theme, and Pygments style |
+| `diff/` | `structured.py` (framework-free diff engine), `word_diff.py` (intra-line emphasis), `view.py` (the `DiffView` widget) |
+| `markdown/` | `format_token.py`, `highlight.py`, `table.py` (pure), `view.py` + `streaming.py` (widgets) |
+| `components/` | Chrome (`footer`, `status_line`, `task_panel`, `tool_event`, `changelog`, `display_block`) and the `messages/` + `dialogs/` subpackages |
+| `utils/` | Pure dissection/preview/search helpers (`message_groups`, `tool_display`, `selection_dialog`, `session_browser`) |
+
+The pure subpackages (`diff.structured`, `diff.word_diff`, and all of `utils/`)
+import no `textual` or `rich`. Importing the top-level `indusagi.react_ink`
+package does pull in Textual/Rich because the widget modules need them; import
+from the subpackages directly when you only want the logic.
+
+Two modules are deliberately **not** re-exported at the package top level:
+`components.editor` (`PromptEditor`) and the session-browser engine
+`utils.session_browser` (reachable via `indusagi.react_ink.utils`). Where the
+same name is exported by two modules, the package resolves to the defining
+module: `status_marker` / `split_visible_lines` / `clamp_content_lines` come
+from `components.tool_event`, and `VISIBLE_SESSION_COUNT` /
+`build_session_metadata` come from `components.dialogs.session`.
+
+## View-model types
+
+`types.py` is the UI vocabulary. Every chrome widget renders from a single
+immutable `SessionSnapshot`; the rest are frozen data carriers and type
+aliases.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `SessionSnapshot` | dataclass | `types.py` | Full view-model of one session: messages tuple, model, `is_streaming` / `is_compacting` flags, `SessionStats`, `ContextUsage` |
+| `StatusMessage` | dataclass | `types.py` | A status line entry with a `StatusKind` tone |
+| `ToolExecutionState` | dataclass | `types.py` | One in-flight tool execution keyed by `tool_call_id`, with a `ToolExecutionStatus` |
+| `PendingMessageItem` | dataclass | `types.py` | A queued user input awaiting send, with a `PendingMessageMode` |
+| `SessionStats` / `ContextUsage` | dataclass | `types.py` | Token/cost stats and context-window usage |
+| `UiDisplayBlock` | dataclass | `types.py` | A host- or extension-emitted block merged into the transcript |
+
+Type aliases include `StatusKind`, `ToolExecutionStatus`, `LoginAuthKind`, and
+`PendingMessageMode`. Field names mirror the TypeScript ground truth verbatim
+(`tool_call_id`, `is_streaming`, `updated_at`, `cache_read`) and most
+dataclasses are `frozen=True, slots=True`. The agent and AI imports
+(`AgentMessage`, `Model`, the auth prompt types) sit under `TYPE_CHECKING` to
+keep `types.py` dependency-light.
+
+## Theme adapter
+
+`theme_adapter.py` projects one flat host palette (`Mapping[str, str]`) onto
+three consumers. `create_theme_bundle` packs all three into a `ThemeBundle`.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `ThemeAdapter` (alias `InkThemeAdapter`) | dataclass | `theme_adapter.py` | Role/color resolver + Rich painters; `color`/`background`/`dim`/`muted`/`role`/`role_background` return `rich.text.Text`, the `*_style` variants return `rich.style.Style` |
+| `create_theme_adapter` | function | `theme_adapter.py` | Build the adapter over a palette, seeded from `DEFAULT_ROLE_KEYS` and overlaid with `role_overrides` |
+| `to_textual_theme` | function | `theme_adapter.py` | A `textual.theme.Theme` exposing every palette key and the resolved roles as kebab-cased CSS vars like `$diff-added-bg` |
+| `to_pygments_style` | function | `theme_adapter.py` | A `pygments` `Style` subclass mapping `syn*` roles onto token families |
+| `theme_variable_defaults` | function | `theme_adapter.py` | Feeds `App.get_theme_variable_defaults` so the stylesheet parses |
+| `create_theme_bundle` | function | `theme_adapter.py` | Pack adapter + Textual theme + Pygments style |
+
+Role resolution is a `role-key → fallback-key → text-fallback` dict lookup
+(`DEFAULT_ROLE_KEYS`, `ROLE_FALLBACK_KEYS`). Degradation is deliberate:
+invalid colors are caught via Rich's `ColorParseError`, and non-hex colors
+simply drop out of the Pygments style.
+
+```python
+from indusagi.react_ink import create_theme_bundle
+
+bundle = create_theme_bundle("midnight", {
+    "text": "#e5e5e7",
+    "background": "#1e1e2e",
+    "diffAddedBg": "#1b3a2a",
+    "diffRemovedBg": "#3a1b1b",
+})
+app.register_theme(bundle.theme)            # textual.theme.Theme
+text = bundle.adapter.role("assistant", "hello")   # rich.text.Text
+```
+
+## Markdown stream
+
+The markdown stack renders both settled history and live streaming turns.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `MarkdownView` | class | `markdown/view.py` | `textual.widgets.Markdown` subclass with strikethrough disabled and prompt-XML scrubbing on `update`/`append` |
+| `PlainMarkdownFence` | class | `markdown/view.py` | Renders fenced code uncolored |
+| `StreamingMarkdown` | class | `markdown/streaming.py` | A `MarkdownView` that grows by streamed deltas over Textual's retained-mode `MarkdownStream` |
+| `create_markdown_parser` (alias `parser_factory`) | function | `markdown/format_token.py` | `markdown-it` parser factory (strikethrough off) |
+| `strip_prompt_xml_tags` / `split_partial_prompt_xml_tag` | function | `markdown/format_token.py` | Scrub prompt-XML tags; hold back a partial tag across deltas |
+| `CliHighlight` / `create_highlighter` / `highlight_by_path` / `language_from_path` / `token_type_to_role` | function | `markdown/highlight.py` | Pygments code highlighter mapping token families onto `syn*` theme roles |
+| `build_table_text` / `compute_column_widths` / `format_table_row` / `table_separator_row` | function | `markdown/table.py` | Plain-text markdown table renderer |
+
+A streaming assistant turn calls `await write(delta)` per chunk and
+`await settle()` once the turn ends. `write` prepends the held suffix from the
+previous delta so prompt-XML tags are always stripped whole, then enqueues the
+safe portion on the stream (which coalesces bursts internally — settled blocks
+never re-render). `settle` flushes any held suffix as literal text and stops
+the stream task; the widget keeps the full document as the permanent history
+entry. `asyncio.CancelledError` is never swallowed.
+
+```python
+from indusagi.react_ink import StreamingMarkdown
+
+view = StreamingMarkdown()
+await view.mount()  # inside a Textual app
+async for delta in channel:        # gateway text deltas
+    await view.write(delta)
+await view.settle()
+```
+
+Helpers `has_markdown_syntax`, `get_list_number`, `pad_aligned`, and
+`string_width` are pure; constants `BLOCKQUOTE_BAR`, `PROMPT_XML_TAG_NAMES`,
+and `Alignment` ship alongside.
+
+## Diff view
+
+`diff/` is a structured-patch engine plus its renderer.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `build_structured_diff` | function | `diff/structured.py` | Build a classified, line-numbered, word-paired diff over `difflib.SequenceMatcher`; returns `None` when there is nothing to show |
+| `StructuredDiff` / `DiffHunk` / `DiffLine` | dataclass | `diff/structured.py` | The diff model; `CONTEXT_LINES = 3` |
+| `word_diff_line` / `WordSpan` | function | `diff/word_diff.py` | Intra-line word diff producing emphasis spans, suppressed above `CHANGE_THRESHOLD = 0.4` |
+| `DiffView` | class | `diff/view.py` | `textual.widgets.Static` that draws a `StructuredDiff` with themed `+`/`-` backgrounds, a line-number gutter, and word-level emphasis |
+| `build_diff_text` / `gutter_width` / `line_marker` | function | `diff/view.py` | Pure render helpers under `DiffView` |
+
+`build_structured_diff(old_str, new_str, file_path="")` walks the raw hunk
+lines into typed `DiffLine`s carrying gutter line numbers, then pairs adjacent
+removed→added runs index-for-index and hands them to `word_diff_line` so the
+renderer emphasizes only the changed sub-range of each line. `file_path` is
+accepted for signature parity only. The diff engine uses
+`difflib` (Ratcliff-Obershelp) rather than a Myers diff, so hunk boundaries can
+differ on adversarial input; `tests/react_ink/test_diff.py` is the declared
+arbiter.
+
+```python
+from indusagi.react_ink import build_structured_diff, DiffView
+
+diff = build_structured_diff("line one\nold\n", "line one\nnew\n", "x.py")
+if diff is not None:
+    panel = DiffView(diff)   # mount in a Textual app
+```
+
+## Message list and per-role widgets
+
+The transcript is an anchored, append-only `VerticalScroll` reconciled by a
+stable entry key, so settled history never re-renders.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `MessageList` | class | `components/messages/list.py` | The transcript widget; `sync(...)` reconciles mounted rows against a `SessionSnapshot` |
+| `group_messages` / `visible_entries` / `entry_keys` | function | `components/messages/list.py` | Group tool-calling assistant messages with their following tool results, merge display blocks, clamp |
+| `MessageEntry` / `DisplayBlockEntry` | dataclass | `components/messages/list.py` | Reconciliation entries |
+| `has_tool_calls` / `get_entry_timestamp` | function | `components/messages/list.py` | Predicate and timestamp sort key |
+| `create_message_row` (alias `MessageRow`) | function | `components/messages/row.py` | Dispatcher that builds the right per-role widget for one `AgentMessage` |
+| `AssistantMessageView` / `UserMessageView` / `BashMessageView` | class | `components/messages/*.py` | Per-role transcript widgets |
+| `BranchSummaryMessageView` / `CompactionMessageView` / `CustomMessageView` | class | `components/messages/*.py` | Branch, compaction, and host-custom message widgets |
+| `SkillInvocationMessage` / `ToolCallMessage` / `ToolResultBlock` | class | `components/messages/*.py` | Skill, tool-call, and tool-result widgets |
+
+`group_messages`/`visible_entries`/`entry_keys` group each tool-calling
+assistant message with its following `toolResult` run, merge `UiDisplayBlock`s,
+and sort by timestamp; `MessageList.sync` then reconciles mounted rows by
+stable key. `create_message_row` dispatches each `AgentMessage` by role
+(user / assistant / toolResult / bash / branch / compaction / custom) to the
+matching widget. Most widgets ship a pure `build_*_text(message, theme)`
+renderer returning Rich `Text`: `build_user_message_text`, `build_bash_text`
+(+`bash_status`), `build_compaction_text`, `build_branch_summary_text`,
+`build_custom_text`, `build_skill_invocation_text`.
+
+## Chrome widgets
+
+Persistent UI surfaces driven by the snapshot.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `TaskPanel` | class | `components/task_panel.py` | Live panel of in-flight tool executions keyed by `tool_call_id` |
+| `build_tool_event_lines` / `recent_tool_executions` | function | `components/task_panel.py` | Render and selection helpers |
+| `StatusLine` | class | `components/status_line.py` | Single persistent status line (`Static`) |
+| `derive_status` | function | `components/status_line.py` | Pure text/tone derivation from a `SessionSnapshot` + `StatusMessage` |
+| `Footer` | class | `components/footer.py` | Bottom stats bar (`Static`) with reactive snapshot/branch/provider-count inputs |
+| `footer_cost` / `format_tokens` / `shorten_path` / `chunk_lines` / `sanitize_status_text` / `to_display_text` | function | `components/footer.py` | Pure formatting helpers |
+| `ToolEventBlock` | class | `components/tool_event.py` | Generic tool-event card (`Static`) with status marker and line clamping |
+| `build_tool_event_text` / `status_marker` / `split_visible_lines` / `clamp_content_lines` / `plain_tool_text` | function | `components/tool_event.py` | Tool-event rendering; `ClampedContent` is a `NamedTuple` |
+| `ChangelogBlock` / `build_changelog_text` | class | `components/changelog.py` | Changelog rendering with `render_inline` / `render_markdown_line` |
+| `DisplayBlockView` / `display_block_view` | class | `components/display_block.py` | Dispatcher widget for host/extension-emitted blocks merged into the transcript |
+
+`ToolCallMessage` subclasses `ToolEventBlock`; `TaskPanel` keeps private
+`status_marker`/`split_visible_lines`/`clamp_content_lines` variants while the
+top-level package re-exports the `tool_event` originals.
+
+## The twelve dialogs
+
+All dialogs are Textual `ModalScreen`s pushed via `app.push_screen` and
+resolved with `dismiss(result)`. `DialogFrame` and `SelectableDialog` are the
+reusable base; `WrapCursorMixin` gives wrap-around cursors. The `dialogs`
+package uses lazy `importlib` re-export so importing the group-A pickers never
+pulls in the group-B auth dialogs.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `DialogFrame` | class | `components/dialogs/frame.py` | Shared bordered modal frame |
+| `SelectableDialog` / `WrappingOptionList` / `WrapCursorMixin` | class | `components/dialogs/selectable.py` | Generic searchable single-select picker with wrap-around cursor |
+| `ModelDialog` | class | `components/dialogs/model.py` | Model picker; helpers `matches_model`, `model_search_text` |
+| `ThemeDialog` | class | `components/dialogs/theme.py` | Theme picker; `ThemeDialogItem`, `to_item` |
+| `SettingsDialog` | class | `components/dialogs/settings.py` | Settings editor; `SettingsDialogItem`, `get_next_value` |
+| `ScopedModelsDialog` | class | `components/dialogs/scoped_models.py` | Per-scope model selection; `model_key` |
+| `LoginDialog` | class | `components/dialogs/login.py` | API-key/provider login; `LoginDialogMode`, `LoginDialogResult`, `login_provider_options`, `saved_account_options` |
+| `OAuthDialog` | class | `components/dialogs/oauth.py` | OAuth flow; `OAuthFlow`, `OAuthDialogResult`, `AuthInputPrompt`, `AuthRedirectInfo` |
+| `SessionDialog` | class | `components/dialogs/session.py` | Session browser; `VISIBLE_SESSION_COUNT`, `build_session_metadata` |
+| `StartupSessionPicker` | class | `components/dialogs/startup_picker.py` | Boot-time session chooser |
+| `TreeDialog` | class | `components/dialogs/tree.py` | Session-tree navigator |
+| `UserMessageDialog` | class | `components/dialogs/user_message.py` | Queued-message picker |
+
+`ModelDialog`, `ThemeDialog`, `SettingsDialog`, and `ScopedModelsDialog` are
+the group-A pickers built on `SelectableDialog`; `LoginDialog`, `OAuthDialog`,
+`SessionDialog`, `StartupSessionPicker`, `TreeDialog`, and `UserMessageDialog`
+are the group-B auth/navigation modals.
+
+```python
+from indusagi.react_ink import ModelDialog
+
+chosen = await app.push_screen_wait(ModelDialog(snapshot.model))
+if chosen is not None:
+    ...  # the dialog resolves via dismiss(result)
+```
+
+## Pure helpers
+
+Framework-free logic in `utils/`. These feed the widgets and dialogs.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `describe_tool_call` / `describe_tool_result` / `describe_tool_execution` / `describe_tool_source` | function | `utils/tool_display.py` | Turn a tool call/result into a renderable `ToolCardDescriptor` (title, summary, body, optional `StructuredDiff`) |
+| `split_assistant_message` / `format_user_content` / `format_tool_call` / `format_tool_result` / `format_custom_content` | function | `utils/message_groups.py` | Message dissection feeding the per-role widgets |
+| `extract_tool_text` / `extract_message_preview` / `parse_skill_invocation` / `preview_text` / `preview_multiline` / `safe_stringify` / `format_message_timestamp` | function | `utils/message_groups.py` | Preview and stringification helpers |
+| `matches_search_query` / `wrap_selection_index` | function | `utils/selection_dialog.py` | AND-term case-insensitive search match and modular cursor wrap used by `SelectableDialog` |
+| `filter_and_sort_sessions` / `parse_session_search_query` / `format_session_age` / `format_session_size` / `shrink_session_id` | function | `utils/session_browser.py` | The session-browser fuzzy search/sort engine (via `indusagi.react_ink.utils`, not the top-level package) |
+
+A `ToolCardDescriptor` can carry a `StructuredDiff`, which `DiffView` draws.
+The session-browser names (`ParsedSearchQuery`, `SearchToken`,
+`SessionFilterResult`, `SessionBrowserProgress`, and the functions above) are
+exported from `indusagi.react_ink.utils` rather than the package root.
+
+## Relationship to neighbors
+
+`react_ink` is the presentation layer of the rebuild. It depends on
+[Agent](/python/facades/agent) for `AgentMessage`, `ToolCall`, and the
+role-specific message types, and on [AI](/python/facades/ai) for `Model`, the
+auth prompt types, and the model catalog that backs `ModelDialog`. It is driven
+by the [UI Bridge](/python/ui/ui-bridge), which builds a `SessionSnapshot` per
+agent event and pushes the dialogs onto the [Shell App](/python/subsystems/shell-app).
+The theme adapter registers its `Theme` and Pygments style with the Textual
+app and shares the host-palette layer described in [TUI](/python/ui/tui).
+`session_browser` backs `SessionDialog`/`StartupSessionPicker` against the
+[Runtime](/python/subsystems/runtime) sessions subsystem, and the login/oauth
+dialogs drive the auth subsystem.
+
+Back to the [Architecture overview](/python/architecture).

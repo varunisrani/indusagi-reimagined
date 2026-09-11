@@ -1,0 +1,330 @@
+# Getting Started
+
+> `indusagi` is the 100% Rust rebuild of the terminal-first AI coding-agent framework — a Cargo workspace that compiles to a single static binary. One published crate, `indusagi`, carries both the library (`[lib]`) and the `indusagi` CLI binary (`[[bin]]`). Install the CLI with `cargo install indusagi`, add the library with `cargo add indusagi`, or build from a checkout with `cargo build` / `cargo run`. Set your provider API key in the environment (or sign in with `indusagi auth login`), and a bare attended launch opens the interactive REPL/TUI.
+
+## Table of Contents
+
+- [Install](#install)
+- [The crate layout](#the-crate-layout)
+- [Toolchain](#toolchain)
+- [Build and run](#build-and-run)
+- [The indusagi binary](#the-indusagi-binary)
+- [The flag grammar](#the-flag-grammar)
+- [Mode derivation](#mode-derivation)
+- [Provider API keys](#provider-api-keys)
+- [The auth subcommand](#the-auth-subcommand)
+- [First interactive run](#first-interactive-run)
+- [The boot pipeline](#the-boot-pipeline)
+- [Configuration files and state](#configuration-files-and-state)
+- [Embedding the launcher](#embedding-the-launcher)
+- [Where to next](#where-to-next)
+
+## Install
+
+`indusagi` is published to crates.io as one crate that carries both the library and the `indusagi` binary, so the same name installs the CLI and adds the library:
+
+```bash
+cargo install indusagi    # the CLI — puts the `indusagi` binary on your PATH
+cargo add indusagi        # the library — depend on the framework from your own crate
+```
+
+The rest of this page is the build-from-source and embedding walkthrough.
+
+## The crate layout
+
+`indusagi-rust/` is a virtual Cargo workspace (`resolver = "3"`, edition 2024). The 13 former subsystem library crates are merged into one crate, `indusagi`, as modules — npm-style "one package" — and that crate carries both the `[lib]` and the `[[bin]]`. The workspace `members` are listed explicitly:
+
+| Crate | Role | Bin |
+|-------|------|-----|
+| `crates/indusagi` | The umbrella crate (`[lib] name = "indusagi"`, `src/lib.rs`) holding every subsystem as a module (`core`, `llmgateway`, `runtime`, `capabilities`, `interop`, `tui`, `shell_app`, …), plus the only `[[bin]]` in the tree (`name = "indusagi"`, `src/main.rs`, a thin `main()` over `indusagi::shell_app::run`). Published to crates.io. | `indusagi` |
+| `crates/indusagi-testkit` | Dev-only test fixtures (`ScriptedModel`, wiremock helpers, render harness). `publish = false`. | — |
+| `xtask` | Build / lineage / release tooling (replaces `build.mjs`). | `xtask` |
+
+`default-members = ["crates/indusagi"]`, so a bare `cargo run` drives the binary. The workspace `version` is single-sourced as `0.1.0` (continuing the npm `0.13.x` line); every crate inherits it via `version.workspace = true`, and the runtime version string is the compile-time `CARGO_PKG_VERSION` — there is no filesystem walk and no `"0.0.0"` fallback.
+
+The shell application — argv parsing through to a running agent — is the `shell_app` module of the `indusagi` crate (the port of the TypeScript `shell-app/` subsystem). See [Shell App](/rust/subsystems/shell-app) for its internals; this page is the build-and-run walkthrough.
+
+## Toolchain
+
+The toolchain is pinned by `rust-toolchain.toml` at the workspace root:
+
+```toml
+[toolchain]
+channel    = "1.96.0"
+components = ["rustfmt", "clippy"]
+```
+
+So `rustc`/`cargo` **1.96.0** with edition 2024 (stable since 1.85). The MSRV floor (`rust-version = "1.96"`) matches the pin. If you use rustup, the override is applied automatically inside the workspace; otherwise put cargo on your `PATH`:
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo 1.96.0
+rustc --version                        # rustc 1.96.0
+```
+
+## Build and run
+
+All commands are run from the `indusagi-rust/` workspace root.
+
+```bash
+# Build the whole workspace (library + binary + testkit + xtask).
+cargo build --workspace
+
+# Run the full test suite (2062 tests at full parity).
+cargo test --workspace
+
+# Run the binary directly through cargo (the `indusagi` executable).
+cargo run
+
+# Pass flags after `--` so cargo forwards them to the binary, not to cargo.
+cargo run -- --help
+cargo run -- --version
+cargo run -- -m claude-sonnet-4 -p "summarize the Cargo.toml in this repo"
+```
+
+For a shippable binary, build in release. The `release` profile is tuned for a latency-sensitive agent (`opt-level = 3`, `lto = "thin"`, `codegen-units = 1`, `strip = true`, `panic = "abort"`); a `dist` profile inherits it with `lto = "fat"` for release artifacts:
+
+```bash
+cargo build --release -p indusagi        # target/release/indusagi
+cargo build --profile dist -p indusagi   # target/dist/indusagi (max optimization)
+
+# Then run the built binary directly:
+./target/release/indusagi --version          # prints: indusagi 0.1.0
+```
+
+### Feature flags
+
+The Cargo feature taxonomy lives on the **`indusagi` library crate** (`crates/indusagi/Cargo.toml`), not on the binary crate. Its default keeps the full historical surface — `default = ["rustls", "mcp", "tui"]` — so the binary is byte-identical to the prior unconditional build. The six features:
+
+| Feature | Gates |
+|---------|-------|
+| `rustls` | TLS backend, forwarded (`reqwest/rustls`) to the single merged `reqwest` transport. There is no `native-tls` feature (the pinned reqwest 0.13.4 native-tls path is unresolvable). |
+| `mcp` | The MCP protocol bridge (`dep:rmcp` + `dep:http`, the `interop` module, the facade `mcp` shim) and the `--mcp` flag's effect. |
+| `tui` | Terminal-UI primitives + the live ratatui render layer (`tui` + `tui_render` modules and their render deps: `ratatui`, `crossterm`, `pulldown-cmark`, `syntect`, `two-face`, `similar`, `lru`, `unicode-width`, `unicode-segmentation`). |
+| `swarm` | The multi-agent coordination subsystem (`swarm` module — a pure code gate). |
+| `composio` | The Composio SaaS connector adapter (`connectors_saas` — a pure code gate). |
+| `full` | `mcp + tui + composio + swarm`. |
+
+A normal `cargo install indusagi` or `cargo build` keeps the **default features on** (`rustls`/`mcp`/`tui`), so the installed binary carries the full historical surface. A trimmed build drops them:
+
+```bash
+# Lean line-oriented build (no live TUI, no MCP):
+cargo build -p indusagi --no-default-features --features rustls
+```
+
+The crate also has an off-by-default `mimalloc` feature (`dep:mimalloc`) that swaps in the mimalloc global allocator. The default tree stays allocator-neutral:
+
+```bash
+cargo build -p indusagi --features mimalloc   # opt into the mimalloc allocator
+```
+
+## The indusagi binary
+
+The `[[bin]]` is named `indusagi`, defined in the `indusagi` crate (`crates/indusagi/Cargo.toml`):
+
+```toml
+[[bin]]
+name = "indusagi"
+path = "src/main.rs"
+```
+
+`main` is a thin shim. It collects the OS argv minus the program name, builds a current-thread tokio runtime, drives the async launcher, and returns the resulting exit code to the OS:
+
+```rust
+fn main() -> ExitCode {
+    let argv: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(indusagi::shell_app::run(argv))
+}
+```
+
+`main` returns `std::process::ExitCode` and never calls `process::exit`, so every destructor runs on the way out — the TUI restores the terminal, the MCP fleet closes, buffered writers flush. The real work is `indusagi::shell_app::run`, ported from `cli.ts`:
+
+```rust
+pub async fn run(argv: Vec<String>) -> ExitCode
+```
+
+It parses argv into a `ParsedInvocation`, short-circuits the two output-only modes (`Help`, `Version`), assembles a `BootContext` for every running mode, hands it to the `select_runner`-selected runner, runs the context's closables in reverse on the way out, and returns the exit code by value. Exit codes mirror the TS launcher: `2` on a parse error, `0` for help/version, `1` on a startup or run failure, else the runner's own code.
+
+## The flag grammar
+
+The command-line vocabulary is the single source of truth `indusagi::shell_app::FLAG_SPECS` — a 10-row `&[FlagSpec]` table the table-driven parser (`tokenize_invocation`) and the help renderer (`render_usage`) both read. A new flag is one row. The 10 flags, in help-render order:
+
+| Flag | Aliases | Kind | Purpose |
+|------|---------|------|---------|
+| `--model` | `-m` | string | Choose the model to run, by catalog id or alias. |
+| `--print` | `-p` | boolean | Emit a single answer to stdout and exit (one-shot mode). |
+| `--json` | `--rpc`, `--wire` | boolean | Speak the JSON line protocol over stdio (wire mode). |
+| `--interactive` | `-i` | boolean | Force the read-eval-print loop even with a prompt present. |
+| `--cwd` | — | string | Run as if started from this working directory. |
+| `--system` | — | string | Override the system prompt with the given text. |
+| `--no-tools` | — | boolean | Disable every tool; the model may only produce text. |
+| `--mcp` | — | string (repeatable) | Attach an external MCP server (repeatable). |
+| `--help` | `-h` | boolean | Show usage and exit. |
+| `--version` | `-v` | boolean | Print the version and exit. |
+
+The parser understands long flags (`--name`, `--name=value`, `--name value`), short flags (`-x`, `-x=value`, `-xvalue`), clustered short booleans (`-ip` → `-i -p`), a value-taking short that ends a cluster (`-ipm gpt` → `-i -p -m gpt`), a bare `--` terminator (everything after is positional), and repeatable flags (`--mcp` accumulates a list). Positionals join into a single free-text prompt. A malformed invocation returns an `InvocationError` whose `Display` is byte-exact to the TS — e.g. `unrecognised flag "--bogus".`, `flag "--model" expects a value.`, `flag "--print" takes no value but got "=1".` — written to stderr, exit `2`.
+
+```bash
+cargo run -- --version          # indusagi 0.1.0
+cargo run -- --help             # the usage banner + the flag table
+cargo run -- --bogus            # exit 2: unrecognised flag "--bogus".
+```
+
+The `--help` banner opens with `indusagi — a terminal-first AI coding agent.` and `Usage: indusagi [options] [prompt...]`, one row per flag (the 28-column left pad is byte-exact to the TS `describeFlag`), and a trailing note about prompt-vs-attended behavior.
+
+## Mode derivation
+
+`tokenize_invocation` derives one `Mode` per invocation through a fixed precedence ladder (`derive_mode`), highest first:
+
+1. `--help` → `Mode::Help`
+2. `--version` → `Mode::Version`
+3. `--json` / `--rpc` / `--wire` → `Mode::Wire`
+4. `--interactive` / `-i` → `Mode::Repl`
+5. a prompt is present → `Mode::Print`
+6. otherwise → `Mode::Repl` when attended, else `Mode::Print`
+
+"Attended" means **both** stdout and stdin are TTYs (`std::io::stdout().is_terminal() && std::io::stdin().is_terminal()`), passed into the pure parser via `TokenizeOptions { attended }`. So an unattended pipe with no prompt defaults to one-shot `print`, while an attended terminal with no prompt opens the interactive loop. `Help` and `Version` are output-only and never reach the runner registry; `Print` / `Wire` / `Repl` are dispatched by `select_runner` to the three registered runners (`OneShotRunner`, `WireRunner`, `ReplRunner`).
+
+## Provider API keys
+
+The framework ships **no vendor SDKs** — every provider is reached over raw HTTP via `reqwest`. The provider key is read from the process environment by the gateway's credential table (`llmgateway::credentials::secret_table()`), which probes each provider's variables in preference order:
+
+| Provider | `ProviderId` | Env vars (in probe order) | Scheme |
+|----------|--------------|---------------------------|--------|
+| Anthropic | `Anthropic` | `ANTHROPIC_API_KEY` | ApiKey |
+| OpenAI | `Openai` | `OPENAI_API_KEY` | ApiKey |
+| Google (Gemini) | `Google` | `GEMINI_API_KEY`, `GOOGLE_API_KEY` | ApiKey |
+| Google Vertex | `GoogleVertex` | `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_VERTEX_PROJECT`, `GOOGLE_CLOUD_PROJECT` | CloudIam |
+| Amazon Bedrock | `Amazon` | `AWS_BEARER_TOKEN_BEDROCK`, `AWS_ACCESS_KEY_ID`, `AWS_PROFILE` | CloudIam |
+| Azure OpenAI | `Azure` | `AZURE_OPENAI_API_KEY`, `AZURE_API_KEY` | ApiKey |
+| NVIDIA | `Nvidia` | `NVIDIA_API_KEY` | ApiKey |
+| Kimi (Moonshot) | `Kimi` | `MOONSHOT_API_KEY`, `KIMI_API_KEY` | ApiKey |
+| MiniMax | `Minimax` | `MINIMAX_API_KEY` | ApiKey |
+| Ollama | `Ollama` | — (local server, no key) | None |
+| Mock | `Mock` | — (in-process transport) | None |
+
+Set the key for the model you intend to run first. For most use the Anthropic key is the simplest path:
+
+```bash
+export ANTHROPIC_API_KEY="sk-..."
+cargo run -- -m claude-sonnet-4 -p "what does this repo do?"
+```
+
+The default model, when neither `--model` nor `settings.json` names a catalog-known model, is the fallback `claude-sonnet-4` (`shell_app::config::FALLBACK_MODEL_ID`). Each candidate is validated against the catalog with `llmgateway::get_card` before it is honored. See the [LLM Gateway](/rust/subsystems/llm-gateway) for the model catalog and connectors.
+
+## The auth subcommand
+
+Providers that support OAuth can be signed in with the `auth` helper (`shell_app::auth_cli`, ported from `oauth-cli.ts`). It drives the authorization-code-with-PKCE flow from the terminal and stores the tokens in the profile's credential store. The entry point is:
+
+```rust
+pub async fn run_auth_command(argv: &[String], io: &dyn AuthIo) -> i32
+```
+
+> **Wiring status.** `run_auth_command` is fully implemented and unit-tested, but it is **not yet dispatched by the binary's `shell_app::run`**: `run` parses argv only through the 10-flag grammar and the five `Mode`s, with no `auth`-word subcommand branch. So typing `indusagi auth login anthropic` today does **not** invoke this helper — the three words are parsed as positionals and joined into a prompt. The helper is therefore reached only by **embedding it directly** (pass it the argv slice *after* the `auth` word, plus an `AuthIo`), as in [Embedding the launcher](#embedding-the-launcher). The shapes below describe `run_auth_command`'s own contract.
+
+Three subcommands, plus help (the argv `run_auth_command` itself consumes — i.e. without the `auth` word):
+
+```text
+login   anthropic   # mint a PKCE pair, print the auth URL, paste the code, store tokens
+refresh openai      # rotate a stored access token from its refresh token
+status              # list which providers hold stored credentials + freshness
+status  anthropic   # report one provider only
+help                # usage (also: --help, -h; a missing verb prints help but exits 2)
+```
+
+Exit codes are `0` success (`EXIT_OK`), `2` bad usage (`EXIT_USAGE`), `1` runtime failure (`EXIT_FAILURE`). `login` mints a 64-char PKCE verifier (`create_pkce_pair`), builds the authorization URL (`build_auth_url`), reads the code you paste (a bare code, a `code#state` form, or a full redirect URL with a `code=` parameter all work — `extract_code` handles each), exchanges it via the gateway over a fresh `reqwest::Client` (`exchange_code`), and persists the tokens. The command knows ten providers (`KNOWN_PROVIDERS`: anthropic, openai, google, google-vertex, amazon, azure, nvidia, kimi, ollama, mock — note it omits `minimax`, which the credential table carries), but only those with an `oauth_config_for` entry can sign in — today just **anthropic** and **openai**; the rest print a hint to set their API key in the environment instead. Tokens are written as pretty JSON to the auth store (`Locator::auth_store_path()` → `<profile>/auth.json`, frozen field names `accessToken` / `refreshToken` / `expiresAt` / `updatedAt`, trailing newline) and are never printed.
+
+## First interactive run
+
+With a key set and an attended terminal, a bare invocation lands in `Mode::Repl` and opens the interactive loop:
+
+```bash
+export ANTHROPIC_API_KEY="sk-..."
+cargo run            # attended + no prompt → interactive REPL/TUI
+# or, on the built binary:
+./target/release/indusagi
+```
+
+The `ReplRunner` checks whether the launch is attended (both stdout and stdin TTYs) and whether the `tui` feature is compiled in. When both hold, it constructs the runtime `Agent` and hands it to the live ratatui render surface (`tui_render::mount_interactive`) — the crossterm alternate-screen UI. Every non-TTY launch (pipes, redirects, tests) and any `--no-default-features` build without `tui` falls back to the built-in plain-text `TextView` over the boot I/O seams (`OutputSink` / `InputSource`), so scripted use stays line-oriented and predictable. The loop reads a line, submits it, streams the answer, and repeats until `exit`/`quit` or EOF.
+
+For non-interactive one-shot answers, give a prompt (or pipe one in) — that derives `Mode::Print` and the `OneShotRunner` streams the assistant's prose to stdout as plain text, then exits. For a machine host, `--json` derives `Mode::Wire` and the `WireRunner` speaks a line-delimited JSON protocol over stdio (`{ "type": "submit", "input": "..." }` in, `event` / `result` / `error` lines out — byte-compatible with the TS wire shapes via `serde` renames and `preserve_order`).
+
+```bash
+echo "list the modules" | ./target/release/indusagi -m claude-sonnet-4   # unattended → print
+./target/release/indusagi -m claude-sonnet-4 --json                       # NDJSON wire protocol
+```
+
+## The boot pipeline
+
+For every running mode, `run` assembles a `BootContext` via `build_boot_context(invocation, io)`. Startup is an ordered `Stage` pipeline (`boot::run_stages`) — each stage is a `C -> C` transformation over an immutable context. The five concrete stages (`boot::stages`), in order:
+
+| # | Stage | Does |
+|---|-------|------|
+| 1 | `ResolveLocator` (`resolveLocator`) | Bind the path/branding `Locator`, rooted at the cwd (honoring `--cwd`). |
+| 2 | `LoadConfiguration` (`loadConfiguration`) | Merge settings (defaults ← global ← project) via `load_settings`, then run idempotent startup `apply_upgrades` (advisory — failures swallowed). |
+| 3 | `ResolveModel` (`resolveModel`) | Pick the model id (invocation `--model` ▸ `settings.default_model` ▸ `FALLBACK_MODEL_ID`), each validated with `get_card`. |
+| 4 | `AssembleTools` (`assembleTools`) | Build the built-in tool box for the chosen collection; when MCP servers are configured, mount the bridge and compose the remote box after the built-in (built-in wins name ties), registering the fleet teardown as a closable. |
+| 5 | `BuildAgentFactory` (`buildAgentFactory`) | Close over the model, system preamble, composite tool box, and compaction policy to expose a ready `make_agent` factory. |
+
+`build_boot_context` reads the `--cwd` flag (falling back to `std::env::current_dir()`), seeds an initial `BootContext` with a panicking `make_agent` stand-in, and runs every stage. The resulting context carries the `ParsedInvocation`, merged `Settings`, the `Locator`, the resolved `model_id`, the absolute `cwd`, the `make_agent` factory, the two I/O seams, and the `closables` list. See [Boot pipeline](/rust/subsystems/shell-app) for the full stage internals.
+
+## Configuration files and state
+
+State lives under the profile directory, resolved by the reconciled `crate::core::Locator`. The brand record (`BRAND`) fixes the names: `app_name`/`bin_name` = `indusagi`, `env_prefix` = `INDUSAGI_`, `profile_dir_name` = `.indusagi`. By default the profile is `~/.indusagi/`; set the `INDUSAGI_HOME` environment variable to relocate every state path. Home precedence is: explicit override → `INDUSAGI_HOME` → OS home.
+
+| Path | Resolver | Holds |
+|------|----------|-------|
+| `~/.indusagi/settings.json` | `Locator::settings_path()` | The global settings layer. |
+| `<cwd>/.indusagi/settings.json` | `Locator::project_settings_path(...)` | The per-project settings layer (highest precedence). |
+| `~/.indusagi/auth.json` | `Locator::auth_store_path()` | The OAuth credential store. |
+| `~/.indusagi/sessions` | `Locator::sessions_dir()` | Persisted sessions. |
+| `~/.indusagi/logs` | `Locator::logs_dir()` | Logs. |
+| `~/.indusagi/upgrades.json` | `ShellLocator::upgrade_marker_path()` | The idempotent-upgrade marker (shell extension). |
+
+Settings (`shell_app::config::Settings`) are merged shallowly, "later wins": the built-in `DEFAULT_SETTINGS` (which names the `coding` tool collection) ← the global file ← the project file. The loader is deliberately forgiving — a missing, unreadable, non-UTF-8, malformed, or wrong-shape file is "no settings at this layer", never an error. Recognized keys are `defaultModel`, `systemPrompt`, `tools.collection` (`read-only` / `coding` / `all`), `mcpServers` (under the `mcp` feature), and `compaction` (`triggerRatio` / `keepRecent`); unknown keys are dropped at the trust boundary (`normalize_settings`).
+
+## Embedding the launcher
+
+You can drive the launcher in-process — `run` takes a `Vec<String>` argv and returns an `ExitCode`, never exiting the process:
+
+```rust
+use std::process::ExitCode;
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    // Equivalent to: indusagi --print "explain this repo"
+    indusagi::shell_app::run(vec![
+        "--print".to_string(),
+        "explain this repo".to_string(),
+    ])
+    .await
+}
+```
+
+The auth helper is reached the same way — and, since `run` does not dispatch it, embedding is currently the *only* way to invoke it. `run_auth_command(argv, io)` takes the slice *after* the `auth` word and an `AuthIo` seam (so a host or test can supply its own terminal IO), returning a process exit code:
+
+```rust
+// Equivalent to a (not-yet-wired) `indusagi auth status anthropic`.
+let code: i32 = indusagi::shell_app::run_auth_command(
+    &["status".to_string(), "anthropic".to_string()],
+    &my_auth_io,   // your `impl AuthIo`
+)
+.await;
+```
+
+To skip the CLI entirely and embed the agent runtime, see [Runtime](/rust/subsystems/runtime) and [Capabilities](/rust/subsystems/capabilities); for raw model access, [LLM Gateway](/rust/subsystems/llm-gateway).
+
+## Where to next
+
+- [Architecture](/rust/architecture) — how the merged crate's modules fit together.
+- [Shell App](/rust/subsystems/shell-app) — the boot pipeline, runners, flag grammar, and `auth` internals.
+- [LLM Gateway](/rust/subsystems/llm-gateway) — the model catalog, connectors, and credentials.
+- [Runtime](/rust/subsystems/runtime) — `create_agent` and the agent loop.
+- [Capabilities](/rust/subsystems/capabilities) — the built-in tool kernel.
+- Parity with the other editions: [Python Getting Started](/python/getting-started), and the TS source the Rust build ports.

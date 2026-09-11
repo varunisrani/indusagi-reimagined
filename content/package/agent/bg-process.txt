@@ -1,0 +1,199 @@
+# Background Process Tool
+
+> Run long-running commands without blocking the agent. Start dev servers, builds, and tests in the background, monitor their output, get alerts on completion, and manage them all from one tool.
+
+Background process management ships as the built-in `process` tool of `indusagi/agent`. It lives in `src/facade/bot/actions/` and is part of `codingTools` / `createCodingTools`. There is no separate extension to install and no `/process:*` slash commands — everything is driven through the single `process` tool.
+
+Implementation:
+
+- `actions/process.ts` — the `process` `AgentTool` (`createProcessTool`) and its action dispatch.
+- `actions/process-controller.ts` — `ProcessController` plus the per-cwd `getProcessController` cache.
+- `actions/process-manager.ts` — `ProcessManager`, the spawn/log/kill engine.
+- `actions/process-types.ts` — `ProcessInfo`, `ProcessStatus`, `StartOptions`, `ProcessesDetails`, and related types.
+
+## Table of Contents
+
+- [Setup](#setup)
+- [Tool Parameters](#tool-parameters)
+- [Actions](#actions)
+- [Alert Flags](#alert-flags)
+- [Examples](#examples)
+- [Process Lifecycle](#process-lifecycle)
+- [Output Storage](#output-storage)
+- [Controller and Manager](#controller-and-manager)
+
+## Setup
+
+```typescript
+import { Agent, createCodingTools, createProcessTool } from "indusagi/agent";
+
+// process is included in the coding tool set
+const agent = new Agent({
+  initialState: { tools: createCodingTools(process.cwd()) },
+});
+
+// or create it on its own
+const proc = createProcessTool({ cwd: process.cwd() });
+```
+
+`createProcessTool(options?)` accepts a `ProcessToolOptions`:
+
+- `cwd?: string` — working directory (defaults to `process.cwd()`).
+- `controller?: ProcessController` — reuse an existing controller.
+- `getConfiguredShellPath?: () => string | undefined` — choose the shell used to spawn.
+- `defaultTailLines?: number` — lines returned by `output` (default 100).
+- `maxOutputLines?: number` — overall cap on the `output` text (default 200).
+
+## Tool Parameters
+
+The tool name and label are both `process`. Parameters (`ProcessesParamsType`):
+
+| Parameter | Type | Used by | Notes |
+|-----------|------|---------|-------|
+| `action` | `"start" \| "list" \| "output" \| "logs" \| "kill" \| "clear" \| "write"` | all | required |
+| `command` | string | start | required for `start` |
+| `name` | string | start | required for `start`; friendly name |
+| `id` | string | output, logs, kill, write | `proc_N` or a name match |
+| `input` | string | write | required for `write`; data for stdin |
+| `end` | boolean | write | close stdin after writing |
+| `alertOnSuccess` | boolean | start | default false |
+| `alertOnFailure` | boolean | start | default true |
+| `alertOnKill` | boolean | start | default false |
+
+The tool returns `AgentToolResult<ProcessesDetails>`. `ProcessesDetails` carries `action`, `success`, `message`, and (per action) `process`, `processes`, `output`, `logFiles`, or `cleared`.
+
+## Actions
+
+### start
+
+Run a command in the background. Requires `name` and `command`.
+
+```
+process action=start name="dev-server" command="npm run dev" alertOnFailure=true
+```
+
+Returns `Started "<name>" (proc_N, PID: <pid>)` plus the stdout log path, and a `ProcessInfo` in `details.process`.
+
+### list
+
+Show every managed process with its id, name, command, status, and runtime.
+
+```
+process action=list
+```
+
+Each entry renders as `proc_N "<name>": <command> [<status>] <runtime>`.
+
+### output
+
+Get recent stdout/stderr. Requires `id` (matches `proc_N` or a process name).
+
+```
+process action=output id="dev-server"
+```
+
+Returns the last `defaultTailLines` (default 100) lines of stdout and stderr, ANSI-stripped, with a header summarizing line counts. The text is capped at `maxOutputLines` (default 200).
+
+### logs
+
+Get the on-disk log file paths. Requires `id`. Use the `read` tool on them for the full output.
+
+```
+process action=logs id="dev-server"
+```
+
+`details.logFiles` contains `stdoutFile`, `stderrFile`, and `combinedFile`.
+
+### kill
+
+Terminate a process. Requires `id`.
+
+```
+process action=kill id="dev-server"
+```
+
+The tool calls `manager.kill(id, { signal: "SIGTERM", timeoutMs: 3000 })`: it sends `SIGTERM` to the process group, then waits a 3000 ms grace window. If the group is still alive after the grace window, the process transitions to `terminate_timeout` and the tool reports the timeout back rather than escalating to `SIGKILL` itself (the message points the user at `/ps` → `x` to force-kill). `SIGKILL` is only sent by the manager's whole-list shutdown paths (`shutdownKillAll()` / `cleanup()`). Killing via the tool never triggers an `alertOnKill` turn.
+
+### clear
+
+Remove all finished processes from the list.
+
+```
+process action=clear
+```
+
+Returns `Cleared N finished process(es)` (`details.cleared`).
+
+### write
+
+Write data to a running process's stdin. Requires `id` and `input`; pass `end=true` to close stdin afterward (for programs that read until EOF).
+
+```
+process action=write id="repl" input="print(1+1)\n"
+process action=write id="repl" input="" end=true
+```
+
+## Alert Flags
+
+Alerts control whether the agent gets a turn to react when a process settles. The user always sees process updates in the UI regardless.
+
+| Flag | Default | Fires when |
+|------|---------|------------|
+| `alertOnSuccess` | false | the process exits with code 0 |
+| `alertOnFailure` | true | the process exits non-zero or errors |
+| `alertOnKill` | false | the process is killed by an external signal (not by the tool) |
+
+You do not need to poll; notifications arrive automatically based on these flags, so the agent can start a process and continue with other work.
+
+## Examples
+
+```
+# Long-running dev server, alert on crash
+process action=start name="dev" command="npm run dev" alertOnFailure=true
+
+# Parallel build + test, both report on completion
+process action=start name="build" command="npm run build" alertOnSuccess=true
+process action=start name="test" command="npm test" alertOnSuccess=true alertOnFailure=true
+
+# Check status, then inspect build output
+process action=list
+process action=output id="build"
+
+# Inspect full logs with the read tool
+process action=logs id="build"
+# then: read <stdoutFile>
+
+# Stop the dev server
+process action=kill id="dev"
+```
+
+## Process Lifecycle
+
+`ProcessStatus` is one of: `running`, `terminating`, `terminate_timeout`, `exited`, `killed`. (`LIVE_STATUSES` is the set `running`, `terminating`, `terminate_timeout`.) An exited process renders as `exit(0)` on success or `exit(<code>)` otherwise. `ProcessInfo` records `id`, `name`, `pid`, `command`, `cwd`, `startTime`, `endTime`, `status`, `exitCode`, `success`, the `stdoutFile` and `stderrFile` paths, and the three alert flags. (The third `combinedFile` path is tracked on the manager's internal record and surfaced via `getLogFiles`/`details.logFiles`, not on the public `ProcessInfo`.)
+
+A background watcher polls running processes every 5000 ms while any are alive and stops once none remain.
+
+## Output Storage
+
+Output is streamed to files, not held in memory. The manager creates one log directory per session:
+
+```
+$TMPDIR/indusagi-processes-<timestamp>/
+  proc_1-stdout.log
+  proc_1-stderr.log
+  proc_1-combined.log
+  proc_2-stdout.log
+  ...
+```
+
+`cleanup()` removes the entire log directory with `rmSync`, and `clear` removes the files for finished processes.
+
+## Controller and Manager
+
+`getProcessController(cwd, options?)` returns a per-cwd cached `ProcessController`; passing options updates the existing controller. `ProcessController.getManager()` exposes the `ProcessManager`, whose public methods include `start(name, command, cwd, options?)`, `list()`, `getOutput(id, tailLines?)`, `getLogFiles(id)`, `getCombinedOutput(id, tailLines?)`, `kill(id, { signal?, timeoutMs? })`, `clearFinished()`, and `cleanup()`. Manager activity is reported through `ManagerEvent` values (`process_started`, `process_ended`, `processes_changed`). The constant `MESSAGE_TYPE_PROCESS_UPDATE` (`"ad-process:update"`) tags process update messages.
+
+## See Also
+
+- [Tools Reference](/docs/agent/tools-reference) — all built-in tools.
+- [Agent Loop and Tools](/docs/agent/loop-and-tools) — how tools are dispatched in the loop.
+- [Agent API Reference](/docs/agent/api-reference) — full Agent API reference.

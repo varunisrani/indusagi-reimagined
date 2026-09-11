@@ -1,0 +1,420 @@
+# Launch
+
+> The CLI front door. The `pindus` / `induscode` process entry (`induscode.entry:run`) plus the `induscode.launch` subsystem that parses argv, renders help, expands `@file` attachments, prints the model catalog, drives sign-in / OAuth, manages extension packages, and picks resume targets — all over the [indusagi](/python/README) framework's AI, agent, and OAuth primitives. Reached by running `pindus` or by `from induscode.launch import read_invocation, ...`.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Process entry (entry.py)](#process-entry-entrypy)
+- [The frozen contract](#the-frozen-contract)
+- [Flag table and argv parsing](#flag-table-and-argv-parsing)
+- [Mode derivation](#mode-derivation)
+- [Attachments (@file)](#attachments-file)
+- [Model catalog](#model-catalog)
+- [Credentials (signin / signout)](#credentials-signin--signout)
+- [OAuth browser sign-in](#oauth-browser-sign-in)
+- [Extension packages](#extension-packages)
+- [Pickers (resume + settings)](#pickers-resume--settings)
+- [Public API](#public-api)
+- [Key concepts](#key-concepts)
+- [Related pages](#related-pages)
+
+## Overview
+
+This area turns a raw argument vector into a fully-configured run. `entry.py` is the
+console-script process entry; the `launch/` package is the typed command-line layer.
+A single frozen `contract.py` declares all the shapes — `Invocation`, `OutputMode`,
+the flag-table types, `CredentialFault`, the `AuthVault` Protocol, `CatalogFilter` —
+and every behavior module is written against those names: the table-driven argv
+reader, the help renderer (generated from the same flag table), the `@file` gatherer,
+the model-catalog printer, the credential command, the OAuth adapter, the
+extension-package command, and the resume / settings pickers.
+
+Launch is the *front* of the pipeline. It owns the full application command line and
+the credential surface; the [boot](/python-cli/subsystems/boot) package orchestrates
+dispatch and supplies the concrete on-disk vault and the Textual session picker.
+
+```
+launch/
+  contract.py            frozen type surface (no I/O)
+  catalog.py             --list-models table printer
+  credentials.py         signin / signout + provider directory
+  oauth.py               browser sign-in adapter + registry + Copilot device flow
+  packages.py            install / remove / update / list / config
+  pickers.py             resume picker + settings browser
+  __init__.py            barrel (zero import-time side effects)
+  invocation/
+    flags.py             the one declarative flag table + usage groups
+    read.py              table-driven argv parser -> Invocation
+    usage.py             --help generated from the table
+    attachments.py       @file expander -> Attachments / AttachmentError
+```
+
+## Process entry (entry.py)
+
+`pyproject.toml` wires both console scripts to `induscode.entry:run`:
+
+```toml
+[project.scripts]
+pindus = "induscode.entry:run"
+induscode = "induscode.entry:run"
+```
+
+`run()` is the `[project.scripts]` shim. It calls `main()`, flushes stdout, and
+treats a `BrokenPipeError` (the reader of our stdout — e.g. `| head` — went away) as
+a clean early exit: stdout is reparked on `/dev/null` so the interpreter's shutdown
+flush cannot re-raise, and the process exits `0`. Otherwise it adopts `main()`'s
+return code.
+
+`main(argv=None)` is the process-level entry. It installs exactly one idempotent
+logging filter that drops any record carrying the `[MCP]` transport-noise marker
+(a no-op when `BRAND.env_debug` — `INDUSAGI_DEBUG` — is set, so diagnostics are never
+hidden during debugging), then runs `asyncio.run(boot(argv))` and *returns* the exit
+code rather than raising `SystemExit`, so it can be called directly from tests.
+
+```python
+import asyncio
+from induscode.entry import main
+
+# In-process; returns an exit code, never calls sys.exit.
+code = asyncio.run(main(["--print", "explain", "this", "repo"]))
+```
+
+Importing `induscode.entry` runs nothing — only the console-script `run()` shim boots.
+The boot import is deferred inside `main()` so `import induscode.entry` stays
+side-effect-light.
+
+## The frozen contract
+
+`contract.py` declares only shapes plus a few inert, pure helpers — no parsing, no
+terminal I/O, no widgets. Behavior modules attach their exports to the `induscode.launch`
+barrel, so consumers import from `induscode.launch` rather than reaching into
+individual modules. The contract re-exports a small slice of framework vocabulary:
+`SessionInfo` (as `ResumeRef`), [`ImageContent`](/python/facades/ai), `ThinkingLevel`,
+and [`Settings`](/python-cli/configuration/settings).
+
+| Type | Purpose |
+|------|---------|
+| `Invocation` | The fully parsed command line: `mode`, `flags`, `positionals`, `prompt`, plus resolved typed fields (`model`, `account`, `cwd`, `system`, `append_system`, `thinking`, `tools`, `no_tools`, `mcp`, `print`, `interactive`, `help`, `version`, `attachments`) |
+| `OutputMode` | `Literal["text","json","rpc"]` selecting the boot runner; `is_output_mode` narrows |
+| `ThinkingEffort` | `off`/`minimal`/`low`/`medium`/`high`/`xhigh` accepted by `--thinking`; a superset of the framework `ThinkingLevel` (adds `off`) |
+| `ToolName` | Closed roster of 13 built-in tool ids the `--tools` / `--no-tools` flags validate against before any tool is constructed |
+| `FlagSpec` / `FlagKind` / `FlagValue` | One row of the declarative flag table and its value vocabularies (`boolean`/`string`/`number`/`list`) |
+| `Attachments` / `AttachmentOptions` | Result of `@file` expansion (inlined prose + base64 `ImageContent` media) and the gatherer's cwd option |
+| `CredentialFault` / `CredentialFaultKind` | Typed credential failure with 7 kinds + a `credential_fault` builder |
+| `CredentialVerb` / `ProviderEntry` | The `signin`/`signout` verb literal and a directory entry (`id`/`label`/`env_key`/`docs_url`) |
+| `AuthVault` | Protocol for the credential vault (`list_accounts`, `default_account`, `put_api_key`, `put_oauth`, `auth_kind`, `read_usable_key`, `remove`); boot supplies the concrete disk implementation |
+| `OAuthCredentials` | Vault-stored browser-sign-in credentials (`access`/`refresh`/`expires` epoch-ms); app-owned, since the framework has no provider-object OAuth shape |
+| `CatalogFilter` | `--list-models` filter: optional `provider`, `thinking_only`, `images_only`, and a case-insensitive `search` substring |
+| `ResumeRef` / `SessionLoader` / `ResumeFault` / `SettingsBrowseOptions` | Resume-picker types: the `SessionInfo` alias, the async session loader callable, a typed resume fault, and the settings-browser options |
+
+## Flag table and argv parsing
+
+`flags.FLAG_SPECS` is the **single** declarative option table — 17 `GroupedFlagSpec`
+rows across five editorial groups. The reader indexes it to parse and `render_usage`
+walks it to print help, so help and parsing can never drift. Adding a row adds both
+behavior and help text.
+
+| Flag | Aliases | Kind | Group | Purpose |
+|------|---------|------|-------|---------|
+| `--print` | `-p` | boolean | output | Run one request, print only the result, exit |
+| `--json` | `--rpc` | boolean | output | Speak the headless line protocol for a driving parent |
+| `--interactive` | `-i` | boolean | output | Force the interactive session even with a prompt |
+| `--model` | `-m` | string | model | Select the model, provider-qualified or bare |
+| `--account` | — | string | model | Authenticate the run with a named stored account |
+| `--thinking` | — | string | model | Set the reasoning effort (one of `THINKING_EFFORTS`) |
+| `--list-models` | — | string | model | List available models (optionally filtered) and exit |
+| `--cwd` | — | string | context | Scope the run to a working directory |
+| `--system` | — | string | context | Replace the built-in system prompt |
+| `--append-system` | — | string | context | Append text after the system prompt |
+| `--resume` | `-r` | boolean | context | Pick a previous session to resume |
+| `--continue` | `-c` | boolean | context | Continue the most recent session in this directory |
+| `--tools` | — | list | tools | Allow only the named built-in tools (comma-joined or repeated) |
+| `--no-tools` | — | boolean | tools | Disable every built-in tool for this run |
+| `--mcp` | — | list | tools | Attach an external MCP server endpoint (comma-joined or repeated) |
+| `--help` | `-h` | boolean | meta | Show usage and exit |
+| `--version` | `-v` | boolean | meta | Show the version and exit |
+
+`read.read_invocation` builds a token index over canonical names plus aliases, then
+walks argv once. The grammar is textbook and entirely data-driven — there is no
+per-flag branch:
+
+- `--name=value` and `--name value` both bind a `string` / `number` / `list` flag; an
+  inline `=value` wins, otherwise the next token is consumed unless it is itself a flag.
+- `--` terminates option parsing; every subsequent token is positional.
+- clustered short booleans (`-pi`) expand to each single-letter switch.
+- `list` flags accumulate across repetition and split a comma-separated token into elements.
+- `@file` tokens are recorded as attachment references rather than positionals.
+- the parse is **total**: an unrecognised `--flag` is tolerated as a boolean entry in
+  the loose `flags` bag (the extension-flag escape hatch) rather than rejected, so
+  nothing is silently dropped.
+
+The first positional becomes `prompt`; the rest accumulate in `positionals`. A final
+fold derives the strongly-typed named fields, dropping an unrecognised `--thinking`
+value or unknown `--tools` name.
+
+```python
+from induscode.launch import read_invocation, read_file_references
+
+inv = read_invocation(["-p", "--model", "openai/gpt", "hello", "@notes.md"])
+assert inv.mode == "json" and inv.print is True
+assert inv.model == "openai/gpt" and inv.prompt == "hello"
+
+# @file refs are surfaced separately for the gatherer:
+refs = read_file_references(["-p", "hi", "@notes.md"])   # -> ["notes.md"]
+```
+
+`read_file_references` is a thin re-walk of argv for just the `@file` refs, so they
+can be obtained without re-deriving the whole parse.
+
+`usage.render_usage` generates the `--help` banner entirely from `FLAG_SPECS` and
+`FLAG_GROUPS` (the synopsis names `pindus`); there is no second, hand-maintained help
+string for it to drift against.
+
+## Mode derivation
+
+`_derive_mode` resolves the `OutputMode` from the flag bag via a fixed precedence:
+
+```python
+# induscode/launch/invocation/read.py
+def _derive_mode(flags):
+    if _read_bool(flags, "json"):                                       # --json / --rpc
+        return "rpc"
+    if _read_bool(flags, "print") and not _read_bool(flags, "interactive"):
+        return "json"                                                   # -p one-shot
+    return "text"                                                       # interactive default
+```
+
+So the headless line protocol (`--json` / `--rpc`) wins over a one-shot `--print`,
+which in turn implies the non-interactive `json` result mode unless `--interactive`
+overrides it; with neither, the mode is the interactive `text` session.
+
+```bash
+pindus "refactor the auth module"               # interactive text mode (default)
+pindus -p "summarize this repo"                  # one-shot json mode, then exits
+pindus --json                                    # headless rpc line protocol
+pindus -i "start here"                           # force interactive even with a prompt
+pindus --model anthropic/claude --thinking high "..."
+pindus "review" @src/main.py @diagram.png        # @file attachments
+```
+
+## Attachments (@file)
+
+`attachments.gather_attachments` expands each `@file` ref into one `Attachments`
+value. It resolves the ref against the cwd (via an inlined `_resolve_read_path`
+that handles `~` expansion), classifies it by extension, enforces a per-kind size
+cap, and folds it into the result:
+
+- **text files** (`.md`, `.py`, `.json`, `.ts`, `.toml`, … — a closed extension set)
+  are read as UTF-8 and inlined into `Attachments.prose`, each wrapped in a
+  `<file path="...">…</file>` block (10MB cap) so the model sees which file each
+  block came from.
+- **image files** (`.png`, `.jpg`, `.gif`, `.webp`, `.bmp`, `.svg`) are base64-encoded
+  into framework [`ImageContent`](/python/facades/ai) in `Attachments.media` (20MB cap).
+- an empty file is skipped silently; an unknown extension, an oversized file, a
+  missing file, or a read error raises a typed `AttachmentError` carrying a
+  discriminant `kind` (`unsupported` / `too-large` / `not-found` / `read-failed`),
+  never a string sentinel or a process exit.
+
+```python
+from induscode.launch import gather_attachments, AttachmentOptions
+
+att = await gather_attachments(["README.md", "logo.png"], AttachmentOptions(cwd="/repo"))
+# att.prose has <file path="...">...</file> text blocks
+# att.media has base64 ImageContent
+```
+
+## Model catalog
+
+`catalog.print_model_catalog` renders the `--list-models` table. It re-derives rows
+from the [conductor](/python-cli/subsystems/conductor) `ModelCatalog` (a normalized
+view over the framework `get_providers` / `get_models`), applies a `CatalogFilter`,
+sorts by provider then model id, and lays out aligned columns: Provider, Model,
+Context, Max Output, Thinking, Images. Filtering is a literal case-insensitive
+substring test — no fuzzy matcher, no external ranking. The output sink (`CatalogIo`)
+and the row source (`CatalogModelSource`) are injectable Protocols so the layout is
+unit-tested deterministically over an in-memory provider→models map.
+
+```python
+from induscode.launch import print_model_catalog, CatalogFilter
+
+print_model_catalog(filter=CatalogFilter(provider="anthropic", thinking_only=True, search="claude"))
+# boot calls this for `pindus --list-models claude` before touching any directory
+```
+
+See [Models](/python-cli/configuration/models) for the catalog data model.
+
+## Credentials (signin / signout)
+
+`credentials.run_credential_command` owns the first positional token only. It returns
+`handled=False` when `argv[0]` is not a verb, so the orchestrator calls it first and
+falls through to a normal launch on a miss. `signin` / `login` and `signout` / `logout`
+are the recognised verbs (the natural-language aliases keep `pindus login` from being
+mistaken for a chat prompt).
+
+```bash
+pindus signin --provider anthropic                # browser sign-in preferred
+pindus signin --provider openai --method api-key  # force the api-key flow
+pindus signin --list                              # read-only list of saved accounts
+pindus signout --provider anthropic --account work
+```
+
+`PROVIDER_DIRECTORY` is the 14-provider api-key directory; each `ProviderEntry`
+carries the provider's conventional `env_key` (the variable `indusagi.ai.get_env_api_key`
+reads) and a `docs_url`. The flow:
+
+1. Resolve the provider — named via `--provider`, or a numbered pick from the merged
+   directory (`PROVIDER_DIRECTORY` + `list_login_providers`).
+2. Prefer browser sign-in when the provider `is_oauth_capable`; otherwise fall back to
+   api-key entry, consulting `get_env_api_key` first so an already-exported key does
+   not need re-typing.
+3. Validate with `validate_api_key` (non-empty, ≥ 20 chars, no placeholder markers) or
+   `validate_account_name` (≤ 50 chars, `[A-Za-z0-9_-]+`).
+4. Persist through the injected `AuthVault` and return a `CredentialResult` carrying a
+   typed `CredentialFault` (one of `unknown-provider`, `invalid-key`, `invalid-account`,
+   `name-collision`, `not-found`, `vault`, `aborted`) on failure — never raising for an
+   expected failure.
+
+```python
+from induscode.launch import (
+    register_built_in_oauth_providers, run_credential_command, format_credential_fault,
+)
+
+register_built_in_oauth_providers()  # explicit prime: anthropic, openai, github-copilot
+result = await run_credential_command(
+    ["signin", "--provider", "openai"], vault=my_vault, profile_dir="/home/u/.pindusagi",
+)
+if result.fault:
+    print(format_credential_fault(result.fault))
+```
+
+`CredentialIo` injects the three console operations the flow needs (print, ask,
+ask-secret), with live defaults over stdout / `input` / `getpass.getpass`, so the
+whole flow is unit-tested with an in-memory vault and no real TTY. See
+[Auth](/python-cli/configuration/auth) for the on-disk vault.
+
+## OAuth browser sign-in
+
+The framework ships no provider-object login, so `oauth.py` re-choreographs a
+`provider.login(callbacks)` flow over framework PKCE primitives
+(`create_pkce_pair`, `build_auth_url`, `exchange_code`, `refresh_token`,
+`OAUTH_PROVIDERS`):
+
+- `register_built_in_oauth_providers()` is the **explicit prime** — it walks the
+  framework `OAUTH_PROVIDERS` config table and registers an adapter for each
+  authorization-code provider (`anthropic`, `openai`), then registers the app-side
+  `github_copilot_adapter` whose RFC 8628 device-grant driver has no framework config.
+  It is idempotent and returns the registered ids. The barrel has **zero** import-time
+  side effects; boot runs this as a stage.
+- `start_oauth_login` drives the adapter's login driver and persists through the
+  injected `AuthVault`; `refresh_oauth_credentials` is the refresh seam.
+- `list_login_providers` is the merged sign-in directory (`LoginProvider` rows with an
+  `auth_kind` of `oauth` or `apiKey`).
+- `open_login_url` launches the consent URL but only for `http(s)` URLs.
+
+`register_oauth_provider` / `get_oauth_provider` / `get_oauth_providers` manage the
+module registry; the adapter shapes are `OAuthProviderAdapter`, `OAuthLoginCallbacks`,
+`OAuthAuthorization`, `OAuthPrompt`, `OAuthLoginResult`, and `OAuthLoginError`. See
+[framework AI facade](/python/facades/ai) for the underlying credential primitives.
+
+## Extension packages
+
+`packages.run_package_command` is the `install` / `remove` / `update` / `list` /
+`config` surface over the extension-package sources the launcher loads. A source is a
+plain string the loader understands — an `npm:` spec, a `git:` / `https:` repo, or a
+bare local path — and the configured set lives under the `extensionPackages` settings
+key, persisted through the `induscode.settings.PreferenceStore`. Like the credential
+command, it owns the first token only (`handled=False` on a non-command `argv[0]`) and
+never raises for an expected failure — a bad argument is a printed line plus a non-zero
+`PackageResult.code`.
+
+```bash
+pindus install npm:@scope/my-ext
+pindus list
+pindus remove npm:@scope/my-ext
+pindus config
+```
+
+```python
+from induscode.launch import run_package_command
+
+res = await run_package_command(["install", "npm:@scope/my-ext"], store=pref_store)
+assert res.handled and res.code == 0   # idempotent under source-key matching
+```
+
+## Pickers (resume + settings)
+
+`pickers.pick_resume_target` loads the resumable sessions for the current cwd and for
+every directory, merges them (`merge_sessions` de-dupes by path, sorts newest-first),
+and chooses one:
+
+- on a **non-interactive** stdin it skips the picker and resolves the newest session,
+  so a piped `pindus --resume` still resumes deterministically;
+- on a TTY it mounts the injected picker (`ResumeDeps.mount_picker`). The launch-layer
+  default raises by design — the launch layer owns no Textual mount; boot's
+  `repl_runner` injects a Textual-backed `ResumeDeps` so the real session list shows.
+
+It returns a `ResumeOutcome(path, fault)` — a typed `ResumeFault` is *returned*, never
+raised, when a load or mount fails, so the orchestrator can fall back to a fresh
+session rather than crash.
+
+`browse_settings` prints a flat console listing (working/profile directories, default
+model, custom-vs-default system prompt, MCP server count, and discovered resource paths
+grouped by category) and pauses for a keypress. `render_settings_listing` is the pure
+line builder, kept separate so a test can assert the content without an I/O seam. See
+[Sessions](/python-cli/subsystems/sessions) for the session store.
+
+## Public API
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `run` | function | `entry.py` | The `[project.scripts]` shim; calls `main()`, swallows `BrokenPipeError` as exit 0, then `sys.exit(code)` |
+| `main` | function | `entry.py` | Process entry: installs the `[MCP]`-noise filter and runs `asyncio.run(boot(argv))`; returns the exit code |
+| `read_invocation` / `read_file_references` | function | `invocation/read.py` | Table-driven argv parser → `Invocation`; the latter re-walks argv for just the `@file` refs |
+| `render_usage` | function | `invocation/usage.py` | Generates the `--help` banner from `FLAG_SPECS` / `FLAG_GROUPS` |
+| `gather_attachments` | async function | `invocation/attachments.py` | Expands `@file` refs → `Attachments`; raises typed `AttachmentError` |
+| `FLAG_SPECS` / `FLAG_GROUPS` / `GroupedFlagSpec` | const | `invocation/flags.py` | The single 17-row option table and its usage groupings |
+| `print_model_catalog` / `CatalogIo` / `CatalogModelSource` / `catalog_source` | function | `catalog.py` | Renders the aligned model table over the conductor `ModelCatalog` with injectable seams |
+| `run_credential_command` / `CredentialResult` / `CredentialIo` | async function | `credentials.py` | The `signin` / `signout` command; resolves a provider, prefers OAuth, returns `CredentialResult` |
+| `PROVIDER_DIRECTORY` / `find_provider` / `validate_api_key` / `validate_account_name` / `format_credential_fault` / `is_oauth_capable` / `as_signin_method` | const/function | `credentials.py` | The 14-provider directory, lookups, validators, fault formatter, and the `oauth`\|`api-key` method vocabulary |
+| `start_oauth_login` / `refresh_oauth_credentials` / `register_built_in_oauth_providers` / `list_login_providers` / `github_copilot_adapter` / `open_login_url` | async/function | `oauth.py` | Browser-sign-in adapter: PKCE auth-code flow + Copilot device grant, explicit registry prime, refresh seam |
+| `run_package_command` / `PACKAGE_COMMANDS` / `PackageResult` / `PackageIo` | async function | `packages.py` | The `install`/`remove`/`update`/`list`/`config` command over the `extensionPackages` setting |
+| `pick_resume_target` / `ResumeDeps` / `ResumeOutcome` / `merge_sessions` | async function | `pickers.py` | Loads + merges resumable sessions, uses the newest on non-TTY, else mounts the injected picker |
+| `browse_settings` / `render_settings_listing` / `SettingsBrowseIo` | async function | `pickers.py` | Prints a flat settings / resource listing and pauses |
+
+## Key concepts
+
+**Single declarative flag table.** `flags.FLAG_SPECS` is the one source of truth: the
+reader indexes it to parse and `render_usage` walks it to print help, so help and
+parsing cannot drift. Adding a row adds both behavior and help text.
+
+**Frozen contract seam.** `contract.py` declares only shapes and inert helpers (no
+I/O); every behavior module is written against those names and attaches its exports to
+the launch barrel.
+
+**Typed faults over sentinels.** Failures are typed unions / exceptions —
+`CredentialFault` (7 kinds), `AttachmentError` (4 kinds), `ResumeFault` — each carrying
+a discriminant plus a hint, never string sentinels or a bare `sys.exit`.
+
+**Injectable I/O seams.** `CatalogIo`, `CredentialIo`, `PackageIo`, `SettingsBrowseIo`,
+`ResumeDeps`, and `CatalogModelSource` are Protocols with live stdout / input defaults,
+letting the whole flow be unit-tested with in-memory stand-ins and no real terminal.
+
+**Explicit OAuth registry prime.** `register_built_in_oauth_providers` must be called
+explicitly (boot runs it as a stage); the barrel has zero import-time side effects.
+
+**Re-choreographed OAuth over framework primitives.** The framework ships no
+provider-object login, so `oauth.py` rebuilds the `provider.login(callbacks)` flow over
+PKCE / `build_auth_url` / `exchange_code` / `refresh_token`, plus an app-owned GitHub
+Copilot device-grant driver the framework cannot represent.
+
+## Related pages
+
+- [Boot](/python-cli/subsystems/boot) — consumes the launch surface in fixed order and supplies the concrete disk vault and Textual picker.
+- [Conductor](/python-cli/subsystems/conductor) — the `ModelCatalog` the catalog printer reads.
+- [Sessions](/python-cli/subsystems/sessions) — the session store the resume picker loads from.
+- [Auth](/python-cli/configuration/auth) — the on-disk credential vault implementing `AuthVault`.
+- [Models](/python-cli/configuration/models) — the catalog data model and `--list-models`.
+- [Settings](/python-cli/configuration/settings) — the `PreferenceStore` the package command and settings browser read.
+- [CLI reference](/python-cli/reference/cli) — the complete flag and subcommand reference.
+- [framework AI facade](/python/facades/ai) — the PKCE / OAuth and `ImageContent` primitives launch builds on.

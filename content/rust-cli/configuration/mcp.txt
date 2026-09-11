@@ -1,0 +1,549 @@
+# MCP
+
+> Mount external Model Context Protocol (MCP) tool servers into an `indusr`
+> session with the repeatable `--mcp` flag. Each ready endpoint's tools are
+> connected through the framework protocol bridge, adapted into deck `Card`s, and
+> folded into an event-sourced enrollment ledger before being grafted onto the
+> built-in capability deck — so the agent calls a remote `github__create_issue`
+> exactly like the native `read` or `bash`. Lives in `induscode::deck::mcp`,
+> gated on the `mcp` cargo feature (on by default).
+
+## Table of Contents
+
+- [What MCP gives you](#what-mcp-gives-you)
+- [The --mcp flag](#the---mcp-flag)
+- [Config file format](#config-file-format)
+- [Auto-detected config search](#auto-detected-config-search)
+- [The deck MCP bridge](#the-deck-mcp-bridge)
+- [The event-sourced bridge ledger](#the-event-sourced-bridge-ledger)
+- [Bridge keys](#bridge-keys)
+- [How tools are attached at boot](#how-tools-are-attached-at-boot)
+- [Failure isolation](#failure-isolation)
+- [Tool naming and filtering](#tool-naming-and-filtering)
+- [Reference](#reference)
+
+## What MCP gives you
+
+The Model Context Protocol lets a third-party server expose a set of tools over a
+wire protocol. `indusr` connects to such servers at boot, lists their tools, and
+adapts each one into the deck's uniform [`Card`](/rust-cli/subsystems/capability-deck)
+shape. The model then sees those tools in its briefing alongside the built-ins
+and can invoke them mid-turn.
+
+The protocol work is done entirely by the [Rust framework](/rust): the deck calls
+[`indusagi::interop::mount_protocol_bridge`](/rust/subsystems/interop), which
+connects every configured server, lists each ready endpoint's tools, normalizes
+their schemas, and hands back a single `indusagi::capabilities::ToolBox` whose
+`descriptors()` advertise every grafted remote tool under its qualified
+`"<server>__<tool>"` name and whose shared `runner` routes a call back across the
+owning endpoint. The framework speaks both transports: subprocess **stdio**
+servers (the `command`/`args` form) and **SSE** servers (the `url` form).
+
+The `induscode::deck::mcp` module is the *side-effecting half* of bridge
+enrollment. On top of the framework bridge it adds:
+
+- **Discovery** — `load_mcp_config` reads the `.indusvx/mcp.json` family
+  (project ▸ XDG ▸ legacy) into a `Vec<ServerConfig>`; `bridge_config` wraps a
+  flat list into a framework `BridgeConfig`.
+- **Adaptation** — `ledger::bridge_box_to_capabilities` wraps each descriptor +
+  the shared runner into a `ledger::BridgeCapability` (a deck `Card`).
+- **Client-pool lifecycle** — `attach_bridge_capabilities` mounts the fleet and
+  folds the adapted tools into a `ledger::BridgeLedger` as `enroll` events;
+  `detach_bridge` retires a server's tools and tears the fleet down;
+  `bridge_status` / `bridge_tool_names` read the live state.
+- **Cataloging** — `bridge_capability_card` re-presents a grafted capability as
+  a `CapabilityCard` so dynamic MCP tools surface in help/introspection beside
+  the static catalog.
+- **Enrollment ledger** — the event-sourced `ledger` reducer
+  (`reduce_ledger(state) -> snapshot`) over the append-only `enroll`/`retire`
+  log; replay is deterministic.
+
+This is the Rust port of `indus-code-rebuild/src/capability-deck/bridge-ledger`,
+documented for the TypeScript and Python editions at [/cli](/cli) and
+[MCP (Python)](/python-cli/configuration/mcp).
+
+## The --mcp flag
+
+`--mcp` names where to find MCP server config. It is the only `FlagKind::List`
+flag besides `--tools` in the agent's 18-row [flag table](/rust-cli/subsystems/launch)
+(`launch/flags.rs`), so it both **repeats** and **comma-splits** — every endpoint
+is attached:
+
+```bash
+# A single project/user config (auto-detected — see search order below)
+indusr --mcp .
+
+# An explicit config file
+indusr --mcp ./mcp.json
+
+# Several endpoints at once (repeated or comma-joined are equivalent)
+indusr --mcp ./fs.json --mcp ./github.json
+indusr --mcp ./fs.json,./github.json
+```
+
+The flag spec is one row of the single declarative `flag_specs()` table:
+
+```rust
+// launch/flags.rs — the --mcp row (FlagGroup::Tools)
+FlagSpec {
+    name: "--mcp",
+    aliases: &[],
+    kind: FlagKind::List,
+    group: FlagGroup::Tools,
+    describe: "Attach an external MCP server endpoint (comma-separated or repeated).",
+}
+```
+
+The parsed value lands on the boot invocation as `Invocation.mcp:
+Option<Vec<String>>` (`core/boot_contract.rs:81`) — `None` when the flag is
+unset, otherwise the tuple of `--mcp` paths. The launch invocation carries the
+same field as a non-optional `mcp: Vec<String>` (`launch/contract.rs:298`); the
+boot pipeline collapses an empty list to `None` (`boot/pipeline.rs:183`).
+
+The two binaries are equivalent — the crate ships `indusr` (primary) and
+`indusagir`, both pointing at `src/bin/main.rs`. Use either spelling.
+
+## Config file format
+
+A config file is JSON with a top-level `servers` field. `servers` may be either
+an **array** of server objects or an **object** keyed by server name (the key
+becomes the server's id). A server is reached over **SSE** when it carries a
+`url`, or over **stdio** when it carries a `command`; one of the two is required.
+A server with `"enabled": false` is dropped.
+
+```json
+{
+  "servers": [
+    {
+      "name": "github",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "your-github-token" },
+      "enabled": true
+    },
+    {
+      "name": "remote",
+      "url": "http://localhost:8080/mcp",
+      "headers": { "Authorization": "Bearer your-token" },
+      "enabled": false
+    }
+  ]
+}
+```
+
+The object form is equivalent and often tidier; the map key supplies the `name`:
+
+```json
+{
+  "servers": {
+    "fs": { "command": "node", "args": ["server.js"] },
+    "remote": {
+      "url": "http://localhost:8080/mcp",
+      "headers": { "Authorization": "Bearer your-token" }
+    }
+  }
+}
+```
+
+Each row is normalized by `parse_config_file` and then discriminated by
+`server_config_from_row` into one framework
+[`indusagi::interop::ServerConfig`](/rust/subsystems/interop) variant — a `url`
+becomes `ServerConfig::Sse`, a `command` becomes `ServerConfig::Stdio`:
+
+```rust
+// the two transport variants a `mcp.json` row can resolve to (framework interop)
+pub enum ServerConfig {
+    Stdio { id: String, command: String, args: Vec<String>, env: IndexMap<String, String> },
+    Sse   { id: String, url: String, headers: IndexMap<String, String> },
+    // StreamableHttp { id, url, headers } — the framework reserves a third,
+    // forward-looking variant (the MCP SSE→Streamable-HTTP migration), but the
+    // deck's `server_config_from_row` only ever mints `Stdio` or `Sse`.
+}
+```
+
+| Field | Applies to | Maps to | Purpose |
+|-------|-----------|---------|---------|
+| `name` | both | `ServerConfig::*::id` | Server id; namespaces its tools. In the object form this is the map key. |
+| `command` | stdio | `Stdio::command` | Executable to spawn (`npx`, `node`, `python`, …). |
+| `args` | stdio | `Stdio::args` | Argument list; non-string elements are dropped. |
+| `env` | stdio | `Stdio::env` | Extra environment variables; coerced to an `IndexMap<String, String>` in declaration order. |
+| `url` | SSE | `Sse::url` | Endpoint URL; the framework transport speaks SSE. |
+| `headers` | SSE | `Sse::headers` | Headers sent on the connection (e.g. an auth bearer token). |
+| `enabled` | both | (filter) | `false` skips the entry without removing it from the file. |
+
+Order is preserved across the whole pipeline — `string_map` builds header/env
+maps with an `IndexMap` so declaration order survives, and the array/object
+normalization keeps rows in source order.
+
+A row with an empty `name`, or one carrying neither `url` nor `command` (and not
+disabled), is **skipped** rather than raised — a single bad entry must not
+discard the whole file. A file missing `servers`, whose `servers` is neither
+array nor object, or that is unreadable/malformed JSON, yields an empty list:
+
+```rust
+// deck/mcp/mod.rs — parse_config_file degrades, never panics
+let Ok(text) = std::fs::read_to_string(path) else { return Vec::new(); };
+let Ok(json) = serde_json::from_str::<Value>(&text) else { return Vec::new(); };
+let Some(servers) = json.get("servers") else { return Vec::new(); };
+```
+
+## Auto-detected config search
+
+`load_mcp_config(path_or_cwd: &str) -> Vec<ServerConfig>` is the discovery entry
+point (the port of the framework `loadMCPConfig`). When `path_or_cwd` is itself
+an existing **file**, it is parsed directly and returned. Otherwise the value is
+treated as a working directory and the conventional locations under it are merged,
+in precedence order:
+
+1. **Project:** `<cwd>/.indusvx/mcp.json`
+2. **User (XDG):** `$XDG_CONFIG_HOME/indusvx/mcp.json` (default `~/.config/indusvx/mcp.json`)
+3. **Legacy:** `~/.indusvx/agent/mcp.json`
+4. **Legacy alt:** `~/.indusvx/agent/mcp-servers.json`
+
+```rust
+// deck/mcp/mod.rs
+pub fn load_mcp_config(path_or_cwd: &str) -> Vec<ServerConfig> {
+    let target = Path::new(path_or_cwd);
+    if target.is_file() {
+        return parse_config_file(target);
+    }
+    // else: merge project ▸ XDG ▸ legacy under the directory…
+}
+```
+
+All present sources are concatenated, so a project `mcp.json` and a user
+`mcp.json` both contribute their servers (declaration order preserved across
+sources). The XDG root comes from `$XDG_CONFIG_HOME`, falling back to
+`$HOME/.config`; the home directory is resolved by a dependency-free `home_dir()`
+helper reading `$HOME` (or `$USERPROFILE` on Windows). Passing an explicit file
+path bypasses the search entirely.
+
+## The deck MCP bridge
+
+Once a `Vec<ServerConfig>` is in hand, `attach_bridge_capabilities` connects the
+fleet and enrolls its tools. It wraps the flat list with `bridge_config` into a
+framework `BridgeConfig`, mounts it, adapts the resulting `ToolBox`, and folds
+each capability into the ledger as an `enroll` event — returning a *new* ledger
+(the input is untouched) plus the live fleet for status/teardown:
+
+```rust
+// deck/mcp/mod.rs
+pub struct AttachResult {
+    pub ledger: BridgeLedger,
+    pub fleet: Option<Arc<dyn ServerFleet>>,
+    pub status: Option<FleetStatus>,
+    pub enrolled: usize,
+    pub fault: Option<DeckFault>,
+}
+
+pub async fn attach_bridge_capabilities(
+    ledger: BridgeLedger,
+    config: BridgeConfig,
+) -> AttachResult { /* … */ }
+```
+
+An empty config is a no-op (no servers, the input ledger flows straight through).
+Otherwise:
+
+```rust
+let mounted = mount_protocol_bridge(config).await;        // framework, infallible
+let caps = bridge_box_to_capabilities(&mounted.box_);     // adapt descriptors
+// fold each cap into the ledger as an `enroll` event…
+let server = server_of_qualified(cap.name()).to_string(); // recover owner from name
+next = next.enroll(EnrollRequest { capability: cap, server, key: None }, now.clone());
+```
+
+A decisive delta from the TypeScript lineage: `mount_protocol_bridge` is
+**infallible** — it returns a `MountedProtocolBridge` directly, not a `Result`.
+There is no wholesale-mount fault branch the way the TS `try/catch` had; the
+`AttachResult::fault` slot is reserved for config-validation only, and per-server
+health is read from `fleet.status()` instead.
+
+The adapter `bridge_box_to_capabilities` turns each `ToolBox` descriptor + the
+box's **shared** runner into one `BridgeCapability`:
+
+```rust
+// deck/mcp/ledger.rs
+pub fn bridge_box_to_capabilities(box_: &ToolBox) -> Vec<BridgeCapability> {
+    let runner = box_.runner.clone();
+    box_.descriptors()
+        .into_iter()
+        .map(|d| BridgeCapability::new(d.name, d.description, d.parameters, runner.clone()))
+        .collect()
+}
+```
+
+`BridgeCapability` is an `Arc`-shared newtype implementing the deck `Card` trait,
+so a grafted MCP tool is a uniform deck capability beside the static catalog. Its
+`run` hands the call to the shared runner under the qualified name and projects
+the opaque `ToolOutcome` onto a deck `ToolResult` via `project_outcome` (a
+`Value::String` is preserved verbatim, anything structured is pretty-printed,
+`Value::Null` becomes empty, and `is_error` rides through):
+
+```rust
+// deck/mcp/ledger.rs — Card::run for a grafted remote tool
+async fn run(&self, input: Value, ctx: &ToolContext) -> ToolResult {
+    let call = ToolCall { id: format!("bridge_{}", self.0.name), name: self.0.name.clone(), input };
+    let outcome = self.0.runner.run(call, ctx.cancel.clone()).await;
+    project_outcome(outcome.output, outcome.is_error)
+}
+```
+
+The owning server id is recovered from the qualified name by
+`server_of_qualified(name) -> &str`, which splits on the first
+[`indusagi::interop::QUALIFIER`](/rust/subsystems/interop) (`"__"`) and returns
+`""` when the name carries no qualifier *or* leads with one (the `sep > 0`
+guard, so a `"__leading"` name yields `""`). Detaching one or more servers is the
+disconnect counterpart:
+
+```rust
+// deck/mcp/mod.rs — retire a server's ledger entries and close the fleet
+pub async fn detach_bridge(
+    ledger: BridgeLedger,
+    fleet: Arc<dyn ServerFleet>,
+    servers: Option<&[String]>,   // None ⇒ every server in fleet.status()
+) -> BridgeLedger { /* withdraw_server per id, then fleet.tear_down().await */ }
+```
+
+Teardown is best-effort and infallible (`ServerFleet::tear_down` swallows close
+errors), so the ledger withdrawal always completes.
+
+## The event-sourced bridge ledger
+
+MCP tools are grafted in and pulled out over a session's life: a server connects
+and contributes a handful of tools, another disconnects, the same server
+reconnects after a hot-reload. Rather than mutate a shared array of live tools —
+which makes "who is enrolled right now" a function of call order — enrollment is
+an **append-only event log** folded into a **derived snapshot** by a single pure
+reducer. The log is the source of truth; the snapshot is a cache of its fold, so
+the live view can never drift from the log.
+
+```rust
+// deck/mcp/ledger.rs — the immutable, event-sourced value
+pub struct BridgeLedger {
+    pub log: Vec<BridgeEntry>,    // the append-only event log, in append order
+    pub snapshot: LedgerSnapshot, // = reduce_ledger(&log), cached
+    pub next_seq: u64,            // the seq the next appended entry will carry
+}
+```
+
+Every transition returns a *new* ledger and never touches the input
+(`Clone` is cheap — `Arc`-shared caps + a `Vec`):
+
+| Method | Kind | Behaviour |
+|--------|------|-----------|
+| `BridgeLedger::empty()` | ctor | No events, empty live view, seq numbering at 1. |
+| `BridgeLedger::from_log(log)` | ctor | Rehydrate from a persisted log: fold for the snapshot, resume seq one past the high-water mark. |
+| `enroll(EnrollRequest, at)` | transition | Append an `enroll` event — an **upsert** on the key (re-enrolling a key replaces its entry). |
+| `retire(key, server, at)` | transition | Append a `retire` event — a **splice** (the keyed entry leaves the live view). |
+| `withdraw_server(server, at)` | transition | Retire every capability a server currently has live, in one batch. |
+| `live_capabilities()` | projection | Flat `Vec<BridgeCapability>` in stable iteration order — what the deck grafts. |
+| `live_capabilities_for_server(server)` | projection | The live caps one server contributes. |
+
+The event and snapshot shapes:
+
+```rust
+// deck/mcp/ledger.rs
+pub enum BridgeOp { Enroll, Retire }   // closed set — exhaustive match, no `_` arm
+
+pub struct BridgeEntry {
+    pub op: BridgeOp,
+    pub key: BridgeKey,
+    pub server: String,
+    pub capability: Option<BridgeCapability>, // Some on Enroll, None on Retire
+    pub seq: u64,                             // monotonic; breaks upsert ties
+    pub at: String,                           // ISO-8601 audit timestamp
+}
+
+pub struct LedgerSnapshot {
+    pub live: IndexMap<BridgeKey, BridgeCapability>, // current live caps, insertion order
+    pub by_server: IndexMap<String, usize>,          // live tool count per server
+    pub high_water: u64,                             // highest folded seq
+}
+```
+
+The reducer is the single sanctioned fold — pure and **total**, and independent
+of slice order (it sorts a borrowed index by `seq` before folding, so a later
+`seq` always wins on a repeated key):
+
+```rust
+// deck/mcp/ledger.rs
+pub fn reduce_ledger(entries: &[BridgeEntry]) -> LedgerSnapshot { /* … */ }
+```
+
+`IndexMap` (not `HashMap`) keeps insertion order so `live_capabilities()` is
+stable across reduces, and `shift_remove` (not `swap_remove`) on a retire matches
+JS `Map.delete`, which does not reorder survivors. Because the snapshot is a pure
+function of the committed log, `from_log` replays a **byte-for-byte identical**
+deck — same live keys in the same order, same per-server tallies, same
+high-water/next-seq.
+
+The `at` timestamp is minted by an internal `iso_now()` (`iso_from_ms` over
+`indusagi::core::time::now_ms`), an ISO-8601 UTC string the ledger only logs and
+never parses — so a dependency-free civil-from-days conversion suffices.
+
+## Bridge keys
+
+Each enrolled capability is keyed by a `BridgeKey` — a newtype over `String`, so
+a raw string cannot stand in for a vetted key. There are two minters:
+
+```rust
+// deck/mcp/ledger.rs
+pub struct BridgeKey(String);
+
+// Content-addressed: a pure function of the tool's identity (qualified name + schema).
+pub fn bridge_content_key(server: &str, tool: &str, parameters: Option<&Value>) -> BridgeKey;
+
+// A fresh, time-sortable ULID — for an ephemeral, per-invocation graft.
+pub fn bridge_ulid_key() -> BridgeKey;
+```
+
+The boot path uses `EnrollRequest { key: None, … }`, so the ledger derives a
+**content key** from the capability's qualified name + parameter schema. The
+digest reuses the framework's `indusagi::core::content_hash`
+(sha256-over-canonical-json, truncated to 32 hex chars), prefixed `bk_`:
+
+```rust
+// deck/mcp/ledger.rs — bridge_content_key
+let identity = json!({ "name": qualified, "schema": parameters.unwrap_or(Value::Null) });
+BridgeKey::new(format!("bk_{}", content_hash(&sort_keys(&identity))))
+```
+
+Because `content_hash` preserves *insertion* order (it is a character-faithful
+`JSON.stringify` for wire parity), the identity is first `sort_keys`-canonicalized
+so a schema differing only in object-key order yields the **same** key — arrays
+keep their order (semantically meaningful). The result: enrolling the same tool
+twice is idempotent (the ledger upsert deduplicates it), while a tool whose
+schema changed yields a new key. The ULID minter is process-wide monotonic (a
+`static Mutex<Option<Generator>>`), so keys minted in the same millisecond still
+order.
+
+The qualified name itself is `qualify_bridge_name(server, tool) ->
+"<server>__<tool>"`, recomputable here only so a key can be minted before a
+descriptor is in hand; `unqualified_tool` is its inverse, used when content-keying
+from the already-qualified name the bridge stamped.
+
+## How tools are attached at boot
+
+Attachment happens at session-conductor assembly, in
+[`induscode::boot::runners`](/rust-cli/subsystems/boot) — specifically
+`build_session_tools_with_addons`. The built-in deck is provisioned first, the
+`--tools` allow-list is applied to *it*, and then the MCP tools are grafted on:
+
+```rust
+// boot/runners.rs — the deck/MCP concat (TS `[...selectTools(...), ...mcpTools]`)
+let deck = provision_deck(Profile::All, ctx).ok()?;
+let deck = /* honour --tools allow-list on the BUILT-IN deck only */;
+let deck = deck.graft(load_mcp_capabilities(inv, cwd).await);   // ← MCP tools concat
+```
+
+`load_mcp_capabilities` resolves the endpoints, connects each, and returns the
+live capabilities ready to graft. Explicit `--mcp` paths win; with **none given**,
+the cwd is auto-discovered so configured `.indusvx/mcp.json` servers are present
+from turn 1 with no `/mcp connect` required:
+
+```rust
+// boot/runners.rs — load_mcp_capabilities
+let paths: Vec<String> = match inv.mcp.as_ref() {
+    Some(paths) if !paths.is_empty() => paths.clone(),
+    _ => vec![cwd.to_string()],                       // autoload under the cwd
+};
+for path in paths {
+    let servers = load_mcp_config(&path);
+    if servers.is_empty() { continue; }
+    let attached =
+        attach_bridge_capabilities(BridgeLedger::empty(), bridge_config(servers)).await;
+    for cap in attached.ledger.live_capabilities() {
+        out.push(std::sync::Arc::new(cap));           // as a deck Capability
+    }
+}
+```
+
+The grafted fleet from the boot path is intentionally **not retained** — these
+are the live boot-path tools and teardown rides process exit. The combined deck
+then folds in addon-contributed tools (de-duped against the deck + MCP) and the
+addon interceptor chain, and `into_tool_box()` produces the runtime `ToolBox` the
+[conductor](/rust-cli/subsystems/conductor) consumes verbatim. The briefing is
+composed *after* attachment, so the system prompt the model receives already
+documents the MCP tools. See [Capability Deck](/rust-cli/subsystems/capability-deck)
+for the built-in catalog and the graft mechanics.
+
+## Failure isolation
+
+`--mcp` is best-effort and never sinks a session:
+
+- A server that **faulted on connect** contributes no descriptors and is simply
+  absent from the enrollment — failure isolation comes for free from the
+  framework fleet, which connects endpoints in parallel and skips any whose
+  `list_tools` faults per-endpoint. `mount_protocol_bridge` is infallible, so
+  there is no wholesale-mount fault branch.
+- A config with **zero usable servers** is `continue`d over and contributes
+  nothing — a bad config or missing file degrades the deck rather than aborting
+  boot.
+- A **malformed / unreadable file** yields an empty `Vec<ServerConfig>`; a single
+  bad row is skipped while the rest of the file loads.
+- `--no-tools` short-circuits `build_session_tools_with_addons` (it returns
+  `None`), so the run is prompt-only and no MCP attachment is attempted.
+
+Per-server health, when a fleet is retained (e.g. by a long-lived `/mcp` pool
+rather than the boot path), is read from `fleet.status()` —
+`bridge_status(fleet) -> FleetStatus` is a thin pass-through, and
+`bridge_tool_names` / `bridge_tool_counts` read live state straight from the
+ledger snapshot without needing a live fleet handle.
+
+## Tool naming and filtering
+
+MCP tools land on the same deck as the built-ins, so the `--tools` /
+`--no-tools` allow-list interacts with them deliberately:
+
+- `--tools` filters the **built-in deck only**, *before* the MCP graft. Names are
+  matched case-insensitively with `_` and `-` stripped (the `canon_tool_name`
+  helper), so `web_fetch`, `webfetch`, and `web-fetch` resolve identically. An
+  empty list means "no filter" (the full deck). MCP tools are grafted *after*
+  this selection, so they are still available.
+- `--no-tools` disables every built-in tool and skips the deck/MCP path entirely.
+
+```bash
+# Restrict the built-ins, but the MCP server's tools still attach
+indusr --tools read,bash --mcp ./mcp.json
+
+# --no-tools is prompt-only: no built-ins AND no MCP attachment
+indusr --no-tools -p "just talk"
+```
+
+Remote tool names are always the qualified `"<server>__<tool>"` form the
+framework `QUALIFIER` stamps (e.g. `github__create_issue`), which is unique across
+servers and doubles as the model-facing label.
+
+See [Launch](/rust-cli/subsystems/launch) for the full flag grammar and
+[Configuration: Settings](/rust-cli/configuration/settings) for persisted session
+defaults.
+
+## Reference
+
+| Symbol | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `--mcp` | flag (`FlagKind::List`) | `launch/flags.rs` | Attach external MCP endpoints; comma-split or repeated. |
+| `Invocation.mcp` | field | `core/boot_contract.rs` | The parsed `Option<Vec<String>>` of `--mcp` paths (`None` when unset). |
+| `load_mcp_config` | fn | `deck/mcp/mod.rs` | Parse a config file or merge the auto-detected `.indusvx/mcp.json` family into a `Vec<ServerConfig>`. |
+| `bridge_config` | fn | `deck/mcp/mod.rs` | Wrap a flat `Vec<ServerConfig>` into a framework `BridgeConfig`. |
+| `attach_bridge_capabilities` | async fn | `deck/mcp/mod.rs` | Mount the fleet and enroll its tools into a new `BridgeLedger`; returns `AttachResult`. |
+| `detach_bridge` | async fn | `deck/mcp/mod.rs` | Retire named servers' ledger entries and tear the fleet down. |
+| `AttachResult` | struct | `deck/mcp/mod.rs` | `{ ledger, fleet, status, enrolled, fault }` — the attach outcome. |
+| `bridge_capability_card` | fn | `deck/mcp/mod.rs` | Re-present a grafted cap as a `CapabilityCard` for help/introspection. |
+| `bridge_status` / `bridge_tool_names` / `bridge_tool_counts` | fn | `deck/mcp/mod.rs` | Live-state readers over the fleet status / ledger snapshot. |
+| `BridgeLedger` | struct | `deck/mcp/ledger.rs` | Immutable, event-sourced enrollment view: `log` + `snapshot` + `next_seq`. |
+| `reduce_ledger` | fn | `deck/mcp/ledger.rs` | The single pure reducer — folds the `BridgeEntry` log into a `LedgerSnapshot`. |
+| `BridgeEntry` / `BridgeOp` | struct / enum | `deck/mcp/ledger.rs` | One append-only event and its op (`Enroll` \| `Retire`). |
+| `LedgerSnapshot` | struct | `deck/mcp/ledger.rs` | `live` / `by_server` / `high_water` — the reduced live view. |
+| `BridgeCapability` | struct | `deck/mcp/ledger.rs` | The deck `Card` adapting one grafted remote tool. |
+| `bridge_box_to_capabilities` | fn | `deck/mcp/ledger.rs` | Adapt every `ToolBox` descriptor + shared runner into `BridgeCapability`s. |
+| `BridgeKey` / `bridge_content_key` / `bridge_ulid_key` | newtype / fn | `deck/mcp/ledger.rs` | Stable enrollment key; content-addressed (`bk_` + 32 hex) or ULID. |
+| `server_of_qualified` / `qualify_bridge_name` | fn | `deck/mcp/ledger.rs` | Recover / build the `"<server>__<tool>"` qualified name. |
+| `load_mcp_capabilities` | async fn | `boot/runners.rs` | Connect `--mcp` (or autoloaded) endpoints and return their tools as deck capabilities. |
+| `mount_protocol_bridge` / `ServerConfig` / `BridgeConfig` / `ServerFleet` / `QUALIFIER` | framework | `indusagi::interop` | The protocol bridge the deck mounts onto — see [interop](/rust/subsystems/interop). |
+
+The framework protocol bridge is documented in full on the
+[interop](/rust/subsystems/interop) page; the deck's wider tooling layer is
+covered by [Capability Deck](/rust-cli/subsystems/capability-deck). The MCP path
+is gated on the `mcp` cargo feature (on by default; `mcp = ["indusagi/mcp"]`).

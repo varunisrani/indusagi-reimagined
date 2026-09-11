@@ -1,0 +1,106 @@
+# Subagents
+
+A subagent is a fresh agent the primary agent delegates a bounded, self-contained
+objective to — keeping the parent's context window clean. In this rebuild the
+delegation surface is the `task` capability card; the actual subagent *runner* is a
+framework/swarm concern injected at deck-assembly time.
+
+The implementation is `indus-code-rebuild/src/capability-deck/cards/task-card.ts`
+(the tool) and `src/briefing/compose.ts` (the prompt section advertising delegate
+roles).
+
+> **Status:** The `task` tool always builds and ships (it is part of the `all` deck
+> profile the session provisions), but the delegate **runner is not wired in this
+> rebuild**. The session provisions the deck with only `{ cwd }` (`provisionDeck("all",
+> { cwd })` in `src/boot/runners/session.ts`), so no `DelegateRunner` is present and
+> the tool returns a clearly-typed "delegation not available" stub instead of
+> spawning anything. There is no `SubagentStore`, no `createTaskTool`, and no
+> `agents/*.md` definition format. See `FEATURE_GAP_ROADMAP.md` ("Full 5-phase plan
+> workflow with parallel Explore/Plan-architect subagents … exists in
+> `indus-rebuild/src/swarm` but is unwired").
+
+## The `task` Tool
+
+The card builds a framework `AgentTool` named `task`. Its parameters
+(`TaskParams`, a TypeBox schema):
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `objective` | string | A complete, self-contained statement of what the subagent should accomplish. It does not see the conversation history. |
+| `agent` | string? | Optional named subagent profile to run as. |
+| `context` | string? | Optional extra background to start with. |
+
+The tool's structured `details` (`TaskDetails`): `delegated` (a runner handled it),
+`ok` (the objective is considered met), and the `agent` profile that ran.
+
+## Wiring a Runner (programmatic)
+
+To make `task` actually delegate, inject a `DelegateRunner` into the deck context
+under the exported key `DELEGATE_HANDLE_KEY` (`"delegate"`):
+
+```typescript
+import { capabilityDeck } from "indusagi-coding-agent";
+
+const { provisionDeck, DELEGATE_HANDLE_KEY } = capabilityDeck;
+
+const runner: capabilityDeck.DelegateRunner = {
+  listAgents() {
+    return ["explorer", "reviewer"];   // surfaced in the tool description
+  },
+  async run(request, signal) {
+    // request: { objective, agent?, context? }
+    // spawn a subagent however you like and return one report
+    return { ok: true, report: "…the subagent's final report…" };
+  },
+};
+
+const deck = provisionDeck("all", {
+  cwd: process.cwd(),
+  framework: { [DELEGATE_HANDLE_KEY]: runner },
+});
+```
+
+`DelegateRunner` is intentionally minimal:
+
+```typescript
+interface DelegateRunner {
+  listAgents?(): readonly string[];
+  run(request: DelegateRequest, signal?: AbortSignal): Promise<DelegateResult>;
+}
+
+interface DelegateRequest { agent?: string; objective: string; context?: string }
+interface DelegateResult  { ok: boolean; report: string }
+```
+
+When the runner is present the tool delegates; when it is absent the tool returns a
+non-throwing stub result so the deck typechecks and runs in every environment.
+
+## Advertising Delegate Roles in the Prompt
+
+The briefing has a `Delegates` section (`SUBAGENTS_SECTION` in
+`src/briefing/compose.ts`) that renders whatever `SubagentBrief` entries the context
+carries:
+
+```typescript
+interface SubagentBrief {
+  name: string;       // the name the primary agent delegates to
+  purpose: string;    // one-line description of the role
+  when?: string;      // optional hint on when to use it
+}
+```
+
+When the briefing context lists any `subagents`, the section instructs the model to
+offload well-scoped work to those roles via the `task` tool. With no entries, the
+section is omitted.
+
+> **Status:** The section is implemented but not yet fed at runtime. The session
+> runner composes the system prompt with only `{ tools }`
+> (`composeBriefing({ tools })` in `src/boot/runners/session.ts`), so it never
+> passes any `subagents` into the briefing context — the `Delegates` section is
+> therefore always omitted in the live prompt today. See `FEATURE_GAP_ROADMAP.md`.
+
+## Related
+
+- [Extensions](extensions.md) — addons that contribute their own tools and commands
+- [Skills](skills.md) — on-demand instruction packages
+- [Features](features.md) — the capability deck and tool roster

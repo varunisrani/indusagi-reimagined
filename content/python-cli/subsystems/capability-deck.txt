@@ -1,0 +1,270 @@
+# Capability Deck
+
+> The capability deck is `induscode`'s tooling layer — the typed seam between the coding-agent product and the set of callable tools the agent runtime executes. Reach it as `from induscode.capability_deck import provision_deck, DeckContext`. A "capability" *is* a framework [`AgentTool`](/python/facades/agent); the deck assembles a `ToolDeck` the [conductor](/python-cli/subsystems/conductor) consumes verbatim as `options.tools`, and grafts external MCP server tools through an event-sourced bridge ledger.
+
+## Table of Contents
+
+- [What the Deck Is](#what-the-deck-is)
+- [The Frozen Contract](#the-frozen-contract)
+- [Tool Cards: the Catalog](#tool-cards-the-catalog)
+- [The Built-in Bridge](#the-built-in-bridge)
+- [Profiles and Provisioning](#profiles-and-provisioning)
+- [App-novel Cards](#app-novel-cards)
+- [The Bridge Ledger](#the-bridge-ledger)
+- [Bridge Keys: Content-Hash and ULID](#bridge-keys-content-hash-and-ulid)
+- [Mounting MCP Servers](#mounting-mcp-servers)
+- [How the Session Consumes the Deck](#how-the-session-consumes-the-deck)
+- [Faults](#faults)
+- [Public Surface](#public-surface)
+- [Notable Behavior](#notable-behavior)
+
+## What the Deck Is
+
+The deck is the single typed seam between the `induscode` product and the tools the agent loop calls — file ops, the shell, search, the web, plus app-novel checklist / background-process / delegate / SaaS / memory tools and dynamically-grafted MCP server tools.
+
+Two design commitments shape it:
+
+- **A capability is exactly a framework `AgentTool`.** The deck does not invent a parallel descriptor type — `Capability` is a `TypeAlias` of `indusagi.agent.AgentTool`. The deck's whole job is to *assemble* `AgentTool` objects, not to wrap them, so the conductor consumes the deck's output directly as `options.tools`.
+- **The catalog is a single source of truth.** Every index, profile membership, and lookup is *derived* from one `CAPABILITY_CARDS` tuple. One data-driven `provision_deck` walks a profile table instead of a trio of per-profile build functions. MCP enrollment is event-sourced: the live tool set is the pure fold (`reduce_ledger`) of an append-only event stream.
+
+The package is layered, with `contract.py` as a frozen, IO-free type seam everything else is written against:
+
+```
+contract.py          frozen type surface (Capability, CapabilityCard, BridgeEntry, reduce_ledger, ...)
+  builtin_bridge.py  ONE 12-row table re-exposing framework native factories
+  manifest.py        CAPABILITY_CARDS projected from the bridge table + derived lookups
+  cards/             5 app-novel cards (todo, bg-process, task, saas, memory)
+  provision.py       provision_deck — the single data-driven assembler over the profile table
+  bridge_ledger/     event-sourced MCP enrollment (key.py, ledger.py, network.py)
+```
+
+Consumers import the whole surface from `induscode.capability_deck` rather than reaching into individual modules.
+
+## The Frozen Contract
+
+`contract.py` declares only shapes plus a handful of tiny inert helpers (an id brand, a key minter, a fault factory, a pure ledger reducer) — no I/O, no provisioning, no orchestration. The TS lineage's TypeBox generics collapse here: `Capability` and `AnyCapability` both alias the structural `AgentTool` Protocol, and `Schema` is a plain JSON-schema `Mapping[str, Any]` (the stand-in for TypeBox `TSchema`).
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `Capability` / `AnyCapability` | type alias | Both alias `indusagi.agent.AgentTool` — the element type every deck list/box surfaces. |
+| `CapabilityId` / `capability_id` | NewType + function | Branded wire-facing tool name (`"read"`, `"bash"`, `"<server>__<tool>"`) and its sole sanctioned minter. |
+| `CapabilityCard` | dataclass | One catalog row: frozen `id` / `title` / `summary` plus a pure `build: Callable[[DeckContext], Capability]` factory. |
+| `DeckProfile` | type | `Literal["authoring", "survey", "all"]` — the named capability sets a session can be provisioned with. |
+| `DeckContext` | dataclass | The working context handed to `build`: `cwd` plus optional injectable `fs` / `shell` backends and a `framework` handle bag. |
+| `ToolDeck` / `DeckBox` | Protocol + type | The assembled deck: `tools()` (flat list) and `box()` (= `list[AnyCapability] | ToolBox`). |
+| `BridgeEntry` / `BridgeOp` | dataclass + type | One append-only MCP enrollment event (op `enroll` \| `retire`, key, server, capability, seq, at). |
+| `BridgeKey` / `bridge_key` | NewType + function | The branded stable key of an enrolled bridge capability, and its minter. |
+| `LedgerSnapshot` / `reduce_ledger` | dataclass + function | The reduced current view (`live`, `by_server`, `high_water`) and the single pure, total fold that produces it. |
+| `DeckFault` / `DeckFaultKind` / `deck_fault` | Exception + type + function | Typed discriminated failure and its factory. |
+
+## Tool Cards: the Catalog
+
+A **tool card** (`CapabilityCard`) is metadata plus a builder: it advertises the capability's identity (`id`, `title`, `summary`) for help / introspection / slash-command listings, and carries a `build(ctx)` factory that mints the live `AgentTool` for a given `DeckContext`. `build` is pure with respect to the deck — it reads injected backends from the context and returns a configured capability; it performs no enrollment and mutates no shared state.
+
+`manifest.py` owns `CAPABILITY_CARDS` — the one hand-maintained-in-one-place tuple — and derives the rest:
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `CAPABILITY_CARDS` | const | The static catalog tuple, projected from `BUILTIN_BRIDGE` in catalog order. |
+| `CAPABILITY_INDEX` | const | `id -> CapabilityCard` `MappingProxy`, resolves a `--tools name1,name2` selection or model-named tool in O(1). |
+| `CARD_PROFILES` | const | `id -> profiles` membership map, derived from the bridge table. |
+| `capability_ids()` | function | Wire-facing ids of every catalog row, in catalog order. |
+| `has_capability(id)` | function | True when a catalog row exists under this id. |
+| `find_card(id)` | function | Fetch a catalog row by id, or `None`. |
+| `cards_for_profile(profile)` | function | Catalog rows that participate in a profile — the single place built-in profile filtering happens. |
+
+Because every index is derived from the one tuple, there is never a second parallel map to keep in sync.
+
+## The Built-in Bridge
+
+`builtin_bridge.py` is the ONE seam to the framework's native tools. The framework already authors its file / search / shell / web / process / checklist tools as fully-formed `AgentTool` objects and ships a `create_<name>_tool(cwd, ...)` factory for each. The bridge pairs every native factory with a `CapabilityCard.build`-shaped closure in one 12-row table — `_BUILTIN_DESCRIPTORS` — rather than a dozen one-line re-export stubs. Each `BuiltinDescriptor` carries the wire id, deck-side prose, profile membership, and a `BridgeBuilder` closure (e.g. `lambda ctx: create_read_tool(ctx.cwd)`).
+
+The 12 built-ins, with their wire-facing ids and built-in profile membership:
+
+| Wire id | Title | Framework factory | Membership |
+|---------|-------|-------------------|------------|
+| `read` | Read file | `create_read_tool(ctx.cwd)` | read-only |
+| `ls` | List directory | `create_ls_tool(ctx.cwd)` | read-only |
+| `grep` | Search file contents | `create_grep_tool(ctx.cwd)` | read-only |
+| `find` | Find files by name | `create_find_tool(ctx.cwd)` | read-only |
+| `websearch` | Web search | `create_web_search_tool()` | read-only |
+| `webfetch` | Fetch URL | `create_web_fetch_tool()` | read-only |
+| `todo_read` | Read checklist | `todo_read_tool` (singleton) | read-only |
+| `write` | Write file | `create_write_tool(ctx.cwd)` | mutating |
+| `edit` | Edit file | `create_edit_tool(ctx.cwd)` | mutating |
+| `bash` | Run shell command | `create_bash_tool(ctx.cwd)` | mutating |
+| `process` | Manage background processes | `create_process_tool(options={"cwd": ctx.cwd})` | mutating |
+| `todo_set` | Update checklist | `todo_write_tool` (singleton) | mutating |
+
+All model-facing tool `name` strings are the framework's own wire contract, kept verbatim — only deck-side titles / summaries are the deck's prose. The checklist pair uses the *Python* framework wire names `todo_read` / `todo_set` (not the TS `todoread` / `todowrite`).
+
+The bridge exposes the table three ways — `BUILTIN_BRIDGE` (id-keyed `MappingProxy`), `BUILTIN_IDS` (ordered tuple), `BUILTIN_PROFILES` (id-keyed membership) — plus helpers:
+
+```python
+build_builtin(id, ctx)                  # resolve-and-build one built-in (typed faults)
+build_builtins_for_profile(profile, ctx)  # build every built-in eligible for a profile
+builtin_descriptors()                   # the ordered descriptor tuple the manifest projects
+```
+
+These rest on the [framework capabilities](/python/subsystems/capabilities) kernel — the deck never reimplements a tool; it only *binds* the factory to a working context and re-labels it for the catalog.
+
+## Profiles and Provisioning
+
+`provision.py` is the single data-driven assembler. `provision_deck(profile, ctx)` looks the profile up in a `_PROFILE_TABLE`, selects its catalog rows, builds each against the `DeckContext`, and returns a `_ProvisionedDeck` exposing `tools()` and `box()`.
+
+```python
+from induscode.capability_deck import DeckContext, provision_deck
+
+deck = provision_deck("all", DeckContext(cwd="/path/to/project"))
+tools = deck.tools()     # flat list[AgentTool] for inspection / --tools selection
+box = deck.box()         # the same list, wired in as SessionConductorOptions.tools
+```
+
+A profile is a *selection policy* over the catalog — data, not control flow — so adding a profile or moving a card is a one-line table edit. The three profiles in increasing breadth:
+
+| Deck profile | Built-in membership selected | App-novel cards |
+|--------------|------------------------------|-----------------|
+| `authoring` | the read-only subset (read/ls/grep/find/web/`todo_read`) | no |
+| `survey` | every built-in, mutating tools included | no |
+| `all` | every built-in | yes |
+
+> **Profile-name inversion (ported verbatim, pinned by tests — do not "fix").** The deck profile `authoring` maps to the built-in *membership tag* `survey` (the read-only subset), and the deck profile `survey` maps to membership `all` (every built-in including mutating). A deck profile is a selection policy, distinct from the per-tool membership tags the built-in catalog carries; the names deliberately do not line up. The `capability-deck` test suite pins this exact semantics.
+
+`cards_for_deck_profile(profile)` is the selection `provision_deck` walks. `_build_selected` wraps any failing card's `build` as a `build_failed` `DeckFault` so a single bad factory names itself instead of sinking the whole assembly opaquely. The capabilities are built once at provision time; `tools()` and `box()` return fresh copies so a caller cannot mutate the deck's backing list. Bridge / MCP tools are *not* selected here — they are concatenated onto `tools()` by the host after provisioning.
+
+## App-novel Cards
+
+`cards/` adds five in-house tools, concatenated onto the built-ins by `APP_NOVEL_CARDS` only for the `all` profile. Each card is a small class structurally satisfying `AgentTool` (name / label / description / parameters / async `execute`), keying behavior on an `action` discriminant with defensive runtime guards that return `isError` results rather than throwing.
+
+| Card | Tool `name` | Actions | Behavior |
+|------|-------------|---------|----------|
+| `todo_card` | `todo` | `read` \| `set` | In-memory checklist; `set` wholesale-replaces the list. |
+| `daemon_card` | `bg-process` | `start` \| `poll` \| `stop` \| `list` | Background-process tool over `asyncio.create_subprocess_shell`, with bounded ring buffers (`_MAX_BUFFERED_LINES = 2000`) and SIGTERM→SIGKILL escalation. |
+| `task_card` | `task` | (objective) | Sub-agent delegate; runner injected via `ctx.framework["delegate"]`, degrades to a typed stub when absent. |
+| `saas_card` | `saas-action` | `discover` \| `execute` | Connector tool; gateway injected via `ctx.framework["saasGateway"]`, stub when absent. |
+| `memory_card` | `memory` | `read` \| `replace` \| `append` | Working-memory scratch-note tool; store injected via `ctx.framework["memoryStore"]`, defaults to `InMemoryStore`. |
+
+The connector, delegate, and memory cards expose a thin, clearly-typed adapter seam over a framework handle injected through `DeckContext.framework`; when no handle is wired they degrade to a typed stub so every card builds and runs in any environment, including tests. The injection keys are exported constants: `DELEGATE_HANDLE_KEY = "delegate"`, `SAAS_GATEWAY_KEY = "saasGateway"`, `MEMORY_HANDLE_KEY = "memoryStore"`.
+
+Stores (`TodoLedger`, `DaemonTable`, `InMemoryStore`) are per-built-capability, so two sessions never share state.
+
+## The Bridge Ledger
+
+MCP enrollment is **event-sourced**. Rather than mutate a shared module-level list of live tools (which makes "who's enrolled right now" a function of call order and hides every past change), enrollment is an append-only event log folded into a derived snapshot.
+
+`BridgeLedger` is a plain immutable value: the ordered `BridgeEntry` log, its already-folded `LedgerSnapshot`, and the next sequence number to stamp. The log is the source of truth; the snapshot is a cache of its fold. Every transition returns a *new* ledger — the input is never touched:
+
+| Function | Op | Behavior |
+|----------|-----|----------|
+| `empty_bridge_ledger()` | — | An empty ledger; sequence numbering starts at 1. |
+| `bridge_ledger_from_log(log)` | — | Rehydrate a ledger from a persisted event log (fold for the snapshot, resume past the high-water mark). |
+| `enroll_bridge_card(ledger, req)` | enroll | **Upsert** — re-enrolling the same `BridgeKey` replaces its live entry rather than duplicating it. |
+| `retire(ledger, key, server)` | retire | **Splice** — the fold drops the keyed entry from the live view. |
+| `withdraw_server(ledger, server)` | retire ×N | Retire every capability a server currently has live, in one batch (the disconnect counterpart to grafting a whole server). |
+| `live_capabilities(ledger)` | — | The flat list of every live capability — what a host grafts onto the static catalog. |
+| `live_capabilities_for_server(ledger, server)` | — | The live capabilities a single server contributes (for status panels). |
+
+`reduce_ledger` (in `contract.py`) is the single sanctioned reducer: pure and total, it sorts by `seq`, lets a later sequence win on a repeated key (`enroll` upsert), removes retired keys, and derives per-server counts from the live set. The view is therefore independent of input order.
+
+## Bridge Keys: Content-Hash and ULID
+
+`bridge_ledger/key.py` mints the stable key that makes re-enrolling idempotent. Keys are minted from the capability's *identity*, never from a working-directory digest, so the same external tool grafted from two sessions collapses to one key.
+
+```python
+bridge_content_key(server, tool, parameters)  # default: 'bk_<32hex>' sha256 over qualified name + canonical schema
+bridge_ulid_key(monotonic=True)               # opt-in: 'bk_<ULID>' when each enrollment must be a distinct event
+qualify_bridge_name(server, tool)             # the '<server>__<tool>' qualifier using the framework QUALIFIER
+```
+
+`bridge_content_key` digests the qualified `<server>__<tool>` name plus a canonicalized parameter schema (a domain separator between the two prevents `name|schema` from colliding with `name+schema`). A tool whose schema changed yields a new key, correctly surfacing it as a distinct capability. `bridge_ulid_key` is monotonic within a process for the rare case a caller wants every enrollment to be a distinct, time-sortable event.
+
+The canonicalization is deliberately parity-faithful so keys minted by the TS and Python runtimes do not diverge: object keys are sorted by UTF-16 code units, mapping entries whose value is `None` are dropped (the `undefined` stand-in), array order is preserved, and integral floats print without a trailing `.0` (JS number printing).
+
+## Mounting MCP Servers
+
+`bridge_ledger/network.py` is the side-effecting half. The framework's [`mount_protocol_bridge`](/python/subsystems/interop) does the protocol work — it connects every configured server, lists each ready endpoint's tools, and hands back a mounted bridge whose `box` ([`ToolBox`](/python/subsystems/runtime)) advertises every grafted remote tool under its qualified `<server>__<tool>` name. This module adds adaptation, enrollment, and cataloging:
+
+```python
+from induscode.capability_deck import (
+    attach_bridge_capabilities, bridge_config, empty_bridge_ledger, detach_bridge,
+)
+
+config = bridge_config(servers)              # flat list -> framework BridgeConfig
+result = await attach_bridge_capabilities(empty_bridge_ledger(), config)
+# result: AttachResult(ledger, enrolled, fleet, status, fault)
+tools = list(result.ledger.snapshot.live.values())
+```
+
+- **Adaptation.** `bridge_box_to_capabilities(box)` wraps each `ToolBox` descriptor + the shared `runner` into a `_BridgedCapability` — an `AgentTool` whose `execute` calls `runner.run(ToolCall(...))` and projects the runner's opaque outcome onto an `AgentToolResult` (a single text block, preserving plain strings verbatim and JSON-encoding anything structured). When the caller passes no cancel signal the adapter mints a placeholder `CancelToken`.
+- **Enrollment.** `attach_bridge_capabilities(ledger, config)` awaits the mount, adapts the box, and folds each capability into a *new* ledger as an `enroll` event, returning an `AttachResult` (`ledger`, `enrolled` count, live `fleet`, `status`, and a non-fatal `fault`).
+- **Cataloging.** `bridge_capability_card(capability)` re-presents a grafted capability as a `CapabilityCard` so dynamic MCP tools surface in help / introspection beside the static rows; the card's `build` simply returns the already-live capability.
+- **Detach.** `detach_bridge(ledger, fleet, servers=None)` withdraws named servers' live entries and best-effort tears the fleet down.
+
+A wholesale mount failure becomes a non-fatal `bridge` `DeckFault` carried *on* the `AttachResult` (`result.fault`), never raised — so a bad MCP config degrades the deck instead of sinking session bootstrap. Per-server failure isolation comes for free: a server that faulted on connect contributes no descriptors and is simply absent from the enrollment.
+
+## How the Session Consumes the Deck
+
+Downstream, the deck is consumed by `induscode.boot.runners.session` (see [Boot](/python-cli/subsystems/boot)). `select_tools(cwd, inv)` provisions the full deck, honoring the [CLI](/python-cli/reference/cli) flags:
+
+```python
+def select_tools(cwd, inv):
+    if inv.no_tools:                       # --no-tools -> empty
+        return []
+    all_tools = provision_deck("all", DeckContext(cwd=cwd)).tools()
+    if inv.tools is None or len(inv.tools) == 0:
+        return all_tools
+    allow = {_canon_tool_name(name) for name in inv.tools}   # --tools allow-list
+    return [t for t in all_tools if _canon_tool_name(t.name) in allow]
+```
+
+Tool ids are matched case-insensitively with `_` / `-` stripped, and the result feeds `SessionConductorOptions.tools` — the [conductor](/python-cli/subsystems/conductor) passes them to its lazily-built framework agent. The console's integrations slash commands (see [Slash Commands](/python-cli/console/slash-commands)) import `APP_NOVEL_CARDS` / `memory_card` to surface the in-house tools.
+
+## Faults
+
+`DeckFault` is a typed, discriminated `Exception`; the `kind` discriminant selects the category and `cause` carries the underlying error so consumers need not parse the message. Mint one with `deck_fault(kind, message, cause)`.
+
+| `DeckFaultKind` | Raised when |
+|-----------------|-------------|
+| `unknown_capability` | A requested capability id (or deck profile) is not in the catalog / table. |
+| `build_failed` | A card's `build` threw while minting a capability. |
+| `bridge` | Connecting / listing / grafting an MCP server failed (carried on `AttachResult`, not raised). |
+| `backend` | A required injected backend was missing or invalid. |
+
+## Public Surface
+
+Everything is re-exported from the `induscode.capability_deck` barrel:
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `Capability` / `AnyCapability` | type | `contract.py` | Aliases of framework `AgentTool`. |
+| `CapabilityId` / `capability_id` | NewType + fn | `contract.py` | Branded wire-facing tool name + minter. |
+| `CapabilityCard` | dataclass | `contract.py` | One catalog row: metadata + `build` factory. |
+| `DeckProfile` / `DeckContext` | type + dataclass | `contract.py` | Named capability sets + the build context. |
+| `ToolDeck` / `DeckBox` | Protocol + type | `contract.py` | The assembled deck and what `box()` hands out. |
+| `BridgeEntry` / `BridgeOp` / `BridgeKey` / `bridge_key` | dataclass + types + fn | `contract.py` | The enrollment event, its op, the stable key, its minter. |
+| `LedgerSnapshot` / `reduce_ledger` | dataclass + fn | `contract.py` | The reduced view and the pure fold. |
+| `DeckFault` / `DeckFaultKind` / `deck_fault` | Exception + type + fn | `contract.py` | Typed failure + factory. |
+| `CAPABILITY_CARDS` / `CAPABILITY_INDEX` / `CARD_PROFILES` | const | `manifest.py` | The catalog tuple and its derived indexes. |
+| `capability_ids` / `has_capability` / `find_card` / `cards_for_profile` | fn | `manifest.py` | Derived lookups over the catalog. |
+| `BUILTIN_BRIDGE` / `BUILTIN_IDS` / `BUILTIN_PROFILES` | const | `builtin_bridge.py` | The 12-row built-in table and its keyed views. |
+| `BuiltinDescriptor` / `BridgeBuilder` | dataclass + type | `builtin_bridge.py` | One built-in descriptor and the builder closure type. |
+| `build_builtin` / `build_builtins_for_profile` / `builtin_descriptors` | fn | `builtin_bridge.py` | Resolve-and-build helpers over the table. |
+| `provision_deck` / `cards_for_deck_profile` | fn | `provision.py` | The single assembler and the selection it walks. |
+| `BridgeLedger` / `EnrollRequest` | dataclass | `bridge_ledger/ledger.py` | The immutable ledger value and enrollment fields. |
+| `empty_bridge_ledger` / `bridge_ledger_from_log` | fn | `bridge_ledger/ledger.py` | Construction and rehydration. |
+| `enroll_bridge_card` / `retire` / `withdraw_server` | fn | `bridge_ledger/ledger.py` | Pure ledger transitions (each returns a new ledger). |
+| `live_capabilities` / `live_capabilities_for_server` | fn | `bridge_ledger/ledger.py` | Live-set projections. |
+| `bridge_content_key` / `bridge_ulid_key` / `qualify_bridge_name` | fn | `bridge_ledger/key.py` | Content-hash / ULID key minting + name qualifier. |
+| `attach_bridge_capabilities` / `detach_bridge` | fn | `bridge_ledger/network.py` | Mount + enroll / withdraw + tear down. |
+| `bridge_box_to_capabilities` / `bridge_capability_card` / `bridge_config` | fn | `bridge_ledger/network.py` | Adapt a `ToolBox`, catalog a graft, build a `BridgeConfig`. |
+| `AttachResult` | dataclass | `bridge_ledger/network.py` | The outcome of attaching MCP servers. |
+| `APP_NOVEL_CARDS` | const | `cards/__init__.py` | The 5 in-house cards (added only for the `all` profile). |
+| `build_*_capability` / `*_card` / handle keys | fn + const | `cards/*.py` | The todo / daemon / task / saas / memory builders, cards, stores, and injection keys. |
+
+## Notable Behavior
+
+- **Unwired bridge ledger (parity gap).** Although the bridge network (`attach_bridge_capabilities` / `detach_bridge`) is fully built, the live session runner (`boot/runners/session.py` `load_mcp_tools`) currently attaches `--mcp` tools through the framework MCP factory `createMCPAgentToolFactory` directly into the `AgentTool` list, *not* through `attach_bridge_capabilities` / the ledger. The event-sourced ledger is built-but-not-yet-on the session hot path. See [MCP configuration](/python-cli/configuration/mcp).
+- **Idempotent enrollment.** Content-addressed keys mean re-enrolling the same tool (e.g. after a server reconnect) is an idempotent upsert; the live set never duplicates a tool just because a server reconnected.
+- **Typed stubs.** The `task`, `saas`, and `memory` cards degrade to typed, non-throwing stubs when their framework handle is absent from `ctx.framework`. `memory.py` carries an explicit `TODO(framework-memory)` since `indusagi.memory` exposes no public working-memory store yet — see the [framework memory facade](/python/facades/memory).
+- **Per-session isolation.** Built capability stores (`TodoLedger`, `DaemonTable`, `InMemoryStore`) are per-built-capability, so two sessions never share state; background-process output buffers are capped at 2000 lines.
+- **TS-parity-faithful keys.** Content-key canonicalization mirrors the TS `JSON.stringify` / `canonicalize` byte sequence exactly, so keys minted by the TS and Python runtimes are identical for the same tool. See [Parity](/python-cli/reference/parity).

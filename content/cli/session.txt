@@ -1,0 +1,228 @@
+# Session File Format
+
+> Each session is a single append-only NDJSON file. The transcript is a **branchable tree** of nodes, not a flat list — branching repoints the active leaf and forks a new path without rewriting history.
+
+A session is persisted by the conductor's transcript store as one NDJSON (newline-delimited JSON) file. Every line is a self-describing JSON object stamped with the schema string `indus/transcript@1`. The first line is a **head** record (which leaf the session currently points at); every other line is an **entry** node in the tree.
+
+## Table of Contents
+
+- [File Location](#file-location)
+- [On-Disk Schema](#on-disk-schema)
+- [Head Line](#head-line)
+- [Entry Line](#entry-line)
+- [Node Roles](#node-roles)
+- [Tree Structure](#tree-structure)
+- [Parsing a Session File](#parsing-a-session-file)
+- [Catalog & Management](#catalog--management)
+- [Source Files](#source-files)
+
+## File Location
+
+Sessions live under the brand profile directory. The workspace locator resolves the profile root to:
+
+```
+~/.indusagi/agent/
+```
+
+and maps the sessions directory to the `sessions/` leaf. Each session is one file named by its id:
+
+```
+~/.indusagi/agent/sessions/<sessionId>.ndjson
+```
+
+- The on-disk identifier **is** the filename stem (`<sessionId>`), with no directory and no extension.
+- The session id is a ULID minted by the store's clock.
+- The file extension is `.ndjson`.
+
+The profile root can be relocated with the `INDUSAGI_CODING_AGENT_DIR` environment variable (a `~`- and cwd-relative-aware path). When set, it replaces the default `<home>/.indusagi/agent` root and the `sessions/` directory moves with it.
+
+## On-Disk Schema
+
+The schema literal is a namespaced string (not a bare integer) so the format is self-describing:
+
+```typescript
+export const TRANSCRIPT_SCHEMA = "indus/transcript@1" as const;
+```
+
+Two line shapes can appear in a file, discriminated by a `kind` field:
+
+| `kind` | Purpose |
+|--------|---------|
+| `"head"` | Tracks the active leaf. Written first; rewritten on branch. |
+| `"entry"` | One node in the transcript tree. |
+
+The serializer is **tolerant** when reading: blank lines are skipped, malformed JSON lines are dropped, and any line whose `schema` is not `indus/transcript@1` is ignored.
+
+## Head Line
+
+The head line pins the schema and records which leaf the session currently points at, so a reader recovers the active branch without scanning for the deepest node. A file should carry exactly one head line; the last one wins.
+
+```json
+{"schema":"indus/transcript@1","kind":"head","sessionId":"01HZ...","leaf":"01J0..."}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `schema` | `"indus/transcript@1"` | Format discriminant. |
+| `kind` | `"head"` | Line type. |
+| `sessionId` | `string` | The session this transcript belongs to. |
+| `leaf` | `string \| null` | Id of the active leaf node, or `null` for an empty transcript. |
+
+When a loaded file carries **no** head line, the store recovers by pinning the head to the deepest reachable leaf (the node with the longest `parent` chain, ties broken by latest id).
+
+## Entry Line
+
+An entry line carries one transcript node. The field names are the conductor's own — `prev` is the parent link, `at` is the timestamp, and `message` carries the framework `AgentMessage` payload verbatim.
+
+```json
+{"schema":"indus/transcript@1","kind":"entry","id":"01J0...","prev":null,"role":"user","message":{"role":"user","content":"Hello"},"at":"2026-06-11T14:00:00.000Z"}
+{"schema":"indus/transcript@1","kind":"entry","id":"01J1...","prev":"01J0...","role":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Hi!"}]},"at":"2026-06-11T14:00:01.000Z"}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `schema` | `"indus/transcript@1"` | Format discriminant. |
+| `kind` | `"entry"` | Line type. |
+| `id` | `string` | Stable unique node id (a ULID). |
+| `prev` | `string \| null` | Parent node id (`null` for a transcript root). |
+| `role` | `TranscriptRole` | The node's conversational role (see below). |
+| `message` | `AgentMessage` | The framework message payload this node persists. |
+| `at` | `string` | ISO-8601 creation timestamp. |
+| `meta` | `object` *(optional)* | Non-LLM annotations (e.g. import provenance) — omitted when absent. |
+
+The persisted node shape is `TranscriptEntry`, with conductor-side field names:
+
+```typescript
+interface TranscriptEntry {
+  readonly id: string;
+  readonly parent: string | null;  // serialized as `prev`
+  readonly role: TranscriptRole;
+  readonly content: AgentMessage;   // serialized as `message`
+  readonly createdAt: string;       // serialized as `at`
+  readonly meta?: Readonly<Record<string, unknown>>;
+}
+```
+
+The `message` payload is an opaque framework `AgentMessage` (from `indusagi/agent`) — the store persists and replays it without re-declaring the message schema.
+
+## Node Roles
+
+The node `role` is the conductor's own discriminant for the **node**, not the LLM message. It spans the LLM turns plus the conductor's bookkeeping nodes:
+
+```typescript
+type TranscriptRole =
+  | "user"
+  | "assistant"
+  | "tool"
+  | "system"
+  | "condense"
+  | "note";
+```
+
+The role is derived from the carried message by `roleForMessage()`:
+
+| `AgentMessage.role` | Node `role` |
+|---------------------|-------------|
+| `user` | `user` |
+| `assistant` | `assistant` |
+| `toolResult` | `tool` |
+| `compactionSummary` / `branchSummary` | `condense` |
+| anything else (custom / notification) | `note` |
+
+## Tree Structure
+
+Entries form an append-only tree:
+
+- A root entry has `prev: null`.
+- Each later entry names its parent via `prev`.
+- The **leaf** (tracked on the head line) is the current position.
+- Branching repoints the leaf at an earlier node; the next append becomes that node's child, forking a new path. Existing nodes are never rewritten.
+
+```
+[user] ── [assistant] ── [user] ── [assistant] ─┬─ [user]   ← current leaf
+                                                 │
+                                                 └─ [user]   ← alternate branch
+```
+
+The active conversation is the `prev`-chain walked from the leaf back to a root, reversed to chronological order — see [tree.md](tree.md) for navigation, and [compaction.md](compaction.md) for how an over-budget branch is condensed.
+
+## Parsing a Session File
+
+`parseSessionText(sessionId, text)` returns `{ head, entries }`. To parse a file by hand, split on newlines, `JSON.parse` each non-blank line, and switch on `kind`:
+
+```typescript
+import { readFileSync } from "node:fs";
+
+const text = readFileSync(
+  `${process.env.HOME}/.indusagi/agent/sessions/${sessionId}.ndjson`,
+  "utf8",
+);
+
+for (const raw of text.split("\n")) {
+  const line = raw.trim();
+  if (line.length === 0) continue;
+
+  let parsed: any;
+  try { parsed = JSON.parse(line); } catch { continue; }
+  if (parsed.schema !== "indus/transcript@1") continue;
+
+  if (parsed.kind === "head") {
+    console.log(`leaf: ${parsed.leaf ?? "(empty)"}`);
+  } else if (parsed.kind === "entry") {
+    console.log(`[${parsed.id}] ${parsed.role} (parent ${parsed.prev}):`,
+      JSON.stringify(parsed.message).slice(0, 80));
+  }
+}
+```
+
+## Catalog & Management
+
+A workspace accumulates many session files. The `SessionLibrary` is the catalog-and-navigation layer over that collection. It is exposed on the package's `sessions` barrel namespace (see [sdk.md](sdk.md)); construct it with the resolved sessions directory:
+
+```typescript
+import { sessions } from "indusagi-coding-agent";
+
+const library = new sessions.SessionLibrary({
+  sessionsDir: `${process.env.HOME}/.indusagi/agent/sessions`,
+});
+
+const rows = await library.list({ deep: true });
+```
+
+Each row is a `SavedSession`:
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `id` | `string` | Bare session id (the filename stem). |
+| `path` | `string` | Absolute on-disk path. |
+| `name` | `string` *(opt)* | Derived label (the opening turn preview). |
+| `lastModified` | `number` *(opt)* | File mtime, epoch ms. |
+| `size` | `number` *(opt)* | File size in bytes. |
+| `messageCount` | `number` *(opt)* | Count of conversational (user/assistant/tool) nodes. |
+| `preview` | `string` *(opt)* | Single-line excerpt of the opening user turn. |
+
+`list({ deep })` returns rows newest-modified first. A **shallow** listing fills only `id`/`path`/`size`/`lastModified` (it only `stat`s each file, so a large directory lists fast); a **deep** listing opens each file to fill `messageCount`, `preview`, and `name`. A missing directory yields an empty list rather than an error.
+
+File-level operations:
+
+| Method | Effect |
+|--------|--------|
+| `library.open(id)` | Hydrate the file back into a live `TranscriptStore`, or `null` if absent. |
+| `library.rename(fromId, toId)` | Move `<fromId>.ndjson` to `<toId>.ndjson`; returns the new path. Throws if the source is missing or the target exists. |
+| `library.remove(id)` | Delete the file. Returns `true` if removed, `false` if already absent; never throws on an absent session. |
+| `library.pathOf(id)` | The absolute path a session id persists to. |
+
+### Deleting Sessions
+
+A session is removed by deleting its `.ndjson` file under `~/.indusagi/agent/sessions/` — or programmatically via `library.remove(id)`. There is no separate metadata file to clean up; the file **is** the whole session.
+
+## Source Files
+
+Internal source (clean-room rebuild, `indus-code-rebuild/src`):
+
+- `conductor/contract.ts` — `TranscriptEntry`, `SessionHead`, `TranscriptRole`, `TRANSCRIPT_SCHEMA`.
+- `conductor/transcript-store/store.ts` — `TranscriptStore`, `fsBackend`, `memoryBackend`, `replay`.
+- `conductor/transcript-store/serialize.ts` — `encodeEntry`, `encodeHead`, `parseSessionText`, `roleForMessage`, the on-disk line shapes.
+- `sessions/library.ts` — `SessionLibrary` (catalog, open, rename, remove).
+- `sessions/contract.ts` — `SavedSession`, `BranchNode`, `PriorTurn`.
+- `workspace/locator.ts` / `workspace/brand.ts` — the profile-root + `sessions/` path resolution.

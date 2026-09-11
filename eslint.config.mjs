@@ -9,6 +9,12 @@ const eslintConfig = defineConfig([
   globalIgnores([
     // Default ignores of eslint-config-next:
     ".next/**",
+    ".vinext/**",
+    ".sites-runtime/**",
+    ".pnpm-bootstrap/**",
+    "app/data/**",
+    "content/**",
+    "dist/**",
     "out/**",
     "build/**",
     "next-env.d.ts",
@@ -21,6 +27,15 @@ const eslintConfig = defineConfig([
       "@typescript-eslint/no-unused-vars": "off",
       "react-hooks/purity": "off",
       "react-hooks/set-state-in-effect": "off",
+    },
+  },
+  {
+    files: ["app/header.tsx", "app/footer.tsx"],
+    rules: {
+      // The uploaded design intentionally hydrates its pre-paint theme script
+      // and uses the bundled raster brand asset without an image optimizer.
+      "react-hooks/set-state-in-effect": "off",
+      "@next/next/no-img-element": "off",
     },
   },
 ]);

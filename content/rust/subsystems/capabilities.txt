@@ -1,0 +1,641 @@
+# Capabilities
+
+> `capabilities` is the Rust edition's batteries-included tool layer — the
+> concrete actions a model can take through the agent runtime. It is built on a
+> frozen tool kernel (the declarative `Tool` trait, the single `define_tool`
+> adapter, the abstract `Fs`/`Shell` seams, a UTF-8 byte-budget `clamp`, and an
+> ordered `ToolRegistry`), twelve concrete tools across five families
+> (files / search / shell / planning / web), and one OS-backed binding of the I/O
+> seams. Reached as `indusagi::capabilities::*`, every tool authors only an async
+> `run`; the kernel supplies descriptor, input coercion, cancellation, and
+> outcome projection uniformly.
+
+## Table of Contents
+
+- [Layout](#layout)
+- [The authoring kernel](#the-authoring-kernel)
+- [The Fs and Shell seams](#the-fs-and-shell-seams)
+- [Output budgeting](#output-budgeting)
+- [The two outward contracts](#the-two-outward-contracts)
+- [The built-in tools](#the-built-in-tools)
+- [The read-before-edit gate](#the-read-before-edit-gate)
+- [The Myers diff](#the-myers-diff)
+- [Registry and collections](#registry-and-collections)
+- [The local backend](#the-local-backend)
+- [Using the suite](#using-the-suite)
+- [Authoring a custom tool](#authoring-a-custom-tool)
+- [Relationship to neighbors](#relationship-to-neighbors)
+- [Notable behaviors and parity caveats](#notable-behaviors-and-parity-caveats)
+
+## Layout
+
+Everything stacks under `capabilities/mod.rs`, which re-exports the whole surface
+from one site. Three concerns mirror the TypeScript ground truth
+(`indus-rebuild/src/capabilities/`) module-for-module: a frozen kernel, twelve
+concrete tools, and the OS-backed seam plus assembly.
+
+| Module | Source | Holds |
+|--------|--------|-------|
+| `kernel` | `kernel/mod.rs` | The frozen authoring shape: `Tool`/`define_tool`/`DefinedTool`, `ToolContext`/`ToolResult`/`ToolContentBlock`, the `Fs`/`Shell` traits, `OutputBudget`+`clamp`, `ToolRegistry`, and the two outward contracts (`ToolCall`/`ToolOutcome`/`ToolDescriptor`/`JsonSchema`). |
+| `backends` | `backends/local.rs` | The single sanctioned OS binding: `LocalFs` (`tokio::fs`), `LocalShell` + `LocalShellHandle` (`tokio::process` via `sh -c`), the shared `local_fs`/`local_shell` accessors, `make_local_context`, and `standard_budget` (the 64 KiB middle clamp). |
+| `files` | `files/` | `read`/`write`/`edit`/`ls` tools, the read-before-edit gate, and a from-scratch Myers line diff (`diff_lines`/`render_unified_diff`). |
+| `search` | `search/` | `grep` (regex content search) and `find` (filename glob/substring search with a file/dir kind filter). |
+| `shell` | `shell/` | `bash` (one-shot `Shell::exec` with timeout/cwd) and `process` (start/list/poll/stop background jobs via a module-global table + scratch capture files). |
+| `planning` | `planning/todo.rs` | The `todo_set`/`todo_read` pair over a module-global `TodoStore` keyed by `ToolContext` identity; `TodoItem`/`TodoStatus` + `reset_todos`. |
+| `web` | `web/` | `websearch` (DuckDuckGo HTML scrape via `reqwest`) and `webfetch` (`reqwest` GET + HTML-to-text simplification, byte-capped). |
+| `registry` | `registry.rs` | `builtin_registry`, the three standard collections, and the one-call `tool_box` / `try_tool_box` helpers. |
+
+Cancellation flows through the framework's single currency,
+[`core::CancellationToken`](/rust/subsystems/core): a cooperative cancel produces
+a typed `is_error` outcome, never a panic. This is the structural sibling of the
+[Python](/python/subsystems/capabilities) `capabilities` package and the
+TypeScript original; the names are idiomatic Rust (`snake_case` modules,
+`CamelCase` types) rather than the TS/Python identifiers.
+
+## The authoring kernel
+
+A tool is authored as the [`Tool`](/rust/subsystems/capabilities) trait: a name,
+a model-facing description, a JSON-Schema parameter shape, and one async `run`.
+Per-tool plumbing — advertising a descriptor, coercing the model's raw argument
+bag, honoring cancellation, and folding the result into the runtime's tool
+boundary — is concentrated in one adapter, `define_tool`. The author writes only
+`run`. Ported from `kernel/spec.ts`.
+
+```rust
+#[async_trait]
+pub trait Tool: Send + Sync {
+    fn name(&self) -> &str;
+    fn description(&self) -> &str;
+    fn parameters(&self) -> JsonSchema;
+    async fn run(&self, input: Value, ctx: &ToolContext) -> ToolResult;
+}
+
+pub fn define_tool(tool: Arc<dyn Tool>) -> DefinedTool;
+```
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `Tool` | trait | `kernel/spec.rs` | The declarative behavior of one tool: `name`/`description`/`parameters` + async `run(input, ctx)`. The input type collapses to `serde_json::Value`; each tool does its own permissive parse in `run`. |
+| `define_tool` | fn | `kernel/spec.rs` | Wrap an `Arc<dyn Tool>` into a `DefinedTool` the model sees and the runtime invokes. |
+| `DefinedTool` | struct | `kernel/spec.rs` | Wrapped tool; exposes `descriptor()`/`invoke(call, ctx)` for the runtime plus facade-shaped `name`/`description`/`parameters`/`execute()`. `Clone` (an `Arc` inside). |
+| `ToolResult` | struct | `kernel/spec.rs` | A tool's return: `content: Vec<ToolContentBlock>` + an `is_error: bool`. Constructors `text`/`failure`/`json`. |
+| `ToolContentBlock` | enum | `kernel/spec.rs` | `Text(String)` or `Json(Value)` — the unit of a result, discriminated on kind. |
+| `ToolContext` | struct | `kernel/spec.rs` | What every `run` receives besides its input: `context_id`, `cwd`, `fs`, `shell`, `cancel`, `budget`, `framework`. |
+| `Framework` | struct | `kernel/spec.rs` | Typed home for optional, host-injected handles (currently the read-state gate). Absent handle ⇒ the gate is a no-op. |
+| `coerce_input` | fn | `kernel/spec.rs` | Loosely coerce a model-supplied argument bag toward an object: a JSON string that trims to `{…}`/`[…]` is parsed; `null` collapses to `{}`; any other value (a non-JSON string, a scalar) passes through untouched for the tool's own `run` to validate. |
+| `ReadStateHandle` | trait | `kernel/spec.rs` | The minimal `get`/`set`/`has` handle a host may stash on `framework.read_state` to enable the read-before-edit gate. |
+| `ReadStateRecord` | struct | `kernel/spec.rs` | The per-file record the gate keeps: `mtime_ms`, `size`, optional `content_hash`, `read_at`. |
+| `READ_STATE_HANDLE_KEY` | const | `kernel/spec.rs` | `"readState"` — the string key kept exported for wire/JSON parity with the TS bag. |
+| `FacadeOutput` | struct | `kernel/spec.rs` | The facade-shaped output of `DefinedTool::execute`: `content: Vec<String>`, a `details` bag, and `is_error`. |
+
+### Identity, coercion, and outcome projection
+
+`ToolContext` carries a stable `context_id: u64` minted from a monotonic
+`AtomicU64` on construction. This replaces JS object identity so the
+per-conversation `todo` store can key by context exactly as the TS store keys by
+the `ToolContext` object reference. `ToolContext::with_cancel` clones the context
+and swaps only the cancel token (preserving the id), mirroring the TS
+`{ ...base, signal }` spread the registry runner performs.
+
+```rust
+pub struct ToolContext {
+    pub context_id: u64,
+    pub cwd: String,
+    pub fs: Arc<dyn Fs>,
+    pub shell: Arc<dyn Shell>,
+    pub cancel: CancellationToken,
+    pub budget: OutputBudget,
+    pub framework: Framework,
+}
+```
+
+`DefinedTool::invoke(call, ctx)` is the runner-side entry point. It runs a
+pre-flight cancel check (the byte-stable `Cancelled before {name} could begin.`
+message), coerces the input via `coerce_input`, runs the tool, and folds the
+`ToolResult` into a flat `ToolOutcome`. Because Rust has no ambient exception to
+swallow, the TS try/catch around `run` becomes a plain success path: a tool that
+wants to report a failure returns an `is_error` `ToolResult`. Outcome projection
+collapses content blocks into a single `output`: a lone `Text` becomes a bare
+JSON string, a lone `Json` becomes its raw value, and any mix is carried as a
+JSON array of `{ "kind": ..., ... }` objects so a richer host can re-expand it.
+
+## The Fs and Shell seams
+
+Tools receive abstract `Fs` and `Shell` traits through their `ToolContext` and
+**never** touch `std::fs`/`std::process` directly — so a host can swap in a
+sandboxed, remote, or in-memory backend invisibly. These are the only I/O seams a
+tool may use. Ported from `kernel/backends.ts`; only the traits live in the
+kernel, the concrete OS-backed impls are assembled in `backends/local.rs`.
+
+```rust
+#[async_trait]
+pub trait Fs: Send + Sync {
+    async fn read_text(&self, path: &str) -> io::Result<String>;
+    async fn read_bytes(&self, path: &str) -> io::Result<Vec<u8>>;
+    async fn write_file(&self, path: &str, data: &str) -> io::Result<()>;
+    async fn stat(&self, path: &str) -> io::Result<FsEntryInfo>;
+    async fn read_dir(&self, path: &str) -> io::Result<Vec<DirChild>>;
+    async fn mkdir(&self, path: &str, recursive: bool) -> io::Result<()>;
+    async fn rm(&self, path: &str, options: RemoveOptions) -> io::Result<()>;
+    async fn exists(&self, path: &str) -> bool;
+}
+
+#[async_trait]
+pub trait Shell: Send + Sync {
+    async fn exec(&self, command: &str, options: ShellExecOptions) -> io::Result<ShellExecResult>;
+    fn spawn(&self, command: &str, options: ShellLaunchOptions) -> io::Result<Box<dyn ShellHandle>>;
+}
+```
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `Fs` | trait | `kernel/backends.rs` | The only filesystem seam (8 async methods). Paths are plain strings the caller has already resolved against `cwd`; the backend does no path interpretation. |
+| `Shell` | trait | `kernel/backends.rs` | The only command seam: `exec()` (blocking, captured) + `spawn()` (background `ShellHandle`). |
+| `FsEntryInfo` | struct | `kernel/backends.rs` | `stat()` result: `is_file`/`is_directory`/`is_symlink`/`size`/`modified_ms`. `modified_ms` is the parity-critical field the gate floors. |
+| `DirChild` | struct | `kernel/backends.rs` | `read_dir()` entry: `name` + `is_directory`. |
+| `RemoveOptions` | struct | `kernel/backends.rs` | `rm` options: `recursive`, `ignore_missing`. |
+| `ShellLaunchOptions` | struct | `kernel/backends.rs` | Shared spawn/exec settings: `cwd`, `env` (overlay merged onto the inherited env). |
+| `ShellExecOptions` | struct | `kernel/backends.rs` | `exec()` extras: `launch` + `timeout_ms` + `input` (piped to stdin). |
+| `ShellExecResult` | struct | `kernel/backends.rs` | Settled `exec()` result: `stdout`, `stderr`, `code` (`None` when signalled). |
+| `ShellHandle` | trait | `kernel/backends.rs` | A spawned process: `pid()`, `kill(signal)`, `on_exit(listener) -> unsubscribe`. The exit listener fans the single close event to any number of subscribers; a late subscriber to an already-finished process still hears about it. |
+
+## Output budgeting
+
+Tool output is fed to a model with a finite context, so a single tool must never
+return an unbounded blob. `OutputBudget` describes a windowing policy and `clamp`
+applies it. Ported from `kernel/output.ts`.
+
+```rust
+pub enum ClipEnd { Head, Tail, Middle }
+
+pub struct OutputBudget {
+    pub kind: ClipEnd,
+    pub max_bytes: usize,
+    pub notice: Option<Arc<dyn Fn(usize) -> String + Send + Sync>>,
+}
+
+pub fn clamp(text: &str, policy: &OutputBudget) -> String;
+pub fn default_notice(omitted: usize) -> String;
+```
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `OutputBudget` | struct | `kernel/output.rs` | A request to bound a string's UTF-8 byte length: `kind` (head/tail/middle), `max_bytes`, optional `notice` callback. `Clone`-able + `Send + Sync` (the notice is an `Arc<dyn Fn>`). Constructors `new`/`with_notice`. |
+| `clamp` | fn | `kernel/output.rs` | Bound text to a budget, splicing in a notice where bytes were dropped. Under budget ⇒ returned untouched. |
+| `ClipEnd` | enum | `kernel/output.rs` | `Head` / `Tail` / `Middle` — which slice of an over-budget string survives. |
+| `default_notice` | fn | `kernel/output.rs` | The default marker when a budget omits its notice: byte-exact with the TS `\n… trimmed {n} byte{s} to fit the window …\n`. |
+
+All measurement is in UTF-8 **bytes**, and every cut is snapped to a character
+boundary (via `str::is_char_boundary`) so a multibyte sequence is never sliced in
+half. The TS original walked UTF-16 surrogate pairs to find those boundaries; the
+Python port proved that slicing the encoded bytes and backing off over
+`0b10xxxxxx` continuation bytes yields the same window — and Rust `&str` is
+guaranteed valid UTF-8, so the byte view is sliced directly. A `Middle` clamp
+splits the budget across both ends and drops the center band; on a short input
+where the two windows would overlap, the text is returned untouched. The default
+supplied by `make_local_context` is a 64 KiB `Middle`-clamp (see
+[The local backend](#the-local-backend)).
+
+## The two outward contracts
+
+Capabilities sits between two outward contracts it imports rather than redefines.
+In the TS ground truth these live in `runtime/contract/tools.ts` (`ToolCall` /
+`ToolOutcome` / `ToolBox` / `ToolRunner`) and `llmgateway/contract/conversation.ts`
+(`ToolDescriptor` / `JsonSchema`) and are imported, never redefined. To keep the
+layer dependency-light, the boundary shapes are re-derived byte-for-byte: the four
+pure data shapes (`JsonSchema`/`ToolDescriptor`/`ToolCall`/`ToolOutcome`) live in
+`kernel/contract.rs`, while the dispatch machinery they pair with
+(`ToolBox`/`ToolRunner`/`ContextFactory`/`CapabilityError`) lives in
+`kernel/registry.rs`. They are structurally identical so a later refactor can swap
+them for the sibling-module types without changing a single tool.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `JsonSchema` | type alias | `kernel/contract.rs` | `serde_json::Value` (always a JSON object in practice). Each tool's `parameters()` is a `serde_json::json!({...})` literal reproducing the TS schema exactly. |
+| `ToolDescriptor` | struct | `kernel/contract.rs` | The model-facing advertisement: `name`, `description`, `parameters`. Produced by `DefinedTool::descriptor()`. |
+| `ToolCall` | struct | `kernel/contract.rs` | A single request to invoke a named tool, parsed from the model: `id`, `name`, `input`. |
+| `ToolOutcome` | struct | `kernel/contract.rs` | The flat result of running one call: `id`, `output` (a projected `ToolResult`), `is_error`. |
+| `ToolBox` | struct | `kernel/registry.rs` | Bundles the descriptor catalog the model sees with the `runner` that fulfils it. |
+| `ToolRunner` | trait | `kernel/registry.rs` | The injectable executor: `async fn run(call, cancel) -> ToolOutcome`. |
+| `ContextFactory` | type alias | `kernel/registry.rs` | `Arc<dyn Fn() -> ToolContext + Send + Sync>` — supplies a fresh context per dispatch. |
+| `CapabilityError` | enum | `kernel/registry.rs` | `UnknownTool(name)` / `UnknownCollection(name)` (a `thiserror::Error`); `Display` reproduces the TS strings verbatim — `No tool named "X" is registered.` / `No collection named "X" is registered.` |
+
+These boundary types parallel the [Runtime](/rust/subsystems/runtime) and
+[LLM Gateway](/rust/subsystems/llm-gateway) surfaces (see the
+[Python parity](/python/subsystems/capabilities) note on the same split).
+
+## The built-in tools
+
+Eleven capabilities — **twelve** registered `DefinedTool` objects, because `todo`
+is two tools (`todo_set` + `todo_read`). Each is produced by a free constructor
+fn returning a `DefinedTool`. Each tool does its own permissive argument parse,
+emitting a model-readable `is_error` `ToolResult` on a bad request rather than
+throwing.
+
+| Tool name | Constructor | Source | Purpose |
+|-----------|-------------|--------|---------|
+| `read` | `read_tool()` | `files/read.rs` | UTF-8 file contents with a right-aligned 6-wide line-number gutter, 1-based `offset`/`limit` windowing, budget-clamped. Records read-state if a gate handle is present. |
+| `write` | `write_tool()` | `files/write.rs` | Create/overwrite a UTF-8 file, materializing missing parent directories; reports the byte count written. Honors the gate for an existing file (a new file is exempt). |
+| `edit` | `edit_tool()` | `files/edit.rs` | Replace an exact-or-whitespace-fuzzy snippet (`oldText`/`newText`), returning a unified diff (text summary + JSON block); `replaceAll` supported. |
+| `ls` | `ls_tool()` | `files/ls.rs` | List a directory's immediate children with kind/size columns; directories first, dot-entries hidden unless `showHidden`. |
+| `grep` | `grep_tool()` | `search/grep.rs` | Regex content search recursively over a tree (skipping `.git`/`node_modules`), hit-capped and budget-clamped; each hit is `path:line: text`. |
+| `find` | `find_tool()` | `search/find.rs` | Filename search by glob (`*`/`?`, anchored case-insensitive) or substring, with an optional `file`/`dir` kind filter; results root-relative. |
+| `bash` | `bash_tool()` | `shell/bash.rs` | Run one command to completion via `Shell::exec`, with `timeoutMs` (10-minute ceiling, 2-minute default) and `cwd`; non-zero/signalled exit flags the result as an error. |
+| `process` | `process_tool()` | `shell/process.rs` | `start`/`list`/`poll`/`stop` long-lived background jobs whose output is captured to scratch files under `.indus-process/`. |
+| `todo_set` | `todo_set_tool()` | `planning/todo.rs` | Replace the entire per-context checklist in one shot (send `[]` to clear). |
+| `todo_read` | `todo_read_tool()` | `planning/todo.rs` | Play back the stored checklist; read-only. |
+| `websearch` | `web_search_tool()` | `web/websearch.rs` | POST a query to DuckDuckGo's HTML endpoint via `reqwest`, scrape ranked `{ title, url, snippet }` hits (text + JSON blocks). |
+| `webfetch` | `web_fetch_tool()` | `web/webfetch.rs` | GET an absolute http(s) URL, simplify HTML to reading-friendly text, byte-cap both the raw body and the rendered output. |
+
+Supporting state and test helpers:
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `reset_process_table` | fn | `shell/process.rs` | Clear the global background-job registry (test setup/teardown). |
+| `reset_todos` | fn | `planning/todo.rs` | Wipe every stored checklist (test isolation). |
+| `TodoItem` | struct | `planning/todo.rs` | One checklist line: `id`, `text`, `status`. |
+| `TodoStatus` | enum | `planning/todo.rs` | `Pending` / `Active` / `Done`; rendered as `[ ]`/`[~]`/`[x]`. |
+
+### files: read
+
+`read` stats the target (rejecting directories and non-files), loads it as UTF-8
+through `Fs::read_text`, splits into lines without inventing a trailing empty
+line, applies the 1-based `offset`/`limit` window, stamps a 6-wide right-aligned
+line-number gutter, and clamps to the context budget with a `read:`-prefixed
+notice. A header explains the exact view (`Showing lines N–M of T`, remaining-line
+hints, and a byte-trim note). Numeric fields are parsed defensively
+(`read_positive_int`): a finite positive integer or absent, anything else a
+descriptive failure. After a successful read it records read-state via the gate
+(a no-op when no handle is injected).
+
+### files: write
+
+`write` validates a non-empty `path` and coerces `content` (an absent body is an
+empty file). When a gate handle is present and the file already exists, it
+enforces the read-before-edit gate (overwriting counts as a mutation; a new file
+is exempt via the ENOENT bypass). It then materializes the parent directory
+(`Fs::mkdir` recursive), writes, refreshes recorded read-state, and reports
+`Saved {bytes} {byte|bytes} to {path}.` measured in UTF-8 bytes.
+
+### files: edit
+
+`edit` is strict-by-default snippet replacement. After confirming the file exists
+and is a regular file and clearing the gate, it reads the text and runs two
+stages. Stage 1 is exact literal matching: if `oldText` appears once it is
+replaced; if it appears more than once, the edit is refused unless `replaceAll` is
+set. Stage 2 is a single whitespace-fuzzy fallback (`find_fuzzy_spans`) only when
+no literal match exists — it compares canonicalized whitespace (every run
+collapsed to one space, ends trimmed) over char-indexed windows, returning
+byte-offset spans rebuilt back-to-front so earlier offsets stay valid. Identical
+`oldText`/`newText`, an empty `oldText`, or a zero-change result are all refused.
+Success returns a text summary plus a JSON block `{ path, replacements, diff }`,
+where `diff` is `render_unified_diff` clamped to a 16 KB middle window.
+
+### files: ls
+
+`ls` stats each child for kind + size, sorts directories before files then
+case-insensitive name (case-sensitive tiebreak), hides dot-entries unless
+`showHidden`, and renders aligned `kind  size  name/` rows (directories get a
+trailing `/`, directory sizes shown as 0). It clamps to the budget with an
+`ls:`-prefixed notice and prepends a header reporting the entry count and any
+hidden-entries-omitted note.
+
+### search: grep
+
+`grep` walks the tree beneath `path` (default `cwd`) via a hand-rolled recursive
+descent over `Fs`, visiting children in name-sorted order and pruning `.git`/
+`node_modules`. Files over 2 MiB are skipped, and a NUL-sniff over the opening
+4 KiB skips binary files. Each matching line becomes `path:line: text`. The hit
+cap defaults to 200 and is clamped to an absolute ceiling of 5000. Cancellation
+is observed at the top of both the directory loop and the per-line loop. See the
+[regex dialect caveat](#notable-behaviors-and-parity-caveats) for flag handling.
+
+### search: find
+
+`find` walks the tree (same prune set) and matches entry *names*. A query
+containing `*` or `?` is compiled to an anchored, case-insensitive glob regex
+(`*`→`.*`, `?`→`.`, with regex metacharacters in the literal portions escaped);
+otherwise it is a case-insensitive substring. An optional `type` of `"file"` or
+`"dir"` filters by kind. Unlike `grep`, `find` exposes no per-call cap: the result
+ceiling is a fixed `min(DEFAULT_RESULT_CAP=500, ABSOLUTE_RESULT_CAP=10000)` = 500.
+Results are rendered relative to the search root (`.` for the root itself), and
+cancellation is polled at the top of both walk loops.
+
+### shell: bash
+
+`bash` parses `command` (non-empty), an optional `timeoutMs` (positive finite,
+floored, pinned to the 10-minute ceiling), and an optional `cwd`. It races the
+context's cancel token against `Shell::exec` so a mid-run abort returns promptly
+as a typed error. The exec backend enforces the wall-clock deadline. The report
+stitches `stdout:`/`stderr:` sections plus a `status:` line; a `code != Some(0)`
+(non-zero or signalled) marks the whole result `is_error`.
+
+### shell: process
+
+`process` is a controller for long-lived commands with four verbs (`start` /
+`list` / `poll` / `stop`) over a module-global `ProcessTable` (`LazyLock`,
+`parking_lot::Mutex`), job ids `job-1`, `job-2`, …. `start` wraps the command to
+redirect both streams into per-job scratch files under `.indus-process/`
+(`( cmd ) >out 2>err` with POSIX single-quoting), spawns it via `Shell::spawn`,
+and registers an exit listener that freezes the final code/signal onto shared
+atomics. `poll` reads each capture file from the last byte cursor onward
+(`Fs::read_bytes`, decoded lossily so a mid-rune cursor never panics), advances
+the cursor, and returns a 32 KiB tail-clamped window plus the live status.
+`list` snapshots every job with an age; `stop` kills a running job and drops it.
+Lifecycle state and exit code live in atomics (`STATE_RUNNING`/`STATE_FINISHED`,
+an `i64::MIN` sentinel for a null code) so the exit listener can flip them from
+another thread without locking the table.
+
+### planning: todo
+
+The `todo` pair shares one module-global `TodoStore` (`LazyLock`) keyed by
+`ToolContext::context_id`, so each conversation threads a distinct context and
+gets an isolated list. `todo_set` validates an `items` array — each entry needs a
+non-empty `id` and `text` and a `status` of `pending`/`active`/`done`; duplicate
+ids are rejected, the first malformed item aborts — then replaces the whole list.
+`todo_read` renders the stored list as a compact checklist (`[ ]`/`[~]`/`[x]`)
+with a one-line tally and changes nothing. `reset_todos()` clears all lists.
+
+### web: websearch and webfetch
+
+Both web tools never let a network failure escape as an `Err` — every thrown
+fetch, non-OK status, timeout, or unparseable body becomes an `is_error`
+`ToolResult`. `websearch` POSTs the query to `https://html.duckduckgo.com/html/`
+(form-encoded, with a desktop User-Agent and a 10 s timeout), scrapes the result
+anchors and snippet blocks with targeted RE2 regexes, unwraps DuckDuckGo's
+`uddg=` redirect links (percent-decoded), dedupes by URL, caps the count
+(default 5, max 25), and returns a rendered text block plus a JSON array of
+`{ title, url, snippet }`. `webfetch` validates an absolute http/https URL
+(via the `url` crate), GETs it with a 30 s timeout, clips the raw body to an
+effective ceiling (default 1 MiB, absolute 5 MiB), sniffs the content type to
+decide whether to run the HTML simplifier (`html_to_text` — drops script/style/
+head/svg/etc. regions, turns anchors into `text (url)`, headings into ATX lines,
+list items into `- `, decodes a small named-entity set plus numeric references,
+and tidies whitespace), then clamps to the context budget with explanatory
+header notes.
+
+## The read-before-edit gate
+
+A small discipline shared by `read`, `edit`, and `write`, active **only** when a
+host has stashed a `ReadStateHandle` on `ctx.framework.read_state`. With no handle
+present every helper here is a no-op (the mechanism is purely additive). Ported
+from `files/read-state-gate.ts`.
+
+```rust
+pub enum GateOutcome { Ok, Refused(String) }
+
+pub async fn enforce_read_gate(
+    ctx: &ToolContext,
+    abs_path: &str,
+    handle: Option<&Arc<dyn ReadStateHandle>>,
+) -> GateOutcome;
+```
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `enforce_read_gate` | fn | `files/read_state_gate.rs` | Refuse a mutation when the path was never read this session, or when its on-disk mtime advanced OR its byte size changed. A stat failure clears the gate (ENOENT bypass) so the tool reports its own error. |
+| `record_read_state` | fn | `files/read_state_gate.rs` | Record/refresh the per-file state from a fresh stat, flooring `mtime_ms` to a whole millisecond so sub-ms skew can't trip staleness. A failed stat is swallowed. |
+| `get_read_state_handle` | fn | `files/read_state_gate.rs` | Pull the handle off the context, or `None`. |
+| `GateOutcome` | enum | `files/read_state_gate.rs` | `Ok` or `Refused(message)`. |
+| `READ_BEFORE_EDIT_MESSAGE` | const | `files/read_state_gate.rs` | `File has not been read yet. Read it first before writing to it.` |
+| `MODIFIED_SINCE_READ_MESSAGE` | const | `files/read_state_gate.rs` | The byte-stable staleness refusal: `File has been modified since read, either by the user or by a linter. Read it again before attempting to write it.` |
+
+## The Myers diff
+
+`edit` builds its unified-diff output from a from-scratch Myers line diff (the
+`similar`/`diffy` crates are deliberately *not* used — the edit tests assert exact
+hunk content like `-two`, `+TWO`, `@@`). Ported verbatim from `files/diff.ts`.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `diff_lines` | fn | `files/diff.rs` | Myers O(ND) line diff → `LineDiff` (ops + added/removed tallies). |
+| `render_unified_diff` | fn | `files/diff.rs` | Render before/after as `@@`-hunk unified diff; `context` lines frame each hunk; identical blobs → empty string. |
+| `DiffOp` | struct | `files/diff.rs` | One line op: `kind`, `text` (newline stripped), `before_line`, `after_line`. |
+| `DiffOpKind` | enum | `files/diff.rs` | `Keep` / `Add` / `Remove`. |
+| `LineDiff` | struct | `files/diff.rs` | `diff_lines` outcome: `ops` + `added` + `removed`. |
+| `DEFAULT_CONTEXT` | const | `files/diff.rs` | `3` — the TS default context width. |
+
+The core is Myers' greedy shortest-edit-script search (`compute_trace` snapshots
+the `v` frontier at each edit depth; `backtrack` walks those snapshots backward to
+recover the ordered ops), then `build_hunks` groups consecutive changes with up to
+`context` surrounding keep lines. `split_lines` is newline-agnostic (`\r\n` and
+`\n` both terminate; a trailing newline does not add a phantom line; empty input
+yields a single empty line).
+
+## Registry and collections
+
+A `ToolRegistry` is an ordered catalog of tools plus named *collections* that
+group them. Its payoff is `to_tool_box`, which turns a collection into a runnable
+`ToolBox`. Ported from `kernel/registry.ts` and `capabilities/registry.ts`. The
+registry is backed by `IndexMap` so registration/insertion order is preserved —
+load-bearing for the `all` collection.
+
+```rust
+pub fn builtin_registry() -> ToolRegistry;
+pub fn tool_box(collection: ToolCollection, cwd: Option<String>) -> ToolBox;
+pub fn try_tool_box(collection_name: &str, cwd: Option<String>) -> Result<ToolBox, CapabilityError>;
+```
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `ToolRegistry` | struct | `kernel/registry.rs` | Mutable catalog of tools + named collections, backed by two `IndexMap`s. Methods: `new`, `register`, `register_all`, `has`, `get`, `names`, `collection`, `members_of`, `collection_names`, `to_tool_box`. A later `register` under the same name replaces the prior tool. |
+| `builtin_registry` | fn | `registry.rs` | Mint a fresh registry with all 12 tools registered and the three standard collections defined. |
+| `tool_box` | fn | `registry.rs` | One-call helper: a runnable `ToolBox` for a `ToolCollection`, backed by local fs/shell rooted at `cwd` (defaults to the process cwd). Panics on the impossible unknown-collection case. |
+| `try_tool_box` | fn | `registry.rs` | Like `tool_box` but surfaces `CapabilityError` for an unknown collection name. |
+| `ToolCollection` | enum | `registry.rs` | `ReadOnly` / `Coding` / `All`; `name()` yields `"read-only"`/`"coding"`/`"all"`. |
+| `READ_ONLY_NAMES` | const | `registry.rs` | `["read", "ls", "grep", "find", "websearch", "webfetch"]`. |
+| `MUTATING_NAMES` | const | `registry.rs` | `["write", "edit", "bash", "todo_set", "todo_read", "process"]`. |
+
+The three standard collections:
+
+| Collection | Members |
+|------------|---------|
+| `read-only` | `read`, `ls`, `grep`, `find`, `websearch`, `webfetch` — observe the workspace and the web; safe when no mutation should be possible. |
+| `coding` | `read-only` plus `write`, `edit`, `bash`, `todo_set`, `todo_read`, `process`. |
+| `all` | Every registered tool, in registration order. |
+
+At dispatch time the registry's `RegistryRunner` looks up the tool by `call.name`
+(an unknown name returns a typed `is_error` outcome, `This session exposes no tool
+called "X".`), mints a fresh context via the `ContextFactory`, threads the
+dispatch cancel token in via `with_cancel`, and calls `tool.invoke`.
+
+## The local backend
+
+`backends/local.rs` is the single sanctioned OS binding. Nothing above this layer
+touches platform modules directly. Ported from `backends/node-backends.ts`.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `LocalFs` | struct | `backends/local.rs` | `Fs` wired to `tokio::fs`. `stat` detects a symlink before following it; `modified_ms` is epoch milliseconds. |
+| `LocalShell` | struct | `backends/local.rs` | `Shell` wired to `tokio::process` via `sh -c <cmd>`. `exec` drains stdout/stderr concurrently with the wait (no full-pipe deadlock), enforces the deadline with `tokio::time::timeout` + `kill_on_drop`, and preserves a `None` code on a signalled exit. |
+| `LocalShellHandle` | struct | `backends/local.rs` | `ShellHandle` over a spawned child; a supervising Tokio task waits on the child and fans the single exit out to every subscriber. `kill` cancels the supervising wait (which terminates the child). |
+| `local_fs` | fn | `backends/local.rs` | A shared `Arc<dyn Fs>` (`LocalFs`). |
+| `local_shell` | fn | `backends/local.rs` | A shared `Arc<dyn Shell>` (`LocalShell`). |
+| `standard_budget` | fn | `backends/local.rs` | The kernel's default ceiling: a `Middle`, 64 KiB clamp whose notice reads `\n[{n} bytes elided to stay within the output ceiling]\n`. |
+| `make_local_context` | fn | `backends/local.rs` | Assemble a `ToolContext` from a `cwd` plus `local_fs`/`local_shell`, defaulting the cancel token to a never-firing one, the budget to `standard_budget`, and the framework to empty. |
+
+## Using the suite
+
+A host wires up the whole suite with a single `tool_box(...)` call. The box
+advertises descriptors (what the model is shown) and dispatches each call through
+`box.runner.run`.
+
+```rust
+use indusagi::capabilities::{tool_box, ToolCollection, ToolCall};
+use indusagi::core::CancellationToken;
+use serde_json::json;
+
+# async fn demo() {
+let box_ = tool_box(ToolCollection::Coding, Some(".".to_string()));
+
+// Descriptors are what the model is shown.
+let names: Vec<String> = box_.descriptors().into_iter().map(|d| d.name).collect();
+
+let call = ToolCall {
+    id: "c1".to_string(),
+    name: "read".to_string(),
+    input: json!({ "path": "README.md", "limit": 20 }),
+};
+let outcome = box_.runner.run(call, CancellationToken::new()).await;
+assert!(!outcome.is_error);
+# }
+```
+
+To invoke a single tool directly, build a local context and call `invoke`:
+
+```rust
+use indusagi::capabilities::{edit_tool, make_local_context, ToolCall};
+use serde_json::json;
+
+# async fn demo() {
+let ctx = make_local_context("/tmp/project", None, None, None);
+let call = ToolCall {
+    id: "e1".to_string(),
+    name: "edit".to_string(),
+    input: json!({
+        "path": "main.rs",
+        "oldText": "println!(\"hi\")",
+        "newText": "println!(\"hello\")",
+    }),
+};
+let outcome = edit_tool().invoke(call, &ctx).await;
+println!("{}", outcome.output); // text summary, or a block array incl. the unified diff
+# }
+```
+
+The diff helpers and `clamp` are usable without any filesystem:
+
+```rust
+use indusagi::capabilities::{render_unified_diff, clamp, OutputBudget, ClipEnd};
+use indusagi::capabilities::files::diff_lines;
+
+let before = "a\nb\nc\n";
+let after = "a\nB\nc\nd\n";
+let d = diff_lines(before, after);
+println!("{} {}", d.added, d.removed);               // tallies
+println!("{}", render_unified_diff(before, after, 3)); // @@ ... @@ / + / -
+
+let big = "x".repeat(100_000);
+let out = clamp(&big, &OutputBudget::new(ClipEnd::Middle, 64 * 1024));
+assert!(out.len() <= 64 * 1024 + 256);               // bounded; a notice spliced at the cut
+```
+
+## Authoring a custom tool
+
+Implement `Tool` (only `run` carries logic); `define_tool` supplies descriptor,
+input coercion, cancellation, and outcome projection. Register the result and box
+a collection over it.
+
+```rust
+use std::sync::Arc;
+use async_trait::async_trait;
+use serde_json::{json, Value};
+use indusagi::capabilities::{
+    define_tool, Tool, ToolResult, ToolContext, JsonSchema, ToolRegistry,
+    make_local_context,
+};
+
+struct Greet;
+
+#[async_trait]
+impl Tool for Greet {
+    fn name(&self) -> &str { "greet" }
+    fn description(&self) -> &str { "Say hello to someone." }
+    fn parameters(&self) -> JsonSchema {
+        json!({ "type": "object", "properties": { "name": { "type": "string" } } })
+    }
+    async fn run(&self, input: Value, _ctx: &ToolContext) -> ToolResult {
+        let name = input.get("name").and_then(Value::as_str).unwrap_or("world");
+        ToolResult::text(format!("hello {name}"))
+    }
+}
+
+# fn build() {
+let greet = define_tool(Arc::new(Greet));
+let mut reg = ToolRegistry::new();
+reg.register(greet);
+reg.collection("mine", &["greet"]).unwrap();
+let factory = Arc::new(|| make_local_context(".", None, None, None));
+let box_ = reg.to_tool_box(factory, Some("mine")).unwrap();
+assert_eq!(box_.descriptors()[0].name, "greet");
+# }
+```
+
+Because `DefinedTool` also carries a facade-compatible `execute()` surface, the
+same defined tool drops straight into the higher-level agent surface.
+
+## Relationship to neighbors
+
+Capabilities sits between two outward contracts it imports rather than redefines:
+
+- The [Runtime](/rust/subsystems/runtime)'s `ToolCall`/`ToolOutcome`/`ToolBox`/
+  `ToolRunner`. `DefinedTool::invoke()` produces the runtime's outcome;
+  `ToolRegistry::to_tool_box` returns a runtime-shaped `ToolBox`.
+- The [LLM Gateway](/rust/subsystems/llm-gateway)'s `ToolDescriptor`/`JsonSchema`.
+  `DefinedTool::descriptor()` produces the model-facing advertisement.
+
+It depends on [`core::CancellationToken`](/rust/subsystems/core) for cooperative
+cancellation and `core::now_ms` for the wall clock the gate, process table, and
+job bookkeeping share. For how these layers compose, see the
+[Architecture](/rust/architecture) overview; for the structurally identical
+sibling editions, see [Capabilities (Python)](/python/subsystems/capabilities).
+
+## Notable behaviors and parity caveats
+
+- **Eleven capabilities, twelve tool objects.** The `todo` capability is two
+  tools (`todo_set` + `todo_read`); the "eleven" count treats todo as one
+  capability.
+- **Regex dialect (grep / find).** Rust's `regex` crate is RE2-style: **no
+  lookaround, no backreferences**, and flags are inline (`(?i)`/`(?m)`/`(?s)`)
+  rather than trailing letters. `grep` keeps the JS `[gimsuy]` accept-set and the
+  verbatim error string, then translates `i`→`(?i)`, `m`→`(?m)`, `s`→`(?s)`;
+  `g`, `y`, `u` are accepted-and-ignored (the matcher is stateless and UTF-8 by
+  default). A lookaround/backref pattern returns a clean `Could not compile the
+  search pattern: …` error rather than crashing.
+- **Cooperative cancel, never a panic.** `DefinedTool::invoke` runs a pre-flight
+  cancel check; `bash`/`websearch`/`webfetch` race the cancel token against their
+  I/O with `tokio::select!`; `grep`/`find` poll cancellation in their walk loops.
+  A cancel always becomes a typed `is_error` outcome.
+- **No exception folding.** Rust has no ambient throw to swallow, so a tool that
+  fails returns an `is_error` `ToolResult` directly; the kernel keeps a parity
+  helper (`describe_throw`) for any future error-folding path.
+- **`edit` matching.** Strict literal first (must be unique unless `replaceAll`),
+  then a single whitespace-fuzzy fallback via canonicalized-whitespace comparison;
+  identical `oldText`/`newText` or zero-change results are refused. The diff is
+  clamped to 16 KB.
+- **`bash` timeout.** `timeoutMs` is pinned to a 10-minute ceiling and defaults to
+  2 minutes; the deadline is enforced in `LocalShell::exec` via
+  `tokio::time::timeout` + `kill_on_drop`.
+- **`process` table is module-global on purpose.** A job started in one call must
+  be pollable later; captures are written to a `.indus-process/` scratch dir under
+  `cwd` with a 32 KiB tail window per poll, and a mid-rune byte cursor decodes
+  lossily so a poll never panics.
+- **Web tools never raise.** Both scrape/fetch over `reqwest` with bounded
+  timeouts; every network failure (thrown send, non-OK status, timeout, decode
+  error, empty body) is returned as an `is_error` `ToolResult`.
+- **Stable error strings.** Refusal/error wording is kept byte-stable with the TS
+  ground truth (`CapabilityError::Display`, the gate messages, the cancel
+  pre-flight string) so transcripts and tests match across editions.
+- **UTF-8-safe budgeting.** `clamp` measures in bytes and snaps every cut to a
+  `str::is_char_boundary`, so a multibyte rune is never split; an over-short
+  `Middle` window returns the text untouched.

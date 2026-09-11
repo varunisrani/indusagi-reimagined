@@ -1,0 +1,110 @@
+# Package Exports
+
+`indusagi/package.json` defines the public entrypoints consumers may import. The package is ESM only;
+`"main"` is `./dist/index.js` and `"types"` is `./dist/types/index.d.ts`. Every export below resolves
+to a bundled `dist/*.js` (built by `node build.mjs`) with declarations under `dist/types/`.
+
+## Table of Contents
+
+- [Root namespaces](#root-namespaces)
+- [Capability-layer subpaths](#capability-layer-subpaths)
+- [TUI and React subpaths](#tui-and-react-subpaths)
+- [Facade subpaths](#facade-subpaths)
+- [The complete exports map](#the-complete-exports-map)
+
+## Root namespaces
+
+The root entry (`.` -> `dist/index.js`, source `src/index.ts`) re-exports each capability layer as a
+namespace and a `VERSION` constant:
+
+```ts
+import { gateway, runtime, capabilities, interop, saas, swarm, smithy, tracing, shell, VERSION } from "indusagi";
+```
+
+| Namespace | Re-exports | Source |
+|-----------|------------|--------|
+| `gateway` | `src/llmgateway/index.ts` | `src/llmgateway` |
+| `runtime` | `src/runtime/index.ts` | `src/runtime` |
+| `capabilities` | `src/capabilities/index.ts` | `src/capabilities` |
+| `interop` | `src/interop/index.ts` | `src/interop` |
+| `saas` | `src/connectors-saas/index.ts` | `src/connectors-saas` |
+| `swarm` | `src/swarm/index.ts` | `src/swarm` |
+| `smithy` | `src/smithy/index.ts` | `src/smithy` |
+| `tracing` | `src/tracing/index.ts` | `src/tracing` |
+| `shell` | `src/shell-app/index.ts` | `src/shell-app` |
+
+Note that the root namespace is `saas` even though its subpath is `./connectors-saas`, and the root
+namespace is `shell` even though its subpath is `./shell-app`. `VERSION` is exported as a string
+constant from `src/index.ts`.
+
+## Capability-layer subpaths
+
+Each layer is also importable directly. The subpath names match the source directory, except
+`saas`/`shell` (see above).
+
+| Subpath | Source dir | Selected exports |
+|---------|-----------|------------------|
+| `indusagi/llmgateway` | `src/llmgateway/index.ts` | `stream`, `complete`, `streamWithCard`, `completeWithCard`, `MODEL_CARDS`, `models`, `getCard`, `estimateCost`, `CardSelection`, `CONNECTOR_REGISTRY`, `connectorForApi`, plus the type contract |
+| `indusagi/runtime` | `src/runtime/index.ts` | `createAgent`, `step` (alias of `cadence`), `cadence`, `initialSnapshot`, `runError`; types `Agent`, `AgentConfig`, `RunSnapshot`, `RunEvent`, `ToolBox`, `ToolRunner`, `ToolCall`, `ToolOutcome`, `RunError`, `ModelInvoker` |
+| `indusagi/capabilities` | `src/capabilities/index.ts` | `defineTool`, `ToolRegistry`, the twelve tools (`readTool`, `writeTool`, `editTool`, `lsTool`, `grepTool`, `findTool`, `bashTool`, `processTool`, `todoSetTool`, `todoReadTool`, `webSearchTool`, `webFetchTool`), `nodeFs`, `nodeShell`, `makeNodeContext`, `builtinRegistry`, `toolBox`, `TodoStore` |
+| `indusagi/interop` | `src/interop/index.ts` | `createServerEndpoint`, `startServerFleet`, `mountProtocolBridge`, `createProviderHost`, `ProtocolFault`, `qualifyToolName`, `normalizeSchema`; types `ServerEndpoint`, `ServerFleet`, `ProviderHost`, `ServerConfig`, `RemoteTool` |
+| `indusagi/connectors-saas` | `src/connectors-saas/index.ts` | `createSaasGateway`, `createComposioGateway`, `createComposioBackend`, `ComposioBackendError`, `ScopePlanner`; types `SaasGateway`, `SaasBackend`, `ToolkitInfo`, `ConnectedAccount` |
+| `indusagi/swarm` | `src/swarm/index.ts` | `createCrew`, `Crew`, `defaultSpawnAgent`, `CrewManifest`, `TicketBoard`, `Channel`, `Workspace`, `ActivityLog`, `JsonCell`, `JsonlLog`, `newId`, `SwarmFault` |
+| `indusagi/smithy` | `src/smithy/index.ts` | `Forge`, `createForge`, the `config`/`persona`/`knowledge`/`runtime`/`ui` barrels (e.g. `defineAgent`, `PROFILES`, `loadKnowledge`, `ToolLedger`, `ForgeView`) |
+| `indusagi/tracing` | `src/tracing/index.ts` | the `signal`, `channel`, `redaction`, `sinks`, `recorder`, `registry`, and `adapter` barrels (e.g. `Recorder`, `TelemetryHub`, `SecretScrubber`, `traceAgentRun`, `NOOP_HANDLE`) |
+| `indusagi/shell-app` | `src/shell-app/index.ts` | `main`, `buildBootContext`, `renderUsage`, `resolveVersion`, `OneShotRunner`, `WireRunner`, `ReplRunner`, `selectRunner`, `tokenizeInvocation`, `FLAG_SPECS`, `loadSettings`, `Locator`, `BRAND`, `runAuthCommand` |
+
+## TUI and React subpaths
+
+| Subpath | dist target | Source dir | Notes |
+|---------|-------------|-----------|-------|
+| `indusagi/tui` | `dist/tui.js`, types `dist/types/ui/index.d.ts` | `src/ui/index.ts` | TUI primitives: `Key`/`parseKey`/`matchesKey`, editor keybindings (`EditorKeybindingsManager`, `DEFAULT_EDITOR_KEYBINDINGS`), `CombinedAutocompleteProvider`, `fuzzyFilter`/`fuzzyMatch`, width helpers (`truncateToWidth`, `visibleWidth`, `wrapTextWithAnsi`); types `Component`, `TUI`, `EditorTheme` |
+| `indusagi/react-ink` | `dist/react-ink.js`, types `dist/types/react-ink/index.d.ts` | `src/react-ink/index.ts` | Ink components: message rows, dialogs (`LoginDialog`, `ModelDialog`, `ThemeDialog`, …), `ToolEventBlock`, `MessageList`, the markdown renderers (`Markdown`, `StreamingMarkdown`, `MarkdownTable`), and the diff renderers (`Diff` and helpers), plus `theme-adapter` |
+| `indusagi/react-host` | `dist/react-host/index.js`, types `dist/types/react-host/index.d.ts` | `src/react-host/index.ts` | The host-React loader: re-exports `Fragment`, `createElement`, `useEffect`, `useMemo`, `useState` and the default React from `loadHostReact()` |
+| `indusagi/react-host/ink` | `dist/react-host/ink.js` | `src/react-host/ink.ts` | The host's Ink binding |
+| `indusagi/react-host/jsx-runtime` | `dist/react-host/jsx-runtime.js` | `src/react-host/jsx-runtime.ts` | The JSX runtime for the host React |
+
+## Facade subpaths
+
+The facade subpaths are thin entrypoints that re-export larger internal modules under a friendly name.
+
+| Subpath | dist target | Source | Re-exports |
+|---------|-------------|--------|------------|
+| `indusagi/ai` | `dist/ai.js`, types `dist/types/facade/ai.d.ts` | `src/facade/ai.ts` -> `src/facade/ml/index.ts` | The model layer: provider adapters (anthropic, google, openai-completions/responses, bedrock, azure, kimi, nvidia, …), the api/env-key registries, the generated model catalog, `stream`, and the `kit` helpers |
+| `indusagi/agent` | `dist/agent.js`, types `dist/types/facade/agent.d.ts` | `src/facade/agent.ts` -> `src/facade/bot/index.ts` | The bot loop: `agent`, `agent-loop`, `proxy`, `messages`, the `session-manager`, and the `actions` registry |
+| `indusagi/mcp` | `dist/mcp.js`, types `dist/types/facade/mcp.d.ts` | `src/facade/mcp.ts` -> `src/facade/mcp-core/index.ts` | The MCP client/server: `MCPClient`, `MCPClientPool`, `MCPServer`/`createMCPServer`, `loadMCPConfig`, `registerMCPToolsInRegistry`, `initializeMCP`, schema converters, errors, and config helpers |
+| `indusagi/memory` | `dist/memory.js`, types `dist/types/facade/memory.d.ts` | `src/facade/memory.ts` | A phantom facade: `src/facade/memory.ts` is `export {}` (consumers import a JSDoc-only type) |
+
+The `indusagi/interop` subpath and the `indusagi/mcp` facade both speak the Model Context Protocol,
+but they are distinct surfaces: `interop` is the clean-room protocol bridge layer (`src/interop`),
+while the `mcp` facade re-exports the `src/facade/mcp-core` client/server stack.
+
+## The complete exports map
+
+Verbatim from `package.json` `"exports"`:
+
+| Specifier | `import` target | `types` target |
+|-----------|-----------------|----------------|
+| `indusagi` (`.`) | `./dist/index.js` | `./dist/types/index.d.ts` |
+| `indusagi/llmgateway` | `./dist/llmgateway.js` | `./dist/types/llmgateway/index.d.ts` |
+| `indusagi/runtime` | `./dist/runtime.js` | `./dist/types/runtime/index.d.ts` |
+| `indusagi/capabilities` | `./dist/capabilities.js` | `./dist/types/capabilities/index.d.ts` |
+| `indusagi/interop` | `./dist/interop.js` | `./dist/types/interop/index.d.ts` |
+| `indusagi/connectors-saas` | `./dist/connectors-saas.js` | `./dist/types/connectors-saas/index.d.ts` |
+| `indusagi/swarm` | `./dist/swarm.js` | `./dist/types/swarm/index.d.ts` |
+| `indusagi/smithy` | `./dist/smithy.js` | `./dist/types/smithy/index.d.ts` |
+| `indusagi/tracing` | `./dist/tracing.js` | `./dist/types/tracing/index.d.ts` |
+| `indusagi/shell-app` | `./dist/shell-app.js` | `./dist/types/shell-app/index.d.ts` |
+| `indusagi/tui` | `./dist/tui.js` | `./dist/types/ui/index.d.ts` |
+| `indusagi/react-ink` | `./dist/react-ink.js` | `./dist/types/react-ink/index.d.ts` |
+| `indusagi/react-host` | `./dist/react-host/index.js` | `./dist/types/react-host/index.d.ts` |
+| `indusagi/react-host/ink` | `./dist/react-host/ink.js` | `./dist/types/react-host/ink.d.ts` |
+| `indusagi/react-host/jsx-runtime` | `./dist/react-host/jsx-runtime.js` | `./dist/types/react-host/jsx-runtime.d.ts` |
+| `indusagi/ai` | `./dist/ai.js` | `./dist/types/facade/ai.d.ts` |
+| `indusagi/agent` | `./dist/agent.js` | `./dist/types/facade/agent.d.ts` |
+| `indusagi/mcp` | `./dist/mcp.js` | `./dist/types/facade/mcp.d.ts` |
+| `indusagi/memory` | `./dist/memory.js` | `./dist/types/facade/memory.d.ts` |
+| `indusagi/package.json` | `./package.json` | — |
+
+The CLI binary `indusagi` is declared in `"bin"` and maps to `dist/cli.js`; it is not part of the
+`"exports"` map.

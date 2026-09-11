@@ -1,0 +1,236 @@
+# Architecture
+
+> `induscode` is the terminal-first AI coding-agent CLI for Python, layered entirely on top of the [indusagi framework](/python/architecture). The OS launches it through the `pindus` / `induscode` console scripts (`induscode.entry:run`); embedders reach the same subsystems via `import induscode`. This page maps how the agent's layers stack — entry → launch → boot → conductor → runtime, with the console as the UI and channels as the headless output.
+
+`induscode` is structured as a set of self-contained subsystem packages under `src/induscode/`, each with its own barrel `__init__.py` and a frozen `contract.py` of type-only shapes. The package is a thin product layer: it owns the seams a coding-agent session needs (transcript tree, auth vault, signal translation, capability deck, console shell) and composes the framework's published surfaces (LLM API, agent loop, TUI primitives, MCP client, tracing) for everything else.
+
+## Table of Contents
+
+- [The Layer Stack](#the-layer-stack)
+- [The Two Faces: barrel and bin](#the-two-faces-barrel-and-bin)
+- [Request Flow: entry to runtime](#request-flow-entry-to-runtime)
+- [The Boot Pipeline](#the-boot-pipeline)
+- [Runner Dispatch](#runner-dispatch)
+- [How a Session Is Assembled](#how-a-session-is-assembled)
+- [Subsystem Map](#subsystem-map)
+- [Where the Framework Begins](#where-the-framework-begins)
+
+## The Layer Stack
+
+A turn flows down through induscode's own layers and lands on the framework runtime. Reading top to bottom, the UI/output sits at the edge, the conductor is the product core, and the framework agent loop produces the actual assistant message.
+
+| Layer | Package | Role | Built on |
+|-------|---------|------|----------|
+| Process entry | `induscode.entry` | The `pindus` / `induscode` shim: installs the `[MCP]` log filter, runs `asyncio.run(boot(argv))`, adopts the exit code. | stdlib |
+| Launch | [`induscode.launch`](/python-cli/subsystems/launch) | The typed command-line layer: one declarative flag table, the argv reader, `@file` attachments, the model-catalog printer, the credential/package/OAuth commands, the resume picker. | framework AI + OAuth/PKCE |
+| Boot | [`induscode.boot`](/python-cli/subsystems/boot) | The bootstrap orchestrator: short-circuits credential/package/meta verbs, folds an immutable context through an ordered stage pipeline, dispatches to one of three runners, drains closables. | `induscode.workspace`, all subsystems |
+| Conductor | [`induscode.conductor`](/python-cli/subsystems/conductor) | The session core: wraps exactly one framework `Agent`, projects loop events into a stable `SessionSignal` stream, persists a branchable transcript, retries faults, condenses on overflow. | [framework agent](/python/facades/agent) |
+| Capabilities | [`induscode.capability-deck`](/python-cli/subsystems/capability-deck) | The tooling layer: assembles the `ToolDeck` the conductor consumes (`options.tools`); a `Capability` *is* a framework `AgentTool`. | [framework capabilities](/python/subsystems/capabilities) |
+| Console (UI) | [`induscode.console`](/python-cli/console/overview) | The interactive Textual product shell: pure reducer, intent table, theme engine, overlays, slash catalog, mounted via `mount_console`. | [framework react-ink](/python/ui/react-ink) |
+| Channels (output) | [`induscode.channels`](/python-cli/subsystems/channels) | The non-interactive surface: the oneshot text/NDJSON channel and the long-lived JSON-RPC link server. | conductor signals |
+| Runtime | [`indusagi.agent`](/python/facades/agent) / [`indusagi.ai`](/python/facades/ai) | The raw LLM conversation loop, model client, and content/message types the conductor drives. | [framework runtime](/python/subsystems/runtime), [LLM gateway](/python/subsystems/llm-gateway) |
+
+The conductor is the pivot: everything above it (console, channels) is a *consumer* of its `SessionSignal` stream and `submit`/`snapshot` surface; everything below it (capabilities, framework agent) is *assembled into* it at startup by the boot layer.
+
+## The Two Faces: barrel and bin
+
+induscode has two faces, both at the root of `src/induscode/`:
+
+| File | Role |
+|------|------|
+| `__init__.py` | The **library surface** — a lazy PEP 562 namespace barrel re-exporting `VERSION`, `__version__`, and 17 subsystems (`boot`, `conductor`, `console`, …). `__getattr__` imports each only when first touched, so `import induscode` stays cheap and never eagerly pulls the Textual console. |
+| `entry.py` | The **terminal binary** — the function `pyproject.toml [project.scripts]` binds both `pindus` and `induscode` to (`induscode.entry:run`). |
+
+`induscode.entry` does only two things before handing off control:
+
+1. Installs exactly one idempotent `logging.Filter` on the root logger that drops transport-layer `[MCP]` noise — a no-op when the brand debug env var `INDUSAGI_DEBUG` is set, so diagnostics are never hidden.
+2. Hands the sliced `argv` to `induscode.boot.boot` and adopts its resolved exit code.
+
+`run()` wraps `main()` (which returns an `int`, never raising `SystemExit`, so tests can call it), flushes stdout, and treats a `BrokenPipeError` (e.g. `| head` closed early) as a clean exit 0 by parking stdout on `/dev/null`.
+
+```python
+# induscode/entry.py (shape)
+def main(argv: Sequence[str] | None = None) -> int:
+    args = list(argv) if argv is not None else sys.argv[1:]
+    _install_mcp_noise_filter()
+    from induscode.boot import boot          # imported lazily
+    return asyncio.run(boot(args))
+```
+
+## Request Flow: entry to runtime
+
+```
+pindus "refactor the auth module"
+  │
+  ▼
+entry.run() ──► entry.main(argv) ──► asyncio.run(boot(argv))
+  │
+  ▼
+boot.boot(argv)                                   induscode/boot/boot.py
+  ├─ credential verb?  signin/signout/login/logout ──► launch.run_credential_command  (exit)
+  ├─ package verb?     install/remove/update/list/config ──► launch.run_package_command (exit)
+  ├─ meta?             --help / --version / --list-models ──► render & exit
+  ├─ run_stages(seed)  locate-workspace → upgrade → build-invocation → resolve-resources → select-runner
+  └─ select_runner(invocation).run(ctx)           induscode/boot/runners/registry.py
+       ├─ repl_runner     ──► build_session_conductor ──► mount_console(...)         (interactive)
+       ├─ oneshot_runner  ──► build_session_conductor ──► run_oneshot(...)           (text / NDJSON)
+       └─ link_runner     ──► build_session_conductor ──► create_link_server(...)    (JSON-RPC)
+            │
+            ▼
+       build_session_conductor(ctx)               induscode/boot/runners/session.py
+         ├─ register_built_in_oauth_providers + prime_provider_env
+         ├─ resolve_model_id   (--model > authenticated default > catalog default)
+         ├─ build_key_resolver (per-call async; on-read OAuth refresh in DiskAuthVault)
+         ├─ select_tools + load_mcp_tools   (capability_deck + framework MCP pool)
+         ├─ compose_system     (briefing; --system replaces, --append-system appends)
+         └─ create_session_conductor(options)  ──► wraps ONE framework Agent (lazy)
+              │
+              ▼  per turn
+         SessionConductor.submit(input)
+            ├─ agent.prompt(prompt)            indusagi.agent.Agent — the raw loop
+            ├─ translate_agent_event ──► SessionSignal stream (SignalHub)
+            ├─ _persist_tail ──► TranscriptStore (branchable NDJSON tree)
+            └─ _maybe_condense ──► window_budget CondenseFn on overflow
+```
+
+The console (interactive) or a channel (oneshot/link) subscribes to the conductor's `SessionSignal` stream and renders or serializes it. The framework `Agent` produces the assistant message; the conductor re-emits a distinct, stable product signal stream so the app surface evolves independently of the framework's `AgentEvent` loop.
+
+## The Boot Pipeline
+
+`boot.boot(argv)` (in `boot/boot.py`) owns the whole launch arc. It first builds a seed `BootContext` from a resolved `Workspace`, the `BRAND` record, and a once-parsed `Invocation`, then runs three short-circuits in verbatim order before any directory is touched:
+
+- **Credential verbs** (`signin` / `signout` / `login` / `logout` as `argv[0]`) route through [`launch.run_credential_command`](/python-cli/configuration/auth) over a disk-backed `DiskAuthVault`.
+- **Package verbs** (`install` / `remove` / `update` / `list` / `config`) go to `launch.run_package_command` over a workspace-scoped `PreferenceStore`.
+- **Meta requests** — `--help` (usage generated from the one flag table), `--version` (`BRAND.name` + `VERSION`), `--list-models [filter]` (the [model catalog](/python-cli/configuration/models)) — print and exit.
+
+Only if none fire does it run the pipeline. `run_stages(seed)` folds an **immutable** `BootContext` through `STAGES` in order, each stage returning a successor via `dataclasses.replace` (never mutating). Pipeline is data, not control flow:
+
+| Stage | Name | What it does |
+|-------|------|--------------|
+| 1 | `locate-workspace` | `ensure_dirs(workspace)` — materialise the `~/.pindusagi` profile directories. |
+| 2 | `upgrade-stage` | Fold the idempotent `apply_upgrades` registry over the workspace (non-fatal, retried next launch). |
+| 3 | `build-invocation` | Re-parse `argv` into the typed `Invocation` via `tokenize_invocation`. |
+| 4 | `resolve-resources` | Best-effort assemble the settings + `ModelCatalog` graph (degrades to empty on any framework gap). |
+| 5 | `select-runner` | A tracing no-op — the real dispatch happens in `boot()` after the pipeline so the runner owns the exit code. |
+
+A `finally` block calls `_drain_closables`, which runs every teardown callback latest-registered first, swallowing failures.
+
+## Runner Dispatch
+
+The pipeline hands the resolved `Invocation` to exactly one `Runner`. Dispatch is table lookup, not an `if/else` ladder: `RUNNERS` lists every runner in priority order and `select_runner` returns the first whose `accepts` predicate matches.
+
+```python
+# induscode/boot/runners/registry.py
+RUNNERS: Final[tuple[Runner, ...]] = (repl_runner, oneshot_runner, link_runner)
+
+def select_runner(inv: Invocation) -> Runner:
+    for runner in RUNNERS:
+        if runner.accepts(inv):
+            return runner
+    return repl_runner   # total: a bare command line lands interactive
+```
+
+`repl_runner` is both first in the table and the guaranteed fallback. The invocation parser maps the launch `OutputMode` onto the runner: `text` → `repl`, `json` → `oneshot`, `rpc` → `link`.
+
+| Runner | `id` | File | Behaviour |
+|--------|------|------|-----------|
+| `repl_runner` | `repl` | `boot/runners/repl_runner.py` | Builds a `SessionConductor`, honours `--resume` / `--continue`, then `mount_console(conductor, services, …)` for the live [Textual session](/python-cli/console/overview). |
+| `oneshot_runner` | `oneshot` | `boot/runners/oneshot_runner.py` | One non-interactive run to stdout via [`run_oneshot`](/python-cli/subsystems/channels) — clean text, or streamed NDJSON when the `json` flag is set. |
+| `link_runner` | `link` | `boot/runners/link_runner.py` | Serves the declarative `SESSION_OPS` registry over the stdin/stdout pair via `create_link_server` — framed JSON-RPC for a driving parent. |
+
+The full launch flag vocabulary (the single source of truth is the `FLAG_SPECS` table in `launch/invocation/flags.py`):
+
+| Flag | Aliases | Kind | Purpose |
+|------|---------|------|---------|
+| `--print` | `-p` | boolean | Run a single request, print only the result, and exit. |
+| `--json` | `--rpc` | boolean | Speak the headless line protocol for a driving parent process. |
+| `--interactive` | `-i` | boolean | Force the interactive session even when a prompt is supplied. |
+| `--model` | `-m` | string | Select the model, provider-qualified or bare (e.g. `provider/name`). |
+| `--account` | — | string | Authenticate the run with a named stored credential account. |
+| `--thinking` | — | string | Set the reasoning effort (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`). |
+| `--list-models` | — | string | List available models (optionally filtered by a substring) and exit. |
+| `--cwd` | — | string | Scope the run to a working directory (default: the current directory). |
+| `--system` | — | string | Replace the built-in system prompt with the given text. |
+| `--append-system` | — | string | Append extra text after the system prompt. |
+| `--resume` | `-r` | boolean | Pick a previous session to resume. |
+| `--continue` | `-c` | boolean | Continue the most recent session in this directory. |
+| `--tools` | — | list | Allow only the named built-in tools (comma-separated or repeated). |
+| `--no-tools` | — | boolean | Disable every built-in tool for this run. |
+| `--mcp` | — | list | Attach an external [MCP server](/python-cli/configuration/mcp) endpoint (comma-separated or repeated). |
+| `--help` | `-h` | boolean | Show usage and exit. |
+| `--version` | `-v` | boolean | Show the version and exit. |
+
+See the full [CLI reference](/python-cli/reference/cli) for mode derivation and `@file` attachments.
+
+## How a Session Is Assembled
+
+All three runners call the shared `build_session_conductor(ctx)` in `boot/runners/session.py`. That helper threads the invocation's flags into the framework agent through the conductor:
+
+```python
+pindus --model anthropic/claude-sonnet-4-5 --thinking high \
+       --tools read,write,bash --append-system ./extra-prompt.md \
+       --mcp ./mcp.json "refactor this module"
+```
+
+1. **OAuth + env priming** — `register_built_in_oauth_providers()` then `prime_provider_env(ctx)` exports vault keys into provider env vars as a fallback belt (never overriding an existing var).
+2. **Model** — `resolve_model_id` resolves explicit `--model` > the first authenticated provider's preferred default > the catalog default; `build_key_resolver` builds the per-call async credential resolver (requested account > default > first), with on-read OAuth refresh inside `DiskAuthVault`.
+3. **Tools** — `select_tools` calls `provision_deck("all", DeckContext(cwd=cwd)).tools()` from the [capability deck](/python-cli/subsystems/capability-deck), filters case-insensitively by `--tools` / `--no-tools`, and `load_mcp_tools` concatenates any `--mcp` server tools via the [framework MCP pool](/python/facades/mcp) (stdout/stderr/logging silenced).
+4. **System prompt** — `compose_system` builds the tool-aware [briefing](/python-cli/subsystems/briefing); `--system` replaces it, `--append-system` appends a trailing block.
+5. **The conductor** — `create_session_conductor(options)` is called with `SessionConductorOptions` carrying the resolved `tools`, `system`, `modelId`, `sessionsDir`, optional thinking level, and the `getApiKey` resolver. It wraps exactly one framework `Agent`, built lazily so no model client exists until the first turn; `condense_transcript` (the [window-budget](/python-cli/subsystems/window-budget) engine) is attached as the `/compact` + auto-compaction hook.
+
+The runner then either mounts the console over the conductor (interactive) or drives it through a channel (oneshot / link).
+
+## Subsystem Map
+
+Each subsystem is a lazily-imported namespace from the `induscode` barrel. The table groups them by concern.
+
+### Launch & lifecycle
+
+| Namespace | Responsibility |
+|-----------|----------------|
+| [`boot`](/python-cli/subsystems/boot) | The launch orchestrator, the `STAGES` pipeline, the `tokenize_invocation` parser, the `RUNNERS` registry, the `DiskAuthVault`, and the idempotent profile-upgrade driver. |
+| [`workspace`](/python-cli/configuration/settings) | The `BRAND` record (single source of truth for product name, bins `pindus`/`induscode`, env namespace `INDUSAGI`, profile dir `.pindusagi`), `VERSION`, and the pure `create_workspace` / `ensure_dirs` locator. |
+| [`launch`](/python-cli/subsystems/launch) | The declarative `FLAG_SPECS` table and `read_invocation` parser, the usage renderer, the `signin`/`signout` command and `AuthVault` seam, `@file` attachment gathering, the model-catalog printer, the OAuth adapter, and the resume picker. |
+| [`settings`](/python-cli/configuration/settings) | The typed `Preferences` record + `SETTING_KEYS` vocabulary, `DEFAULT_PREFERENCES`, and the two-tier (project-over-global-over-default) `PreferenceStore`. |
+| [`sessions`](/python-cli/subsystems/sessions) | The `SessionLibrary` — catalog-and-navigation over persisted transcripts — plus its `SavedSession`, `BranchNode`, and `PriorTurn` rows. |
+
+### The session core
+
+| Namespace | Responsibility |
+|-----------|----------------|
+| [`conductor`](/python-cli/subsystems/conductor) | The `SessionConductor` over the framework agent loop. Owns the product `SessionSignal` stream (via `SignalHub`), the persistent branchable `TranscriptStore`, the `ModelCatalog` / `ModelMatcher`, and the skill-invocation parser. |
+| [`capability_deck`](/python-cli/subsystems/capability-deck) | The tooling layer: the `Capability` (= framework `AgentTool`) catalog, the `provision_deck` assembler, the in-house cards (todo/bg-process/task/saas/memory), and the event-sourced MCP bridge ledger. |
+| [`window_budget`](/python-cli/subsystems/window-budget) | Context-window budgeting: token measurement, slice planning (`plan_slice`), and the conductor-consumable transcript `condense` / `create_condenser`. |
+| [`briefing`](/python-cli/subsystems/briefing) | The declarative system-prompt pipeline (`compose_briefing` over `BRIEFING_SECTIONS`), the single-pass macro model, and the Agent-Skills `SkillCard` loader. |
+
+### Surfaces & I/O
+
+| Namespace | Responsibility |
+|-----------|----------------|
+| [`console`](/python-cli/console/overview) | The interactive Textual shell: the pure `console_reducer`, the [theme engine](/python-cli/console/theming), the data-driven [slash-command catalog](/python-cli/console/slash-commands), the input/intent/completion modules, the [overlay dialogs](/python-cli/console/dialogs), and `mount_console`. |
+| [`console_slash`](/python-cli/console/slash-commands) | The pure slash-command framework: `build_registry`, `resolve_slash`, and the `SlashCommand`/`SlashContext`/`SlashOutcome` contracts. |
+| [`channels`](/python-cli/subsystems/channels) | The non-interactive channels: the JSON-RPC envelope and declarative `SESSION_OPS` registry served by `create_link_server`, the NDJSON framer, the dialog bridge, and the `run_oneshot` text/NDJSON channel. |
+| [`transcript_export`](/python-cli/subsystems/transcript-export) | The HTML transcript publisher: the SGR-to-HTML painter (`paint_sgr`), the WCAG-luminance `ThemeBridge`, the page-shell template, and `publish_transcript`. |
+
+### Integrations & extension
+
+| Namespace | Responsibility |
+|-----------|----------------|
+| [`runtime_bridge`](/python-cli/subsystems/runtime-bridge) | Provider routing for external runtimes: the `bridge:<adapter>` endpoint convention, the provider-neutral `NormalizedEvent` union, the `ChildTransport` boundary, and the `RuntimeBroker` / `RuntimeRoute` surface. |
+| [`addons`](/python-cli/subsystems/addons) | The third-party customization contract: the `AddonManifest` / `AddonSurface`, the colon-named `HookEvent` taxonomy and `EventDispatcher`, the `ToolInterceptor` chain, addon-contributed tools/commands, and the importlib module loader. |
+| [`insight`](/python-cli/subsystems/insight) | The observability plane: a thin wrapper over [framework tracing](/python/subsystems/tracing) (`Probe`/`Signal` aliased onto `Segment`/`TraceSignal`) plus an in-memory collector sink and NDJSON replay readers. |
+| `kit` | Framework-agnostic stdlib-only leaf helpers: POSIX shell-argument quoting, PNG/JPEG magic-byte sniffing, clipboard image staging, external-editor hand-off, and the managed-binary (`fd`/`rg`) provisioner. |
+
+The full export surface is documented in [Package Exports](/python-cli/reference/package-exports).
+
+## Where the Framework Begins
+
+induscode is built **on top of** the [indusagi framework](/python/architecture) and composes its published types rather than re-deriving them. The boundary is sharp and deliberate:
+
+- The **conductor** wraps a framework [`Agent`](/python/facades/agent) (the raw LLM loop) and consumes its `AgentEvent` stream internally; it never re-declares the framework's message/usage shapes.
+- The **capability deck** types `Capability` as an alias of the framework `AgentTool` from [capabilities](/python/subsystems/capabilities), so contributed tools feed the agent directly with no adapter.
+- The **console** wraps the framework's [react-ink](/python/ui/react-ink) rendering widgets (message list, streaming markdown, task panel, footer, dialogs) and the [TUI](/python/ui/tui) editor — induscode contributes only autocomplete, submit routing, app chords, and overlay flows.
+- **MCP** mounting goes through the framework [MCP](/python/facades/mcp) client pool; **OAuth/PKCE** builds on the framework's gateway credential primitives.
+- **State** lives under `~/.pindusagi/` (resolved via the workspace locator, honouring `INDUSAGI_CODING_AGENT_DIR` > `INDUSAGI_HOME`), sharing the framework's flat profile-dir convention.
+
+For the framework's own internal architecture — the LLM gateway, runtime, capabilities, and shell-app layers induscode sits above — see the [framework architecture](/python/architecture).

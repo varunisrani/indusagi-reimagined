@@ -1,0 +1,296 @@
+# UI Bridge
+
+> `indusagi.ui_bridge` is the seam between the event-sourced
+> [runtime](/python/subsystems/runtime) and the [react-ink](/python/ui/react-ink)
+> TUI widgets. It has two halves: a framework-free **projection** that maps a
+> `RunSnapshot` into the message shapes the widgets render, and an interactive
+> **Textual app** that hosts the coding-agent terminal surface. Imported as
+> `from indusagi.ui_bridge import ...`.
+
+The runtime speaks in gateway `Turn`s and `Block`s; the widgets render an
+`AgentMessage` list discriminated by a `type` tag. `ui_bridge` translates one
+into the other. The pure side (`adapter`, `facade_types`) imports neither
+`textual` nor `rich` and is always importable; the app side (`InteractiveApp`,
+`mount_interactive`, `create_theme`, `exit_transcript_text`) is resolved lazily
+so importing the data mapping never pulls in Textual.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Data flow](#data-flow)
+- [The projection (adapter)](#the-projection-adapter)
+- [Usage and the Footer](#usage-and-the-footer)
+- [The interactive app](#the-interactive-app)
+- [Event folding and retained-mode rendering](#event-folding-and-retained-mode-rendering)
+- [Keybindings and exit](#keybindings-and-exit)
+- [The exit transcript](#the-exit-transcript)
+- [Lazy app exports](#lazy-app-exports)
+- [Facade type aliases](#facade-type-aliases)
+- [Relationship to neighbors](#relationship-to-neighbors)
+- [Notable behaviors](#notable-behaviors)
+
+## Public exports
+
+From `indusagi.ui_bridge` (the package `__init__`):
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `to_agent_messages` | function | `adapter.py` | Project a `RunSnapshot` → `list[AgentMessage]` the react-ink UI renders |
+| `turn_to_agent_messages` | function | `adapter.py` | Project a single gateway `Turn` (+ model, timestamp) into the message(s) it maps to |
+| `reply_to_assistant_message` | function | `adapter.py` | Map a finalized gateway `Reply` into an `AssistantMessage` with its real usage/stop reason |
+| `gateway_usage_to_ml` | function | `adapter.py` | Convert a gateway `Usage` + model id into the facade `Usage` shape (token totals, per-tier cost) |
+| `live_usage` | function | `adapter.py` | Derive the Footer-facing `LiveUsage` (tokens, cost, context-window utilization) from a snapshot |
+| `LiveUsage` | dataclass | `adapter.py` | The status-line/Footer shape (frozen, slots) |
+| `LiveUsageTokens` | dataclass | `adapter.py` | Token totals in the Footer sub-shape (input/output/cacheRead/cacheWrite/total) |
+| `InteractiveApp` | class | `app.py` | The `textual.app.App[int]` REPL composing the react-ink widgets |
+| `mount_interactive` | async function | `app.py` | Mount `InteractiveApp` over a live `Agent`; resolve the exit code |
+| `create_theme` | function | `app.py` | Build the fixed chat-surface `ThemeBundle` |
+| `exit_transcript_text` | function | `app.py` | Pure render of a message sequence into plain Rich `Text` for scrollback |
+| `AgentMessage`, `Message`, `UserMessage`, `AssistantMessage`, `ToolResultMessage` | type | `facade_types.py` | The facade message union and its concrete dataclasses (re-exported from [`indusagi.ai`](/python/facades/ai)) |
+| `TextContent`, `ThinkingContent`, `ImageContent`, `ToolCall` | type | `facade_types.py` | The content-block parts the adapter builds inside messages |
+| `Usage`, `UsageCost`, `StopReason` | type | `facade_types.py` | The facade usage/cost shapes and the `StopReason` literal union |
+
+> `adapter.now_ms` (milliseconds since the Unix epoch) is in `adapter.__all__`
+> but is **not** re-exported by the barrel — reach it via
+> `indusagi.ui_bridge.adapter.now_ms`.
+
+## Data flow
+
+```
+runtime  ──→  adapter        ──→  react_ink widgets
+(Agent)       (projection)        (MessageList, TaskPanel,
+RunSnapshot                        StatusLine, Footer, PromptEditor)
+RunEvent
+```
+
+The runtime exposes an immutable `RunSnapshot` (`run_id`, `session_id`,
+`phase`, `messages` as a tuple of gateway `Turn`s, pending tools,
+`usage_total`, `model`, `error`). The adapter walks it and produces the legacy
+`AgentMessage` list. `InteractiveApp` subscribes to the agent's event stream,
+re-reads the snapshot on each event, and pushes the freshly projected view into
+its persistent widgets.
+
+## The projection (adapter)
+
+`adapter.py` is a pure module — no `textual`, no `rich`. It walks each `Turn`
+(`UserTurn` / `AssistantTurn` / `ToolTurn`), discriminates `Block`s by class
+(`TextBlock`, `ThinkingBlock`, `ToolCallBlock`, `ImageBlock`, `ToolResultBlock`)
+via `match`/`isinstance`, and projects them into the facade union
+`AgentMessage` (`UserMessage | AssistantMessage | ToolResultMessage`). Fields
+the renderer never reads are filled with defaults — zeroed usage, a `"stop"`
+reason, and synthetic 1ms-spaced timestamps.
+
+```python
+from indusagi.ui_bridge import to_agent_messages, live_usage
+
+snapshot = agent.snapshot()             # indusagi.runtime.Agent -> RunSnapshot
+messages = to_agent_messages(snapshot)  # list[AgentMessage] for the react-ink UI
+usage = live_usage(snapshot)            # LiveUsage for the Footer/status line
+print(usage.model, usage.tokens.total, f"{usage.contextPercent:.1f}%", usage.cost)
+```
+
+A `ToolTurn` batches every tool result for a step into one turn (one
+`ToolResultBlock` per call). The old shape is one message **per** result, so a
+single tool turn fans out to N `ToolResultMessage`s. Tool result blocks carry
+no tool name, so the projected `ToolResultMessage.toolName` is left `""` — the
+renderer keys display off the matching tool-call, not the result.
+
+You can also project a single turn, or map a freshly settled `Reply` (which
+carries real usage) by hand:
+
+```python
+from indusagi.ui_bridge import turn_to_agent_messages, reply_to_assistant_message
+
+# one gateway Turn -> the message(s) it projects to (tool turns fan out)
+msgs = turn_to_agent_messages(snapshot.messages[-1], snapshot.model, timestamp=0)
+
+# a just-settled gateway Reply -> an AssistantMessage with real usage/cost
+assistant_msg = reply_to_assistant_message(reply)
+```
+
+`to_agent_messages` synthesizes timestamps as `base + i`, where
+`base = now_ms() - len(messages)`, so the last turn lands at roughly now and
+1ms spacing keeps strict ordering without colliding stamps.
+
+## Usage and the Footer
+
+`gateway_usage_to_ml(usage, model)` converts a gateway `Usage` into the facade
+`Usage`, computing `totalTokens` and a best-effort USD cost from the
+[catalog](/python/subsystems/llm-gateway) card. Cost is best-effort: when
+`get_card` returns `None` for an unknown model id, every cost field is `0.0`.
+Per-tier costs are derived by estimating each tier's tokens in isolation so the
+breakdown sums to the total.
+
+`live_usage(snapshot)` builds the Footer-facing `LiveUsage` from a snapshot:
+the bound model id, its provider/display label, token totals (as
+`LiveUsageTokens`), the run cost, and context-window utilization
+(`contextWindow`, `contextTokens`, `contextPercent`). Context occupancy is the
+non-output footprint (`input + cacheRead + cacheWrite`); the percent is `0.0`
+when the window is unknown. `LiveUsage` and `LiveUsageTokens` are frozen,
+slotted dataclasses whose field names keep the original camelCase spelling
+(`cacheRead`, `displayName`, `contextPercent`) to match the rest of the bridge
+vocabulary.
+
+## The interactive app
+
+`InteractiveApp` is a `textual.app.App[int]` REPL. Its `compose()` lays out a
+banner, an empty-state hint, the react-ink `MessageList`/`TaskPanel`/
+`StatusLine`/`Footer`, a prompt row (`PromptEditor` plus a `›` marker), and a
+working hint. It is constructed with the live agent plus keyword-only `model`
+and `cwd`:
+
+```python
+InteractiveApp(agent, model="claude-sonnet-4", cwd="/repo")
+```
+
+`mount_interactive` is the convenience entry point. It builds the app, awaits
+`app.run_async()`, and after the alternate screen is restored prints the exit
+transcript. It always returns `0` on a clean leave — run-level failures surface
+as faulted snapshots in the UI, not as a non-zero process code:
+
+```python
+import asyncio
+from indusagi.ui_bridge import mount_interactive
+
+async def main(agent):
+    code = await mount_interactive(agent, model="claude-sonnet-4", cwd="/repo")
+    return code  # always 0 on a clean interactive leave
+
+asyncio.run(main(agent))
+```
+
+`mount_interactive` accepts `transcript_file` (the print destination; defaults
+to stdout) and `headless` / `auto_pilot`, which are forwarded to
+`run_async` so tests can drive the real mount path under a Textual `Pilot`
+without a TTY.
+
+`create_theme()` builds the fixed chat-surface theme via
+`create_theme_bundle("indus-interactive", ...)`; the app exposes the resulting
+react-ink `ThemeAdapter` through its `theme_adapter` property and feeds Textual
+variable defaults through `get_theme_variable_defaults()`.
+
+## Event folding and retained-mode rendering
+
+On mount the app calls `agent.subscribe(...)`; each `RunEvent` is wrapped in an
+`AgentEventMessage` by `_relay_run_event` and posted into Textual's message
+pump. `on_agent_event_message` re-reads `agent.snapshot()` as the authoritative
+source — it never trusts the event payload — then folds the event into
+per-tool `ToolExecutionState` keyed by tool-call id:
+
+- `ToolStartedEvent` — record a `running` tool and set the status line.
+- `ToolFinishedEvent` — flip to `success`/`error`, capture an output preview.
+- `SettledEvent` — clear the tool panel so stale cards do not linger; status `Ready`.
+- `FaultedEvent` — surface the error message in the status line.
+
+It then calls `_refresh_view()`, which pushes the projected `SessionSnapshot`
+into the persistent widgets: `MessageList.sync(messages)`, `TaskPanel`,
+`StatusLine`, and `Footer` all receive updated `.snapshot`/`.tool_executions`
+in place. The widget tree is never rebuilt — this is the Textual replacement
+for React's per-render reconciliation. While a run streams, the `PromptEditor`
+is disabled and re-focused once the run settles.
+
+Because `MessageList` reconciles rows by `role:timestamp` keys, the app stamps
+each turn index once (`_turn_stamps`, `max(last + 1, now_ms())`, 1ms spacing)
+and reuses it across snapshots, so settled history is never re-rendered. (The
+pure `adapter.to_agent_messages`, by contrast, recomputes `base + i` stamps on
+every call.)
+
+Submitting a draft (Enter) fires a fire-and-forget Textual worker that awaits
+`agent.submit(text)`; the subscription drives the view to settlement. `/exit`
+and `/quit` leave the session; a blank draft is a no-op, and a draft submitted
+while a run is active is restored to the editor rather than dropped.
+
+## Keybindings and exit
+
+- **Enter** — submit the current draft (via `agent.submit`).
+- **Esc** — abort an active run (`agent.abort` cancels the run's `CancelToken`),
+  or exit at an idle prompt.
+- **Ctrl-C** — always exit `0`, run active or not.
+
+The Esc binding is registered with `priority=True`. `check_action` gates that
+priority binding while a modal dialog (e.g. the react-ink `ThemeDialog`) is
+open, so Esc dismisses the dialog instead of tearing down the whole app.
+Ctrl-C is deliberately **not** gated.
+
+## The exit transcript
+
+Textual's alternate screen is erased when the app leaves, which would wipe the
+conversation from scrollback. As a deliberate workaround, after `run_async`
+returns and the normal screen is restored, `mount_interactive` re-reads
+`agent.snapshot()` (not the possibly stale folded snapshot), projects it, and
+prints the same content the `MessageList` showed.
+
+`exit_transcript_text(messages)` is the pure renderer behind this: it turns a
+`Sequence[AgentMessage]` into a plain Rich `Text` (user/assistant text plus
+concise tool-call and tool-result summaries; thinking blocks are skipped) and
+returns `None` for an empty session. You can render the conversation without
+ever launching the app:
+
+```python
+from indusagi.ui_bridge import to_agent_messages, exit_transcript_text
+from rich.console import Console
+
+text = exit_transcript_text(to_agent_messages(agent.snapshot()))
+if text is not None:           # None when the session held no messages
+    Console().print(text)
+```
+
+## Lazy app exports
+
+The barrel imports `adapter` and `facade_types` eagerly (framework-free) but
+resolves `InteractiveApp`, `create_theme`, `exit_transcript_text`, and
+`mount_interactive` lazily through module `__getattr__` (PEP 562). Importing
+the data mapping never pulls in Textual; a missing Textual install surfaces as
+`ImportError` only when an app export is touched:
+
+```python
+from indusagi.ui_bridge import to_agent_messages   # framework-free, always works
+from indusagi.ui_bridge import mount_interactive    # triggers the textual import
+```
+
+A host's TTY branch typically catches this `ImportError` to fall back to a
+plain-text loop.
+
+## Facade type aliases
+
+`facade_types.py` is a thin alias importer. The message vocabulary it once
+defined now lives canonically in [`indusagi.ai`](/python/facades/ai); this
+module re-exports those exact class objects so `isinstance` checks and
+dataclass identity hold across the `indusagi.ai` and `indusagi.ui_bridge`
+boundaries. Do not add definitions here — extend `indusagi.ai.types` instead.
+
+## Relationship to neighbors
+
+`ui_bridge` sits downstream of [Runtime](/python/subsystems/runtime) (consumes
+`Agent`, `RunSnapshot`, `RunEvent`, and the contract events
+`ToolStartedEvent` / `ToolFinishedEvent` / `SettledEvent` / `FaultedEvent`) and
+the [LLM Gateway](/python/subsystems/llm-gateway) (gateway `Turn`/`Block`/
+`Reply`/`Usage` types, plus cost and metadata via `get_card`/`estimate_cost`).
+It is upstream of — and the only configured caller of —
+[react-ink](/python/ui/react-ink), whose widgets and helpers it composes and
+feeds. Its facade types are re-exports of [`indusagi.ai`](/python/facades/ai),
+so the bridge speaks identity-equal types with the AI facade. The typical
+consumer is the REPL runner in the boot/CLI layer.
+
+## Notable behaviors
+
+1. **`now_ms` is not on the barrel.** It is in `adapter.__all__` but reached as
+   `indusagi.ui_bridge.adapter.now_ms`.
+2. **App exports are lazy.** Importing only the adapter surface stays
+   framework-free; touching an app export triggers the Textual import (and any
+   `ImportError`).
+3. **Cost is best-effort.** An unknown model id (`get_card` → `None`) zeroes
+   every cost field; per-tier costs are estimated in isolation so they sum to
+   the total.
+4. **`mount_interactive` always returns `0`** on a clean leave. Ctrl-C exits
+   `0`; Esc aborts an active run or exits at idle.
+5. **Esc gating.** `check_action` gates the priority Esc binding while a modal
+   dialog is open so Esc dismisses the dialog; Ctrl-C is never gated.
+6. **The exit transcript** is a deliberate workaround for Textual's alternate
+   screen erasing scrollback; it re-reads the live snapshot, not the folded one.
+7. **Tool result blocks carry no tool name**, so `ToolResultMessage.toolName`
+   is `""` and the renderer keys off the matching tool-call.
+8. **Argument coercion.** A non-mapping tool input is wrapped under a `value`
+   key; `None` maps to `{}` (the absent-input branch), and user-visible
+   stringification reproduces JS spellings (`true`/`false`, `null`, integral
+   floats without a trailing `.0`) for parity.

@@ -1,0 +1,160 @@
+# MCP
+
+> Connect the agent to external **Model Context Protocol (MCP)** servers. The agent acts as an MCP *client*: it connects to each configured server, lists its tools, and grafts them into its own tool deck under qualified `"<server>__<tool>"` names, so the model can call them like any built-in.
+
+## What MCP gives you
+
+An MCP server exposes tools (and other resources) over a standard protocol. Once
+attached, every tool a reachable server advertises becomes a callable agent tool.
+Enrollment is **event-sourced**: servers can attach and detach over a session's
+life, and a server that fails to connect simply contributes no tools rather than
+sinking startup.
+
+## Attaching servers
+
+There are two ways to attach a server, plus an in-session manager.
+
+### 1. The `--mcp` flag
+
+Attach an external MCP server endpoint for a single run (repeatable, or
+comma-separated):
+
+```bash
+indus --mcp <endpoint>
+indus --mcp a --mcp b
+```
+
+### 2. A config file
+
+Declare servers in a JSON config file. The agent loads, in order: a project file
+at `.indusvx/mcp.json` (resolved against the working directory), a user file at
+`$XDG_CONFIG_HOME/indusvx/mcp.json` (defaulting to `~/.config/indusvx/mcp.json`),
+and the legacy paths `~/.indusvx/agent/mcp.json` and
+`~/.indusvx/agent/mcp-servers.json`. Servers from every file that exists are
+merged.
+
+The file has a top-level `servers` field — an **object keyed by server name**, or
+an **array** of entries each carrying its own `name`:
+
+```json
+{
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/dir"]
+    }
+  }
+}
+```
+
+### 3. The `/mcp` command (interactive)
+
+In an interactive session, manage the configured servers:
+
+| Verb | Effect |
+|------|--------|
+| `/mcp` or `/mcp status` | Show configured servers, their connection state, and each one's tools |
+| `/mcp connect` | Connect all configured servers (building the pool on first use) |
+| `/mcp reconnect` | Reload the config from disk and reconnect |
+| `/mcp disconnect` | Disconnect from all servers |
+| `/mcp tools` | List the loaded MCP tool names |
+
+When nothing is configured, `/mcp status` tells you to add a server to
+`.indusvx/mcp.json` and run `/mcp connect`.
+
+## Config format
+
+Each server entry is one of two transports.
+
+### Stdio (a local command)
+
+```json
+{
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"],
+      "env": {}
+    }
+  }
+}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `command` | string | Executable to spawn for a stdio server |
+| `args` | string[] | Arguments passed to the command |
+| `env` | object | Extra environment variables for the child |
+
+### HTTP / SSE (a remote URL)
+
+```json
+{
+  "servers": {
+    "remote": {
+      "url": "https://mcp.example.com/sse",
+      "headers": { "Authorization": "Bearer …" }
+    }
+  }
+}
+```
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `url` | string | Endpoint URL for an HTTP/SSE server |
+| `headers` | object | Request headers (e.g. an auth bearer) |
+
+### Common fields
+
+| Field | Type | Meaning |
+|-------|------|---------|
+| `name` | string | Server name (the key, when `servers` is an object) |
+| `enabled` | boolean | Set `false` to skip the server (defaults to enabled) |
+| `timeout` | number | Per-server request timeout |
+
+## How tools are grafted
+
+Each remote tool is enrolled under a **qualified** `"<server>__<tool>"` name, so
+two servers can expose a same-named tool without collision, and the name doubles
+as a stable display handle. Grafted tools appear in the same catalog/help surface
+as the static built-ins, tagged with the MCP server they came from. A remote
+tool's output (text, structured JSON, or content blocks) is rendered into a text
+result; structured values are JSON-encoded.
+
+## How the wiring works (internals)
+
+The plumbing lives in two places that both sit on the `indusagi` framework:
+
+- The interactive `/mcp` command drives an `MCPClientPool` built from
+  `loadMCPConfig(cwd)` — both imported from the framework's `indusagi/mcp`
+  facade — over the workspace MCP config.
+- The capability deck grafts remote tools through
+  `attachBridgeCapabilities(ledger, config)` (in the deck's bridge-ledger), which
+  calls the framework's `mountProtocolBridge(config)` from `indusagi/interop`.
+  `mountProtocolBridge` connects every configured server, lists each ready
+  endpoint's tools, and returns a `ToolBox` (plus the live server fleet); the
+  deck adapts that box into agent capabilities and folds them into an
+  event-sourced ledger. The matching `detachBridge(ledger, fleet, servers?)`
+  retires a server's tools and tears its connection down.
+
+A wholesale mount failure (a bad config that throws) degrades the deck with a
+typed fault instead of crashing the session, and a single faulted server is
+simply absent from the enrollment.
+
+## Troubleshooting
+
+- **No servers configured.** Add one to `.indusvx/mcp.json` (or a user/legacy
+  path above) and run `/mcp connect`.
+- **A server won't connect.** Verify the `command` is on `PATH` (try running it
+  yourself) or the `url` is reachable; a faulted server contributes no tools and
+  shows as not connected in `/mcp status`.
+- **Tools missing after connecting.** Re-run `/mcp tools`; if a config changed on
+  disk, use `/mcp reconnect` to reload it.
+- **Debug output.** Set `INDUSAGI_DEBUG` in the environment for verbose
+  diagnostics.
+
+## See also
+
+- [Features](features.md) - The built-in toolset and the rest of the agent
+- [Settings](settings.md) - Config tiers and the profile directory
+- [Providers](providers.md) - Model providers and authentication

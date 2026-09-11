@@ -1,0 +1,381 @@
+# Runtime Bridge
+
+> `induscode::runtime_bridge` is the per-turn routing seam that decides **where an assistant turn is actually produced**: by the [`indusagi`](/rust) framework gateway, or by an external child coding-agent (a spawned `claude` / `codex` CLI, or a peer `indusagi` agent over JSON-RPC). The load-bearing fact of the Rust port: there is no `AssistantMessageEventStream` and no `streamSimple` — the framework's streaming currency is the gateway's [`Channel`](/rust/subsystems/llm-gateway) of `Emission`, and the runtime reaches a model through exactly one seam, the [`indusagi::runtime::ModelInvoker`](/rust/subsystems/runtime) trait. So the TS broker that *decorated* `streamSimple` becomes the Rust [`RuntimeBroker`] that **is** a `ModelInvoker`.
+
+The broker wraps the gateway-backed invoker and, for runtime-annotated models, produces a bridge-backed `Channel<Emission>` instead. Both arms hand back the same `Channel`, so the [conductor's](/rust-cli/subsystems/conductor) turn driver cannot tell which path produced the turn — the exact Rust analogue of the TS "indistinguishable to the caller" guarantee. Every external wire dialect is collapsed into one provider-neutral `NormalizedEvent` union, which a single `EmissionSink` translates into framework `Emission`s, so the per-bridge push idiom lives in exactly one place.
+
+## Table of Contents
+
+- [Where It Sits](#where-it-sits)
+- [The Routing Decision](#the-routing-decision)
+- [The Synthetic Endpoint and the Spec Side-Table](#the-synthetic-endpoint-and-the-spec-side-table)
+- [Normalized Events and the Sink](#normalized-events-and-the-sink)
+- [Bridges and the Shared Driver](#bridges-and-the-shared-driver)
+- [The Three Shipped Dialects](#the-three-shipped-dialects)
+- [The Injectable Child Transport](#the-injectable-child-transport)
+- [Auth as Data](#auth-as-data)
+- [Resume Links](#resume-links)
+- [Cancellation Is Law](#cancellation-is-law)
+- [Module Map](#module-map)
+- [Public Surface](#public-surface)
+- [Examples](#examples)
+- [Parity Notes](#parity-notes)
+- [On the Framework](#on-the-framework)
+
+## Where It Sits
+
+The runtime bridge is the Rust port of `indus-code-rebuild/src/runtime-bridge` (~2.3k LOC; PLAN/55). It builds directly **on** the [indusagi framework](/rust) and consumes its vocabulary verbatim from `indusagi::llmgateway::contract` — `Channel`, `Emission`, `ModelCard`, `Conversation`, `StreamOptions`, `StopReason`, plus `GatewayError` / `GatewayErrorKind` / `gateway_error` — and never re-derives event shapes. It writes through `indusagi::llmgateway::streaming::channel_of`, reuses `indusagi::llmgateway::conversion::fold_reply` to reconstruct terminal replies, and honours the framework `indusagi::core::CancellationToken` threaded through `StreamOptions.cancel`.
+
+The single most important difference from the TS edition (mod.rs §2): **Rust has no `streamSimple` to decorate.** The runtime reaches a model only through `indusagi::runtime::ModelInvoker` (the `AgentDeps.invoke_model` injection point; the [conductor](/rust-cli/subsystems/conductor) re-exports it as `conductor::contract::ModelInvoker`). So the broker *is* a `ModelInvoker`: it wraps a gateway-backed `Arc<dyn ModelInvoker>` and overrides it for runtime-annotated models.
+
+Within `induscode` it has one cross-subsystem touch point: the broker's spec resolution consumes a `SpecTable` (a `BTreeMap<String, ExternalRuntimeSpec>` keyed by canonical model id) built by the [launch](/rust-cli/subsystems/launch) catalog/model-pick layer, and its resume persistence is bound by the [conductor's](/rust-cli/subsystems/conductor) transcript store at assembly time. The crate is `induscode`; the bins are `indusr` and `indusagir`.
+
+## The Routing Decision
+
+The product never calls a bridge or the gateway directly. It hands the broker to the agent as `AgentDeps.invoke_model` and the framework calls `ModelInvoker::invoke(conversation, options)` once per turn; the broker picks the path. Routing is data, not control flow.
+
+A [`RuntimeBroker`] is **bound to one [`ModelCard`]** at agent-construction time (broker.rs §; PLAN/55 §4.2 OQ2: `ModelInvoker::invoke` has no model argument — one agent = one model), and routes that single card on each `invoke`. The pure-decision helper is `route()`:
+
+```rust
+pub fn route(&self) -> RuntimeRoute<'_> {
+    // No runtime annotation in the side-table ⇒ a plain HTTP-provider model.
+    let spec = match crate::runtime_bridge::bridges::spec_from_card(&self.card, &self.spec_table) {
+        Some(spec) => spec,
+        None => return RuntimeRoute::Framework,
+    };
+    // Annotated, but no bridge registered for the adapter ⇒ still framework.
+    match self.bridges.get(&spec.adapter) {
+        Some(bridge) => RuntimeRoute::External { bridge: bridge.as_ref(), spec },
+        None => RuntimeRoute::Framework,
+    }
+}
+```
+
+The two outcomes of `RuntimeRoute<'a>`:
+
+| Route | Carries | Behaviour |
+|-------|---------|-----------|
+| `RuntimeRoute::External` | `bridge: &'a dyn RuntimeBridge` + `spec: ExternalRuntimeSpec` | The broker builds a `ChildTransport`, attaches the resume tap, and drives `bridge.run_exchange(...)`. |
+| `RuntimeRoute::Framework` | — | The turn falls through to the wrapped gateway-backed `ModelInvoker` unchanged. |
+
+`ModelInvoker::invoke` re-resolves the same decision by hand (rather than holding a `RuntimeRoute` borrow), then dispatches. There are **three** distinct fall-throughs to the framework arm, every one mirroring TS broker parity:
+
+1. No spec in the side-table → plain HTTP-provider model → `self.framework.invoke(...)`.
+2. Annotated but no bridge registered for the adapter → `self.framework.invoke(...)`.
+3. External route decided, but **no `transport_factory` wired** → `self.framework.invoke(...)` (parity with `broker.ts:280` — the no-`transportFactory` fallthrough).
+
+Only past all three does the broker resolve a persisted resume token, build the transport via the factory, attach the best-effort resume tap, and call `bridge.run_exchange(self.card.clone(), conversation, exchange_opts, transport)`. Every branch returns the same `Channel`.
+
+## The Synthetic Endpoint and the Spec Side-Table
+
+A runtime-backed model is **annotated, not re-catalogued**. The catalog/matcher own the model list; this layer attaches an optional [`ExternalRuntimeSpec`] alongside the [`ModelCard`]. Unlike the TS layer (which rewrote `Model.baseUrl` and decoded it back), the Rust broker resolves the spec from a **side-table keyed by canonical id** (PLAN/55 §4.2 OQ1, which the contract explicitly sanctions), because Rust cannot abuse a `base_url` field the same way:
+
+```rust
+pub type SpecTable = BTreeMap<String, ExternalRuntimeSpec>;
+
+pub fn spec_from_card(
+    card: &ModelCard,
+    table: &BTreeMap<String, ExternalRuntimeSpec>,
+) -> Option<ExternalRuntimeSpec> {
+    table.get(&card.id).cloned()
+}
+```
+
+The `bridge:<adapter>` scheme survives only as a stable, non-HTTP **display/identity** address:
+
+| Symbol | Value / Shape | Role |
+|--------|---------------|------|
+| `RUNTIME_ENDPOINT_SCHEME` | `pub const … = "bridge:"` | The synthetic non-HTTP scheme stamped onto a runtime model's display address. |
+| `runtime_endpoint(adapter)` | `format!("bridge:{}", adapter.as_str())` | The single sanctioned way to mint the convention. |
+| `annotate_card(card, spec)` | fresh `ModelCard` | Rewrites `card.base_url = Some(runtime_endpoint(&spec.adapter))`; the input is never mutated (a fresh value is returned). |
+| `spec_from_card(card, table)` | `Option<ExternalRuntimeSpec>` | The side-table lookup the broker recognizes a runtime model with. |
+
+The [`ExternalRuntimeSpec`] is the frozen annotation. Only `adapter` is required (it selects which bridge owns the exchange); every transport field is optional:
+
+```rust
+pub struct ExternalRuntimeSpec {
+    pub adapter: RuntimeAdapterId,            // which bridge owns the exchange
+    pub auth_mode: RuntimeAuthMode,           // serde rename = "authMode"
+    pub binary_path: Option<String>,          // serde rename = "binaryPath"
+    pub args: Vec<String>,                    // prepended to the bridge's protocol flags
+    pub env: BTreeMap<String, String>,        // deterministic ordering
+    pub delegate: Option<String>,             // for a peer bridge fronting a downstream source
+}
+```
+
+`RuntimeAdapterId` mirrors the TS `(string & {})` open union: the three shipped ids (`ClaudeCli`, `CodexCli`, `IndusagiCli`) keep exhaustive matching ergonomic, while an `untagged` `Custom(String)` arm lets an addon register a further adapter without editing the enum. The kebab-case wire tags (`"claude-cli"`, `"codex-cli"`, `"indusagi-cli"`) preserve the TS string-literal values byte-for-byte; `as_str()` returns the stable slug.
+
+## Normalized Events and the Sink
+
+Every external runtime speaks a different wire dialect, but the broker should not care. Each bridge is reduced to a **parser** that maps its vocabulary onto a small, closed, provider-neutral union, and one [`EmissionSink`] translates those events into framework `Emission`s. This is the seam that removes per-bridge `push*` duplication.
+
+```rust
+pub enum NormalizedEvent {
+    Text     { delta: String },
+    Thinking { delta: String },
+    ToolCall { id: String, name: String, arguments: serde_json::Value },
+    Resume   { resume_token: String },
+    Finish   { reason: FinishReason },
+    Failed   { error: BridgeFailure },
+}
+```
+
+The terminal success reasons are a subset of the framework `StopReason`, projected by `FinishReason::to_stop_reason`:
+
+| `FinishReason` | → `StopReason` | TS literal |
+|----------------|----------------|------------|
+| `Stop` | `StopReason::Complete` | `"stop"` |
+| `Length` | `StopReason::MaxOutput` | `"length"` |
+| `ToolUse` | `StopReason::ToolCalls` | `"toolUse"` |
+
+The Rust `EmissionSink` is **far thinner** than the TS `sink.ts` (313 lines → a fraction): because `fold_reply` (`conversion::reduce`) already reconstructs the terminal `Reply` from the emission stream with the canonical block order (thinking → text → tool calls), there is **no** accumulating `AssistantMessage`, **no** content-block index bookkeeping, and **no** lazy `*_start`/`*_end` lifecycle. The sink just maps each event onto one-or-two `Emission`s pushed onto a `tokio::sync::mpsc::UnboundedSender<Emission>` that backs a `channel_of` factory:
+
+| Method | Effect |
+|--------|--------|
+| `text(delta)` | Push `Emission::Text { delta }` (buffered for the fold). |
+| `thinking(delta)` | Push `Emission::Thinking { delta }` (buffered). |
+| `tool_call(id, name, arguments)` | Push `Emission::ToolCallStart { id, name }` + `Emission::ToolCallDelta { id, args_delta }` (args serialized as a JSON string); `fold_reply` reassembles the single `Block::ToolCall`. |
+| `emit(event)` | Dispatch one raw `NormalizedEvent` onto the matching method; a `Resume` is a no-op. |
+| `finish_success(reason)` | Push `Emission::Stop { stop }` then a terminal `Emission::Done { reply }` built by `fold_reply(&model_id, buffer.iter())`. Terminal, idempotent. |
+| `finish_error(error)` | Push a terminal `Emission::Error { error }`; `BridgeFailure::aborted` selects `GatewayErrorKind::Aborted` vs `GatewayErrorKind::Transport`. Terminal, idempotent. |
+
+A `settled` flag guards against emissions after a terminal `Done`/`Error` (the TS `settled` flag); post-settle pushes are silently dropped. Terminals are **not** buffered (they are envelopes, not deltas the fold consumes). A `tx.send` failure (the consumer hung up) is swallowed — it must never mask the streamed outcome. The bound `model_id` is threaded so the folded `Done.reply` carries the right `model` field. A `Resume` event emits **no** `Emission` (a stream no-op; the token is persisted out of band by the broker's tap — see the `resume_is_a_channel_no_op` test).
+
+## Bridges and the Shared Driver
+
+A [`RuntimeBridge`] is one external-runtime adapter — the strategy that produces a turn for a model whose spec names it. The trait is dialect-specialist; the lifecycle wiring common to all of them is factored into `drive_exchange` (`_drive.ts`):
+
+```rust
+pub trait RuntimeBridge: Send + Sync {
+    fn adapter(&self) -> &RuntimeAdapterId;
+    fn run_exchange(
+        &self,
+        model: ModelCard,
+        conversation: Conversation,
+        opts: ExchangeOptions,
+        transport: Box<dyn ChildTransport>,
+    ) -> Channel;
+    fn requires_credential(&self, spec: &ExternalRuntimeSpec) -> bool {
+        matches!(spec.auth_mode, RuntimeAuthMode::ApiKey)
+    }
+}
+```
+
+The transport is a **parameter** (not constructed internally) precisely so tests pass a fake and no real CLI is spawned. `run_exchange` returns the `Channel` synchronously (it is populated asynchronously as the child emits), matching `gateway::stream`.
+
+`drive_exchange(model, opts, transport, opening_request, parse)` is the shared transport → parser → sink loop every bridge reuses. It builds an `EmissionSink` over an unbounded `mpsc` that backs the returned `Channel`, and the loop:
+
+- subscribes the `ChildParser` to `transport.on_message` (each inbound `ChildMessage` is fed to the sink; a terminal `ParseStep::Done` settles the exchange);
+- sends the `opening_request` (a send failure ends the exchange in error);
+- races the settle against `opts.stream.cancel` via `tokio::select!` (an aborted exchange yields a typed `BridgeFailure::aborted`, never a hang);
+- **always** calls `transport.close().await` on the way out.
+
+The transport is move-only / single-use, so it is `take()`n on the first channel iteration (stashed behind a `Mutex<Option<(Box<dyn ChildTransport>, ChildParser)>>`); a rare re-iteration yields a single typed `BridgeFailure::error("external runtime exchange is not re-runnable")`, keeping the channel well-formed (parity with the TS stream being consumed once). Inside the loop the sink lives behind an `Arc<Mutex<EmissionSink>>` because the synchronous `on_message` callback (invoked off-thread by the transport) and the async loop both drive it; a shared `finished` flag makes `settle_success` / `settle_error` idempotent (the TS `finished` guard).
+
+A parser is `ChildParser = Box<dyn FnMut(&ChildMessage, &mut EmissionSink) -> ParseStep + Send>`. `ParseStep` has two values: `Continue` (events emitted, stream stays open) and `Done` (the payload was terminal — the driver finishes successfully if the sink has not already settled). Dialect parsers narrow opaque payloads with the shared helpers `as_record` (`value.as_object()`) and `str_field`.
+
+## The Three Shipped Dialects
+
+Three bridges ship, each a `RuntimeBridge` impl with a built-in [`ExternalRuntimeSpec`] in `builtin_runtime_specs()`:
+
+| Bridge struct | Adapter | Default binary / args | Wire dialect |
+|---------------|---------|-----------------------|--------------|
+| `ClaudeCliBridge` | `claude-cli` | `claude --output-format stream-json --verbose` | Anthropic stream-json content blocks |
+| `CodexCliBridge` | `codex-cli` | `codex --json` | OpenAI `--json` turn/item events |
+| `IndusagiCliBridge` | `indusagi-cli` | `indusagi --rpc` | Peer JSON-RPC notifications + `runExchange` response |
+
+All three ship `RuntimeAuthMode::ExternalCli` (the spawned child owns its own login). `builtin_runtime_spec(adapter)` is the by-id lookup.
+
+Dialect specifics worth knowing:
+
+- **`claude_cli_parser`** records the last-seen `stop_reason` (`message_delta`) so `message_stop` / `result` finishes with it (`claude_stop_reason` maps `"max_tokens"` → `Length`, `"tool_use"` → `ToolUse`, else `Stop`). It surfaces a `Resume` from `system`/`subtype:"init"`/`session_id`, emits the tool call from the **`content_block_start`** snapshot (intentionally **dropping** `input_json_delta` chunks), and routes `text_delta` / `thinking_delta` to the sink. An `error` payload settles `finish_error` + `Done`.
+- **`codex_cli_parser`** tracks `saw_tool_call` so `turn.completed` / `response.completed` settle as `ToolUse` only if a tool call was seen, else `Stop`. It streams `response.output_text.delta` as text and `response.reasoning_text.delta` / `response.reasoning.delta` as thinking; on a completed item (`response.output_item.done` / `item.completed`) it emits a `ToolCall` for a `function_call` / `tool_call` item (`codex_is_tool_item`), else falls back to the item's whole `text`. `codex_parse_arguments` accepts an `arguments` string-or-object (empty/unparseable → `{}`), and the tool-call id prefers `call_id`, then `id`, then the tool name. A `thread.started` surfaces a `Resume` (the `thread_id`), and an `error` / `turn.failed` payload settles `finish_error` + `Done`.
+- **`indusagi_cli_parser`** is stateless. A frame carrying a `method` is a notification, dispatched by `indusagi_handle_notification` (`stream/text`, `stream/thinking`, `stream/toolCall`, `session/resume`, `stream/done` — whose `reason` maps via `indusagi_finish_reason` `"length"`→`Length`, `"toolUse"`→`ToolUse`, else `Stop` — and `stream/error`, which honours an `aborted` param to pick `BridgeFailure::aborted` vs `error`). A frame with no `method` is a response: an `error` key settles `finish_error`, a `result` key is a terminal `Done` if streaming notifications did not already finish. `IndusagiCliBridge::new(spec)` builds a peer bridge bound to a spec so its `delegate` is forwarded in the opening `runExchange` (the JSON-RPC `method` is the `INDUSAGI_RPC_METHOD = "runExchange"` const, the `id` defaults to the session id); `IndusagiCliBridge::default()` carries no delegate.
+
+The peer is built but only the CLI bridges (`claude` / `codex`) are wired into the default catalog at 1.0; the peer ships behind the same `cli-bridges` transport seam.
+
+## The Injectable Child Transport
+
+The bridge ↔ child boundary is the injectable `ChildTransport` trait — never a hard-coded spawn. **No `tokio::process` is pulled into the default build**; the production transport is gated behind the `cli-bridges` feature, and tests pass a fake, so no real `claude` / `codex` binary is launched.
+
+```rust
+#[async_trait::async_trait]
+pub trait ChildTransport: Send + Sync {
+    async fn send(&self, request: ChildRequest) -> Result<(), TransportError>;
+    fn on_message(&self, listener: MessageListener) -> Disposer;
+    async fn close(&self);
+}
+```
+
+| Member | Role |
+|--------|------|
+| `send` | Relay one `ChildRequest` to the child (write a prompt to stdin / issue a JSON-RPC call). Errors with `TransportError` after `close`. |
+| `on_message` | Register a `MessageListener` (`Box<dyn FnMut(ChildMessage) + Send>`) for inbound messages; returns a `Disposer` (`Box<dyn FnOnce() + Send>`). |
+| `close` | Terminate the child and release the transport. Idempotent; kill-on-close is the production factory's job under `cli-bridges`. |
+
+`ChildMessage` and `ChildRequest` carry an **opaque** `serde_json::Value` (`payload` / `body`) — whatever the underlying protocol relays. The broker reaches a transport only through a `ChildTransportFactory = Arc<dyn Fn(TransportContext) -> Box<dyn ChildTransport> + Send + Sync>`, fed a `TransportContext { spec, model, opts, resume }` so a production factory can launch and wire the child without the broker touching a process. When the broker has `None` for the factory, every external decision falls through to the framework route.
+
+## Auth as Data
+
+Authentication policy is data, not control flow. `RuntimeAuthMode` is `ExternalCli | ApiKey`, and `requires_credential` answers the single question "does this model need a key on disk before being offered?":
+
+- `ExternalCli` → `false`. The spawned child owns its own login (its own keychain), so the model is offered as available with an **empty credential vault**. All three shipped specs are `ExternalCli`.
+- `ApiKey` → `true`. The runtime still resolves a key from the credential vault, same as a normal HTTP provider; only the transport differs.
+
+The broker delegates `requires_credential` to the owning bridge's predicate when one is registered, and falls back to `matches!(spec.auth_mode, RuntimeAuthMode::ApiKey)` when no bridge is present — so it answers strictly the *runtime* credential question. See [Auth](/rust-cli/configuration/auth) for the disk-backed vault this policy gates.
+
+## Resume Links
+
+An underlying CLI session can be reattached across exchanges. When a child surfaces a session id / thread id, the broker persists it through an injected `RuntimeLinkStore`:
+
+```rust
+pub const RUNTIME_LINK_ENTRY: &str = "external-runtime-link";
+
+pub struct RuntimeLink {
+    pub source: String,        // the model's provider/source slug
+    pub bridge: String,        // the adapter id, e.g. "claude-cli"
+    pub resume_token: String,  // serde rename = "resumeToken"
+    pub at: String,            // ISO-8601 capture instant
+}
+
+pub fn runtime_source_key(source: &str, model_id: &str, bridge: &str) -> String {
+    format!("{source}|{model_id}|{bridge}")  // "source|model|bridge"
+}
+```
+
+`RuntimeLinkStore` is **best-effort** and append-only: `save(link)` is fire-and-forget (errors are logged, never propagated — a save failure must never fault a turn, PLAN/55 §4.3 R4), and `find(source_key) -> Option<String>` resolves a persisted token synchronously.
+
+Two halves run on each external exchange:
+
+- **Reattach.** `resolve_resume(spec)` keys `RuntimeLinkStore::find` by `runtime_source_key(source_slug, card.id, adapter)`. The resolved token flows into `ExchangeOptions.resume`, the `TransportContext.resume`, and the bridge's opening request body. The `source_slug` is the bound card's `ProviderId` serialized to its kebab-case wire literal (`"anthropic"`, `"openai"`, …).
+- **Persist.** `attach_resume_tap(transport, spec)` registers a listener on `transport.on_message` that reads the same inbound messages as the parser, **independent** of the bridge's own parsing. `resume_token_of(payload)` recognizes the cross-dialect token shapes:
+
+```rust
+fn resume_token_of(payload: &serde_json::Value) -> Option<String> {
+    // Peer JSON-RPC: { method: "session/resume", params: { resumeToken } }
+    // Anthropic:     { type: "system", subtype: "init", session_id }
+    // OpenAI --json: { type: "thread.started", thread_id }
+    // anything else  → None
+}
+```
+
+It is permissive (a stale token just yields a fresh session) and uses an `Arc<Mutex<bool>>` latch so it persists exactly **one** token per exchange (the TS `saved` latch). The tap is a no-op when no store is wired. The [conductor's](/rust-cli/subsystems/conductor) transcript store binds the production `RuntimeLinkStore` (the record is logged under the `external-runtime-link` tag); the in-memory test fake lives in the broker test module.
+
+## Cancellation Is Law
+
+A cancelled exchange is always a **typed outcome**, never a panic or a hang. The contract's `BridgeFault` is serde-tagged and exhaustive with **no `_` arm** (so a new variant is a compile error at every match site):
+
+```rust
+pub enum BridgeFault {
+    UnknownAdapter { adapter: String },
+    Transport { message: String },
+    Parse { message: String },
+    Aborted,
+    Runtime { message: String },
+}
+```
+
+A route that fails *before* it produces a stream still hands back a well-formed channel via `fault_channel(fault) -> Channel`, which mints a single `Emission::Error` with the matching `GatewayErrorKind` (`Aborted` → `Aborted`, `Transport`/`Runtime` → `Transport`, `Parse` → `Parse`, `UnknownAdapter` → `Unsupported`) — parity with the framework `GatewayInvoker`'s error-channel fallback. In `drive_exchange`, an already-cancelled or mid-flight-cancelled token settles `BridgeFailure::aborted("exchange aborted")` → `GatewayErrorKind::Aborted`, and the transport is **still torn down** (the `an_already_cancelled_exchange_settles_as_a_typed_aborted_error` test asserts both the typed error and `transport.close()`).
+
+## Module Map
+
+| Module | Holds |
+|--------|-------|
+| `contract.rs` | The frozen type seam: `ExternalRuntimeSpec`, `RuntimeAdapterId`, `RuntimeAuthMode`, `RUNTIME_ENDPOINT_SCHEME` / `runtime_endpoint`, the `NormalizedEvent` union + `FinishReason` + `BridgeFailure`, the `ChildTransport` trait + `ChildMessage` / `ChildRequest` / `ChildTransportFactory` / `TransportContext` / `TransportError` / `Disposer` / `MessageListener`, `ExchangeOptions`, `ChildParser` / `ParseStep`, the `RuntimeBridge` trait, `RuntimeRoute`, `RuntimeLink` / `RuntimeLinkStore` / `RUNTIME_LINK_ENTRY` / `runtime_source_key`, and the typed `BridgeFault` + `fault_channel`. |
+| `sink.rs` | The one `EmissionSink` impl: `NormalizedEvent` → `Emission` mapping, the fold buffer, the `settled` guard, `text` / `thinking` / `tool_call` / `emit` / `finish_success` / `finish_error`. |
+| `bridges.rs` | `builtin_runtime_specs` / `builtin_runtime_spec` / `spec_from_card` / `annotate_card`; the shared `drive_exchange` loop + `as_record` / `str_field`; the three bridge structs (`ClaudeCliBridge` / `CodexCliBridge` / `IndusagiCliBridge`) and their parsers (`claude_cli_parser` / `codex_cli_parser` / `indusagi_cli_parser`). |
+| `broker.rs` | `RuntimeBroker` (the `impl ModelInvoker`) + `SpecTable`, `register` / `with_transport_factory` / `with_link_store`, `route` / `requires_credential` / `resolve_resume` / `attach_resume_tap` / `source_slug`, the resume tap's free helpers `resume_token_of` / `build_link` / `now_iso8601`, and the `wire_tracing_sink` stub. |
+| `mod.rs` | The public routing surface re-export (mirrors `runtime-bridge/index.ts`). |
+
+## Public Surface
+
+The subsystem is consumed through `induscode::runtime_bridge`. The crate root re-exports:
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `RuntimeBroker` | struct | `broker.rs` | The router that **is** a `ModelInvoker`; sole entry the agent wires via `AgentDeps.invoke_model`. |
+| `SpecTable` | type alias | `broker.rs` | `BTreeMap<String, ExternalRuntimeSpec>` — the canonical-id → spec side-table. |
+| `RuntimeBridge` | trait | `contract.rs` | One external-runtime adapter: `adapter()`, `run_exchange(...)`, `requires_credential(spec)`. |
+| `ExternalRuntimeSpec` | struct | `contract.rs` | The frozen runtime annotation. |
+| `RuntimeAdapterId` | enum | `contract.rs` | `ClaudeCli` / `CodexCli` / `IndusagiCli` / `Custom(String)`. |
+| `RuntimeAuthMode` | enum | `contract.rs` | `ExternalCli` / `ApiKey`. |
+| `RUNTIME_ENDPOINT_SCHEME` / `runtime_endpoint` | const / fn | `contract.rs` | The `bridge:` scheme and the `bridge:<adapter>` minter. |
+| `NormalizedEvent` | enum | `contract.rs` | `Text` / `Thinking` / `ToolCall` / `Resume` / `Finish` / `Failed`. |
+| `FinishReason` | enum | `contract.rs` | `Stop` / `Length` / `ToolUse`; `to_stop_reason()`. |
+| `BridgeFailure` | struct | `contract.rs` | `{ message, aborted }`; `error(..)` / `aborted(..)` constructors. |
+| `BridgeFault` | enum | `contract.rs` | The exhaustive, serde-tagged routing fault; `fault_channel(fault)`. |
+| `ChildTransport` | trait | `contract.rs` | The injectable child boundary. |
+| `ChildMessage` / `ChildRequest` | struct | `contract.rs` | The opaque-payload envelopes. |
+| `ChildTransportFactory` | type alias | `contract.rs` | `Arc<dyn Fn(TransportContext) -> Box<dyn ChildTransport> + Send + Sync>`. |
+| `TransportContext` | struct | `contract.rs` | `{ spec, model, opts, resume }` fed to the factory. |
+| `ChildParser` / `ParseStep` | type alias / enum | `contract.rs` | The per-dialect parser surface (`Continue` / `Done`). |
+| `ExchangeOptions` | struct | `contract.rs` | Composes framework `StreamOptions` + `session_id` / `cwd` / `resume`. |
+| `RuntimeRoute` | enum | `contract.rs` | `External { bridge, spec }` / `Framework`. |
+| `RuntimeLink` / `RuntimeLinkStore` / `RUNTIME_LINK_ENTRY` | struct / trait / const | `contract.rs` | Resume-token persistence under the `external-runtime-link` tag. |
+| `runtime_source_key` | fn | `contract.rs` | Composes the `source\|model\|bridge` reuse key. |
+| `EmissionSink` | struct | `sink.rs` | The single `NormalizedEvent` → `Emission` translator. |
+
+Not re-exported at the crate root but `pub` in `bridges.rs`: `builtin_runtime_specs`, `builtin_runtime_spec`, `spec_from_card`, `annotate_card`, `drive_exchange`, the three `*_cli_parser` builders, and `ClaudeCliBridge` / `CodexCliBridge` / `IndusagiCliBridge`.
+
+## Examples
+
+Wire the broker into an agent as the `ModelInvoker`, layering in the optional collaborators:
+
+```rust
+use std::sync::Arc;
+use induscode::runtime_bridge::{RuntimeBroker, SpecTable};
+use induscode::runtime_bridge::bridges::{ClaudeCliBridge, CodexCliBridge};
+
+let mut broker = RuntimeBroker::new(card, gateway_invoker, Arc::new(spec_table))
+    .with_transport_factory(my_factory)   // Arc<dyn Fn(TransportContext) -> Box<dyn ChildTransport>>
+    .with_link_store(my_link_store);       // Arc<dyn RuntimeLinkStore>
+broker.register(Arc::new(ClaudeCliBridge::default()));
+broker.register(Arc::new(CodexCliBridge::default()));
+
+// Hand it to the agent; the conductor cannot tell which path a turn took:
+let invoker: Arc<dyn indusagi::runtime::ModelInvoker> = Arc::new(broker);
+```
+
+Write a custom bridge as a pure parser over the shared driver:
+
+```rust
+use induscode::runtime_bridge::{
+    NormalizedEvent, ParseStep, RuntimeAdapterId, RuntimeBridge,
+    ChildTransport, ExchangeOptions, EmissionSink,
+};
+use induscode::runtime_bridge::bridges::drive_exchange;
+use indusagi::llmgateway::contract::{Channel, Conversation, ModelCard};
+
+struct MyBridge { adapter: RuntimeAdapterId }
+
+impl RuntimeBridge for MyBridge {
+    fn adapter(&self) -> &RuntimeAdapterId { &self.adapter }
+    fn run_exchange(&self, model: ModelCard, _c: Conversation,
+                    opts: ExchangeOptions, transport: Box<dyn ChildTransport>) -> Channel {
+        let parse = Box::new(|m: &_, sink: &mut EmissionSink| {
+            // map this dialect's payload onto NormalizedEvents...
+            sink.emit(NormalizedEvent::Finish { reason: Default::default() });
+            ParseStep::Done
+        });
+        drive_exchange(model, opts, transport, serde_json::json!({"type":"turn"}), parse)
+    }
+}
+```
+
+`RuntimeAdapterId::Custom("my-cli".into())` lets a model whose `SpecTable` entry names that adapter route to `register(Arc::new(MyBridge { .. }))`.
+
+## Parity Notes
+
+This is a complete, fully-tested library layer. Its tests live alongside the source (`#[cfg(test)]` in `sink.rs`, `broker.rs`, `bridges.rs`) using a scripted `FakeTransport`, a `FakeFramework` `ModelInvoker`, and an in-memory `FakeLinkStore` — **no real binary is spawned anywhere**. Several deliberate behaviours are worth flagging against the [TS](/cli) and [Python](/python-cli/subsystems/runtime-bridge) editions:
+
+- **Side-table, not `baseUrl` decode.** Where TS rewrote `Model.baseUrl` to `bridge:<adapter>` and decoded it back, Rust resolves the spec from a canonical-id `SpecTable` (PLAN/55 §4.2 OQ1). The `bridge:` scheme survives only as a display address (`annotate_card`).
+- **No `streamSimple` to decorate.** The broker **is** a `ModelInvoker`; both arms hand back a `Channel<Emission>`. There is no `AssistantMessageEventStream`.
+- **Folded reply, no in-place accumulator.** The sink defers reconstruction to `fold_reply` at finish time rather than maintaining a frozen `AssistantMessage` snapshot per push, so it sheds the TS `OpenBlock` / `ensureOpen` / `closeOpen` machinery entirely. Block order is canonical (thinking → text → tool calls).
+- **Cancellation is a typed `Aborted`.** A cancelled exchange settles `GatewayErrorKind::Aborted` and still closes the transport — never a panic, never a hang.
+- **`cli-bridges`-gated OS seam.** The production `ChildTransportFactory` (the only `tokio::process` code) is feature-gated; the default build and the entire test suite run over fakes.
+
+The tracing-sink wiring (`wire_tracing_sink`, broker.rs) is a documented scaffold stub: the projection onto `indusagi::tracing::trace_agent_run` is filled by the conductor port. See [Parity](/rust-cli/reference/parity) for the broader translation record.
+
+## On the Framework
+
+Everything below the routing seam belongs to the [indusagi framework](/rust). The network fall-through is the framework [runtime](/rust/subsystems/runtime)'s `ModelInvoker`, backed by the [LLM gateway](/rust/subsystems/llm-gateway) via `gateway::stream` (`channel_of` + `fold_reply` from `indusagi::llmgateway`); the `Channel` / `Emission` currency, the `ModelCard` / `Conversation` / `StreamOptions` / `StopReason` types, the `GatewayError` family, and the `CancellationToken` are all framework surfaces consumed verbatim from [`indusagi::core`](/rust/subsystems/core) and `indusagi::llmgateway`. The runtime bridge adds exactly one thing on top: a typed choice, per turn, between that gateway path and an external child runtime — with both paths returning the same `Channel<Emission>`.

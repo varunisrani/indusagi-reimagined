@@ -1,0 +1,227 @@
+# Getting Started
+
+> `induscode` is a terminal-first AI coding agent for Python, built entirely on
+> the [`indusagi`](/python/README) framework. Install it with `pip install induscode`,
+> then run the `pindus` command — a bare invocation opens the interactive Textual
+> console, and flags switch it into one-shot or headless modes.
+
+## Table of Contents
+
+- [Install](#install)
+- [Set a provider key](#set-a-provider-key)
+- [Sign in interactively](#sign-in-interactively)
+- [First interactive run](#first-interactive-run)
+- [One-shot print mode](#one-shot-print-mode)
+- [Headless NDJSON mode](#headless-ndjson-mode)
+- [Pick a model](#pick-a-model)
+- [Browse the model catalog](#browse-the-model-catalog)
+- [Notes](#notes)
+
+## Install
+
+```bash
+pip install induscode
+```
+
+`induscode` requires **Python 3.11+**. The single runtime dependency is the
+framework with both extras pulled in automatically — `indusagi[mcp,tui]` — because
+the agent needs MCP enrollment and the Textual console. Installing the package
+registers two equivalent console scripts, `pindus` (primary) and `induscode`, both
+wired to `induscode.entry:run`.
+
+Confirm the install. The version is single-sourced from package metadata, never
+hardcoded:
+
+```bash
+pindus --version          # prints: induscode <version>
+pindus --help             # the option reference, generated from the flag table
+```
+
+```python
+import induscode
+print(induscode.VERSION)               # resolved via importlib.metadata
+from induscode.workspace import BRAND
+print(BRAND.bin_names)                 # ('pindus', 'induscode')
+print(BRAND.profile_dir_name)          # '.pindusagi'
+```
+
+State (settings, sessions, auth) lives under `~/.pindusagi/` by default. Override
+the location with the `INDUSAGI_CODING_AGENT_DIR` or `INDUSAGI_HOME` environment
+variables.
+
+## Set a provider key
+
+The fastest path to a first run is to export the provider key for the model you
+intend to use. Each provider reads its own environment variable through the
+framework gateway:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."   # Anthropic (Claude) — the default provider
+export OPENAI_API_KEY="sk-..."          # OpenAI
+export GEMINI_API_KEY="..."             # Google Gemini
+```
+
+With a key in the environment you can run immediately — no sign-in step is
+required. For persistent, multi-account, or browser-based (OAuth) credentials, use
+`pindus signin` instead (next section). See [Auth](/python-cli/configuration/auth)
+for the full credential model.
+
+## Sign in interactively
+
+The `signin` / `signout` verbs are consumed before flag parsing and manage stored
+credentials. They are the front of the [launch](/python-cli/subsystems/launch)
+pipeline. `login` / `logout` are accepted as natural-language aliases.
+
+```bash
+pindus signin                              # interactive provider pick, then prompt
+pindus signin --provider anthropic         # browser sign-in preferred when capable
+pindus signin --provider openai --method api-key   # force the api-key path
+pindus signin --list                       # read-only: show stored accounts
+pindus signout --provider anthropic --account work
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--provider <id>` | Target provider (`anthropic`, `openai`, `google`, `xai`, `groq`, `cerebras`, `mistral`, `openrouter`, `minimax`, …). The first positional after the verb is also accepted as the provider. |
+| `--account <name>` | Name the stored credential account (for multi-account providers). |
+| `--method <oauth\|api-key>` | Force the sign-in method. By default, browser sign-in (OAuth) is preferred for providers that support it, falling back to api-key entry. |
+| `--list` / `--ls` | List saved accounts and exit (sign-in verb only). |
+
+When no key is found in the environment, `signin` validates and persists the
+credential into the vault under `~/.pindusagi/`. OAuth-capable providers
+(`anthropic`, `openai`, plus GitHub Copilot via the device grant) run a PKCE
+browser flow.
+
+## First interactive run
+
+A bare `pindus` invocation — or any invocation that isn't `-p`/`--json` — opens the
+interactive [console](/python-cli/console/overview), a Textual TUI driven by a
+[SessionConductor](/python-cli/subsystems/conductor).
+
+```bash
+pindus                                  # interactive Textual console
+pindus "refactor the auth module"       # seed the first prompt, stay interactive
+pindus -i "start here"                  # force interactive even with a prompt
+```
+
+Inside the console you drive the agent in natural language, run slash commands
+(`/model`, `/resume`, `/theme`, …), and steer or queue follow-ups while a run is in
+flight. See [Slash Commands](/python-cli/console/slash-commands) for the full
+command set and [Dialogs](/python-cli/console/dialogs) for the interactive prompts.
+
+You can attach files to any prompt with `@path` references — text files are inlined
+into the prompt and images are sent as media:
+
+```bash
+pindus "review this" @src/main.py @diagram.png
+```
+
+Resume or continue a prior session from the directory:
+
+```bash
+pindus --resume        # -r : pick a previous session to resume
+pindus --continue      # -c : continue the most recent session in this directory
+```
+
+## One-shot print mode
+
+`-p` (`--print`) runs a single request to settlement, prints only the final result,
+and exits — ideal for scripting and pipelines. The runner selected is the
+[oneshot channel](/python-cli/subsystems/channels) in its clean-text shape.
+
+```bash
+pindus -p "summarize this repo"
+pindus -p "explain the boot pipeline" @src/induscode/boot/boot.py
+```
+
+The process exits `0` on a clean settlement and `1` if the run faulted. Because
+`induscode.entry:run` parks stdout on `/dev/null` on `BrokenPipeError`, piping
+through `| head` and friends exits cleanly.
+
+## Headless NDJSON mode
+
+Adding `--json` to a print run switches the oneshot channel into its NDJSON shape:
+a line-delimited event log instead of a single answer. Each line is one JSON value,
+framed so embedded line separators never break a naive splitter.
+
+```bash
+pindus -p --json "summarize this repo"
+```
+
+The stream begins with a `start` signal frame, emits one framed line per conductor
+signal, and ends with an `end` frame carrying the final phase and usage:
+
+```text
+{"type":"signal","name":"start", ...}
+{"type":"signal","name":"text", ...}
+{"type":"signal","name":"end","body":{"phase":"settled","usage":{...}}}
+```
+
+`--json` on its own (without `-p`) selects the long-lived bidirectional JSON-RPC
+2.0 **link** mode — a server over stdio for a driving parent process, served from
+the same declarative `SESSION_OPS` registry. The [Channels](/python-cli/subsystems/channels)
+page documents both wire surfaces in full.
+
+### How the mode is derived
+
+The output mode resolves from your flags via a fixed precedence:
+
+| Flags | Resolved mode | Runner |
+|-------|---------------|--------|
+| `--json` / `--rpc` | `rpc` | link server (JSON-RPC over stdio) |
+| `-p` without `-i` | `json` | oneshot (text, or NDJSON when `--json` is also set) |
+| anything else | `text` | interactive Textual console |
+
+## Pick a model
+
+`-m` (`--model`) selects the model for the run. The value is matched against the
+framework catalog, provider-qualified (`provider/name`) or bare:
+
+```bash
+pindus -m claude-haiku-4-5 -p "hi"
+pindus -m anthropic/claude-sonnet-4 "refactor the auth module"
+pindus -m openai/gpt -p --json "summarize this repo"
+```
+
+With no `-m`, the model falls back to `settings.default_model` from your
+[settings](/python-cli/configuration/settings), then to the framework default. Pair
+`-m` with `--thinking` to set the reasoning effort (`off`, `minimal`, `low`,
+`medium`, `high`, `xhigh`):
+
+```bash
+pindus -m claude-sonnet-4 --thinking high "design the migration plan"
+```
+
+See [Models](/python-cli/configuration/models) for the catalog and matcher, and the
+[framework gateway](/python/subsystems/llm-gateway) for provider routing.
+
+## Browse the model catalog
+
+`--list-models` prints the available models as an aligned table and exits, with no
+session and no directory side effects. Pass an optional substring to filter:
+
+```bash
+pindus --list-models             # the full provider/model catalog
+pindus --list-models claude      # filter by a case-insensitive substring
+```
+
+The table is derived from the [conductor's](/python-cli/subsystems/conductor)
+`ModelCatalog` — a normalized view over the framework `get_providers`/`get_models`
+sources — showing provider, model id, context window, max output, reasoning
+support, and image support.
+
+## Notes
+
+- Requires **Python 3.11+**; the package is `induscode` on PyPI.
+- Two equivalent console scripts are installed: `pindus` (primary) and `induscode`,
+  both → `induscode.entry:run`.
+- The interactive console and MCP mounting are always available — `induscode`
+  depends on `indusagi[mcp,tui]`, so both extras are pulled in automatically.
+- State lives under `~/.pindusagi/` by default; relocate it with
+  `INDUSAGI_CODING_AGENT_DIR` or `INDUSAGI_HOME`.
+- `--help` and `--version` are generated from the same flag table the parser reads,
+  so usage text can never drift from behavior.
+- You can drive the CLI in-process from Python: `induscode.entry.main(argv)` returns
+  an exit code instead of raising `SystemExit`, so tests can call it directly. See
+  [Launch](/python-cli/subsystems/launch) and the [CLI reference](/python-cli/reference/cli)
+  for the complete flag and mode documentation.

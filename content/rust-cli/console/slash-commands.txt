@@ -1,0 +1,471 @@
+# Slash Commands
+
+> The slash-command subsystem of the `indusr` interactive console (Rust edition):
+> a typed line like `/model`, `/resume`, or `/export out.html` is parsed,
+> resolved against an ordered registry, and run as a thin **synchronous**
+> handler that touches the world only by pushing typed `SlashEffect` values onto
+> the context. The whole machine lives in one module — `induscode::console::slash`
+> (`crates/induscode/src/console/slash.rs`) — with no `if`-ladder: every command
+> is one row in [`build_catalog`], and resolution, completion, family grouping,
+> and `/help` are all derived from that list.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [One module, no React](#one-module-no-react)
+- [The contract: outcome, effects, the command trait](#the-contract-outcome-effects-the-command-trait)
+- [Resolution pipeline](#resolution-pipeline)
+- [The command catalog](#the-command-catalog)
+- [Transcript and session control](#transcript-and-session-control)
+- [Workbench: pickers, help, diagnostics](#workbench-pickers-help-diagnostics)
+- [Integrations: auth, MCP, memory, composio, IO](#integrations-auth-mcp-memory-composio-io)
+- [Dynamic rows: skills and templates](#dynamic-rows-skills-and-templates)
+- [The full catalog listing (snapshot)](#the-full-catalog-listing-snapshot)
+- [Family commands and verb tables](#family-commands-and-verb-tables)
+- [The registry as a value](#the-registry-as-a-value)
+- [How dispatch works](#how-dispatch-works)
+- [The effect → conductor mapping](#the-effect-conductor-mapping)
+- [Public API](#public-api)
+- [Notes and parity](#notes-and-parity)
+
+## Overview
+
+When you type a line into the composer the console routes it in a fixed order: a
+leading `!` / `!!` is a shell escape; otherwise the line is resolved against the
+slash registry; otherwise it is submitted as a plain prompt. The slash layer
+owns that middle step — turning the raw string into a *discriminated outcome*
+([`SlashResolution::NotSlash`] / [`SlashResolution::Match`] / [`SlashResolution::Miss`])
+and then running the matched command's handler.
+
+Every handler is uniform and thin. The whole world a command can touch is the
+[`SlashContext`] it is handed; instead of reaching into the terminal it pushes
+typed [`SlashEffect`] values that the host loop drains *after* `run` returns.
+This keeps handlers pure with respect to the TUI, makes the catalog snapshot
+deterministically, and makes every command unit-testable by asserting a plain
+`Vec<SlashEffect>` — exactly what the upstream TS tests did with a scripted fake
+context.
+
+```rust
+pub trait SlashCommand: Send + Sync {
+    fn name(&self) -> &str;
+    fn summary(&self) -> &str;
+    fn aliases(&self) -> &[&'static str] { &[] }
+    fn family(&self) -> Option<&str> { None }
+    fn takes_args(&self) -> bool { false }
+    fn run(&self, ctx: &mut SlashContext) -> SlashOutcome;
+}
+```
+
+This documents the Rust coding agent (`indusr`), built on the Rust
+[indusagi framework](/rust). It is a clean-room rebuild of the TypeScript
+`console/slash/**` lineage; for the TS/Python editions see
+[/cli](/cli) and [/python-cli/console/slash-commands](/python-cli/console/slash-commands).
+
+## One module, no React
+
+The TS slash subsystem was split across `console/slash/{contract,resolve,registry,shared,builtins,transcript,workbench,integrations,dynamic}.ts` and dispatched from inside `TerminalConsole.tsx`. The Rust port folds the whole thing into one file, `crates/induscode/src/console/slash.rs`, organized in numbered sections:
+
+| Section | What it holds | Ports |
+|---------|---------------|-------|
+| 1. Contract | [`SlashOutcome`], [`SlashEffect`], [`SlashContext`], [`SlashCommand`] | `contract.ts` |
+| 2. Toolkit | [`info`]/[`warn`]/[`busy`]/[`success`], [`split_verb`], [`SubCommand`], [`FamilyCommand`], [`PlainCommand`] | `shared.ts` |
+| 3. Resolution | [`looks_like_slash`], [`parse_slash`], [`resolve_slash`], [`SlashLine`], [`SlashResolution`] | `resolve.ts` |
+| 4. Registry | [`SlashRegistry`], [`tokens_of`] | `registry.ts` |
+| 6. Transcript group | `transcript_commands()` (12 rows) | `transcript.ts` |
+| 7. Workbench group | `workbench_commands()` (9 rows) | `workbench.ts` |
+| 8. Integrations group | `integration_commands()` (8 rows) | `integrations.ts` |
+| 9. Dynamic rows | [`build_dynamic_commands`], `SkillCommand`, `TemplateCommand` | `dynamic.ts` |
+| 10. Assembler | [`build_catalog`], `static_commands()`, [`DEFAULT_SLASH_REGISTRY`] | `builtins.ts` |
+| 11. Dispatcher | [`dispatch_slash`], [`DispatchResult`] | `TerminalConsole.tsx` |
+
+The single biggest re-architecture: the TS `SlashContext` mixed real handles (the conductor) with React dispatch closures (`dispatch` / `openModal` / `setStatus` / `appendBlock`). The Rust framework has **no React** and the reducer is driven by *values* ([`ConsoleEvent`]), so [`SlashContext`] collects a [`SlashEffect`] list the dispatcher drains. As a consequence `run` is **synchronous** — the TS `SlashOutcome | Promise<SlashOutcome>` union was async only because the closures awaited the conductor; here those awaits become [`SlashEffect::Conductor`] requests the host loop performs, so the command body itself never blocks.
+
+## The contract: outcome, effects, the command trait
+
+A handler returns a [`SlashOutcome`] and, on the way, pushes [`SlashEffect`]s onto its [`SlashContext`].
+
+```rust
+pub enum SlashOutcome {
+    Handled,         // ran; nothing further
+    Prompt(String),  // produced text to submit as a normal turn
+    Unknown,         // not a real command — fall through to a literal prompt
+}
+pub const HANDLED: SlashOutcome = SlashOutcome::Handled;
+```
+
+[`SlashEffect`] is the value form of the TS render closures (`contract.ts:530-543`). It is `Debug + Clone` but deliberately **not** `PartialEq`, because the `Event` / `Status` / `AppendBlock` arms embed framework value types ([`ConsoleEvent`], [`StatusMessage`], [`UiDisplayBlock`]) that are `Debug`-only; tests pattern-match on shape rather than `==`.
+
+```rust
+pub enum SlashEffect {
+    Event(ConsoleEvent),                                  // raise a reducer event verbatim
+    OpenModal { kind: ModalKind, payload: Option<SlashModalPayload> },
+    CloseModal,
+    Status(StatusMessage),                                // transient toast
+    SetBuffer(String),                                    // replace the composer buffer
+    AppendBlock(UiDisplayBlock),                          // out-of-band display block
+    RequestExit,                                          // leave the console
+    Conductor(ConductorAction),                           // backend work for the host loop
+}
+```
+
+Overlays that carry data thread a typed [`SlashModalPayload`] (Rust has no `unknown`, so each data-carrying overlay gets a typed arm):
+
+```rust
+pub enum SlashModalPayload {
+    SignInProvider(String),                  // /login <provider>
+    ScopedModels(ScopedModelsIntent),        // /models-for {edit|show|reset}
+    Plugin { surface: PluginSurface, title: String, text: String }, // /mcp /memory /composio
+}
+```
+
+The [`SlashContext`] exposes one mutator per effect — `dispatch`, `set_status`, `open_modal`, `open_modal_with`, `close_modal`, `request_exit`, `set_buffer`, `append_block`, `conductor` — plus `effects()` / `drain()` for inspection. It also carries the raw `args` tail.
+
+## Resolution pipeline
+
+Resolution is three pure functions over a string and a registry. None of it touches I/O, the conductor, or the TUI.
+
+1. **[`looks_like_slash(input)`]** — whether the line is command-shaped at all. After trimming leading blanks it must start with `/` (`SLASH_PREFIX`) and the rest must match the hand-rolled `COMMAND_TOKEN` shape `^[a-zA-Z][a-zA-Z0-9:-]*(?:\s|$)`. A second slash anywhere in the token disqualifies the line, so a bare `/`, a `//comment`, and a `/usr/local/bin` path all fall through to the prompt.
+2. **[`parse_slash(input)`]** — returns `Option<SlashLine>`. The token runs to the first whitespace and is lower-cased; the argument tail is what follows, outer-trimmed, interior spacing preserved.
+3. **[`resolve_slash(input, registry)`]** — parses, then looks the token up and returns a [`SlashResolution`]:
+
+```rust
+pub enum SlashResolution<'r> {
+    NotSlash,                                              // not command-shaped
+    Match { command: &'r dyn SlashCommand, args: String },// a row owns the token
+    Miss  { name: String },                               // command-shaped, unowned
+}
+```
+
+| Outcome | Meaning | Dispatcher action |
+|---------|---------|-------------------|
+| `NotSlash` | not command-shaped | hand on as a normal prompt or `!`/`!!` escape |
+| `Match { command, args }` | a row owns the token | `command.run(ctx)` |
+| `Miss { name }` | command-shaped but no row owns it | surface "Unknown command: /name" |
+
+```rust
+use induscode::console::slash::{resolve_slash, SlashResolution, DEFAULT_SLASH_REGISTRY};
+
+match resolve_slash("/branch since the refactor", &DEFAULT_SLASH_REGISTRY) {
+    SlashResolution::Match { command, args } => {
+        assert_eq!(command.name(), "branch");
+        assert_eq!(args, "since the refactor");
+    }
+    _ => unreachable!(),
+}
+
+// An alias resolves to the same row as its canonical name:
+match resolve_slash("/fork", &DEFAULT_SLASH_REGISTRY) {
+    SlashResolution::Match { command, .. } => assert_eq!(command.name(), "branch"),
+    _ => unreachable!(),
+}
+
+// An embedded slash breaks the token shape, so a path reaches the prompt:
+assert!(matches!(
+    resolve_slash("/usr/local/bin", &DEFAULT_SLASH_REGISTRY),
+    SlashResolution::NotSlash
+));
+```
+
+Resolution is case-insensitive on the command token (the token is lower-cased in `parse_slash` and again on lookup in [`SlashRegistry::find`]).
+
+## The command catalog
+
+[`build_catalog(&DynamicCommandSources)`] concatenates three static groups in listing order, then splices in the discovered dynamic rows, dropping any discovered token that would shadow a built-in:
+
+```
+transcript_commands (12)  ->  workbench_commands (9)  ->  integration_commands (8)
+                          ->  dynamic /skill:<name> rows  ->  dynamic /<template> rows
+```
+
+That is **29 static commands** (12 + 9 + 8), plus *N* discovered dynamic rows. Counting aliases as invokable tokens — `reset`, `condense`, `compact`, `sessions`, `usage`, `fork`, `tree`, `models`, `scoped-models`, `?`, `hotkeys`, `changelog` — there are about 41 resolvable static tokens.
+
+`static_commands()` is the static prefix; [`DEFAULT_SLASH_REGISTRY`] is a `LazyLock<SlashRegistry>` built once over `static_commands()` (no dynamic rows) for the pure derivations and `/help`. The live console mounts its own registry over [`build_catalog`] with the workspace-discovered skills and templates spliced in (`console/mount.rs`).
+
+## Transcript and session control
+
+The first group (12 rows, `transcript_commands()`) resets, renames, branches, inspects, or leaves the live session. Pickers open an overlay through `ctx.open_modal(...)`; the rest request work on the [conductor](/rust-cli/subsystems/conductor) via [`SlashEffect::Conductor`].
+
+| Command | Aliases | Args | What it does |
+|---------|---------|------|--------------|
+| `/clear` | `reset` | — | Wipe the view (`rows:set` empty, `blocks:clear`, `status:clear`), toast, then request `ConductorAction::NewSession`. |
+| `/new` | — | — | Identical to `/clear` (same `run_clear` handler). |
+| `/summarize-context` | `condense`, `compact` | yes | Show a busy toast and request `ConductorAction::Condense { guidance }`; trailing text becomes the optional `guidance`. |
+| `/resume` | `sessions` | — | Open the persisted-session list (`ModalKind::Sessions`). |
+| `/session` | — | — | Request `ConductorAction::StatsBlock { cost_only: false }` — append a full stats block (ids, counts, tokens, cost). |
+| `/cost` | `usage` | — | Request `ConductorAction::StatsBlock { cost_only: true }` — the compact cost-only table. |
+| `/branch` | `fork` | — | Branch the transcript from a prior turn (`ModalKind::UserTurns`). |
+| `/timeline` | `tree` | — | Navigate the transcript tree (`ModalKind::Tree`). |
+| `/name` | — | yes | Set the session name (`ConductorAction::SetSessionName`), or bare → `ConductorAction::ReportSessionName`. |
+| `/reload` | — | — | Busy toast, then `ConductorAction::Reload` (no-op tree navigation onto the current leaf). |
+| `/quit` | — | — | `ctx.request_exit()` → leave the console. |
+| `/exit` | — | — | Same as `/quit`. |
+
+`/clear` and `/new` both wipe the rendered view *and* request `ConductorAction::NewSession`; the conductor reset is what actually empties the transcript, since the rendered conversation comes from the conductor's messages. The host loop's `NewSession` arm also drops any queued input so the fresh session starts clean.
+
+## Workbench: pickers, help, diagnostics
+
+The second group (9 rows, `workbench_commands()`) reaches the overlays a user opens to inspect or retune the session, plus the live help and keymap surfaces. The scheme picker is reached via `/settings`, not a dedicated `/theme` command (see [Theming](/rust-cli/console/theming)).
+
+| Command | Aliases | Args | What it does |
+|---------|---------|------|--------------|
+| `/model` | `models` | — | Open the single-model picker (`ModalKind::Models`). |
+| `/models-for` | `scoped-models` | yes | Edit / show / reset per-scope model routing (a family; `ModalKind::ScopedModels`). |
+| `/settings` | — | — | Open the settings overlay (`ModalKind::Settings`). |
+| `/help` | `?` | — | Append a `Commands` display block listing every command + summary, read from [`DEFAULT_SLASH_REGISTRY`]. |
+| `/keys` | `hotkeys` | — | Append a `Keyboard shortcuts` markdown table built from the 22-row `HOTKEYS` map. |
+| `/whats-new` | `changelog` | — | Append a `What's new` block (`CHANGELOG_FALLBACK` body; the on-disk `CHANGELOG.md` read is a host-loop concern). |
+| `/plan` | — | — | Request `ConductorAction::TogglePlanMode` — toggle read-only research (mutating tools blocked). |
+| `/thinking` | — | — | Request `ConductorAction::CycleThinkingLevel` (off → low → medium → off). |
+| `/debug` | — | — | Raise `ConsoleEvent::ToggleReasoning` *and* request `ConductorAction::WriteDebugLog`. |
+
+`/help` is rendered by `help_block()`, which reads the assembled [`DEFAULT_SLASH_REGISTRY`] under `LazyLock` (the TS call-time dynamic import to dodge an init cycle disappears). Each row is formatted as `- **/name** _(/alias, ...)_ — summary`, headed by `N commands available. Type \`/\` to complete.`. `/keys` renders the grounded chord/effect table — `Enter` (submit), `Shift+Enter` (soft newline), `Esc Esc` (tree navigator), `Ctrl+C` (interrupt), `Ctrl+L` (model picker), `Ctrl+R` (resume list), `! <cmd>` / `!! <cmd>` (shell escapes), and the rest. See [Input handling](/rust-cli/console/overview#input-handling).
+
+## Integrations: auth, MCP, memory, composio, IO
+
+The third group (8 rows, `integration_commands()`) bridges credentials, MCP, the working-memory capability, Composio, and transcript IO. It builds on the framework's [MCP facade](/rust/subsystems/facade) and the agent's [capability deck](/rust-cli/subsystems/capability-deck).
+
+| Command | Aliases | Args | Family | What it does |
+|---------|---------|------|--------|--------------|
+| `/login` | — | yes | — | Open the sign-in launcher (`ModalKind::SignIn`); `/login <provider>` threads `SlashModalPayload::SignInProvider`. |
+| `/logout` | — | — | — | Open the sign-out confirmation (`ModalKind::SignOut`). |
+| `/mcp` | — | yes | — | Drive the MCP fleet: a verb of `status` (default) / `connect` / `reconnect` / `disconnect` / `tools` requests `ConductorAction::Mcp { verb }`; anything else warns. |
+| `/memory` | — | yes | `memory` | Inspect and toggle the working-memory capability (verbs `status`, `on`, `off`, `tools`; `ModalKind::Plugin`). |
+| `/composio` | — | yes | `composio` | Connect and inspect Composio app bridges (verbs `status`, `accounts`, `tools`, `connect`, `enable`; `ModalKind::Plugin`). |
+| `/copy` | — | — | — | Request `ConductorAction::CopyLastReply` — last reply → OS clipboard. |
+| `/export` | — | yes | — | Request `ConductorAction::ExportTranscript { path }` — render the transcript to an HTML file. |
+| `/share` | — | — | — | Request `ConductorAction::ShareTranscript` — export, then publish a secret GitHub gist. |
+
+```bash
+# inside the indusr interactive session
+/mcp connect             # build + connect the workspace MCP pool, show status
+/composio enable github  # hydrate a Composio toolkit's tools
+/export out.html         # render the live transcript to HTML
+/share                   # publish the transcript as a secret gist
+/copy                    # last reply -> clipboard
+```
+
+`/composio` needs `COMPOSIO_API_KEY` in the environment; without it the verbs surface a warn toast and a plugin overlay carrying `COMPOSIO_NO_KEY` ("Composio is not configured. Export COMPOSIO_API_KEY ..."). `/memory on|off` flips only the reported active flag and re-renders the overlay text — it does not detach the `memory` tool from the live deck. See [MCP configuration](/rust-cli/configuration/mcp).
+
+## Dynamic rows: skills and templates
+
+Two row shapes are *discovered*, not hand-written, from the [briefing](/rust-cli/subsystems/briefing) layer's [`DynamicCommandSources`] (capability cards from `SKILL.md` files, prompt templates from `*.md` macro files). [`build_dynamic_commands`] projects them into command rows — **skills first** (namespaced under `skill:`), then templates — suppressing self-collisions first-wins; an empty source yields `[]`. Both return a `SlashOutcome::Prompt` the dispatcher submits as a normal turn.
+
+```rust
+pub struct DynamicCommandSources {
+    pub skills: Vec<SkillCard>,    // discovered SKILL.md capability cards
+    pub templates: Vec<Macro>,     // discovered *.md macro files
+}
+pub fn build_dynamic_commands(sources: &DynamicCommandSources) -> Vec<Box<dyn SlashCommand>>;
+```
+
+- **`/skill:<name>`** (`SkillCommand`, family `skill`, `takes_args`) — its `run` mints an Agent-Skills invocation block via `skill_invocation_block`: `<skill name="..." location="...">body</skill>`, where the trailing argument becomes the body and the four XML-significant characters (`&`, `<`, `>`, `"`) are escaped by `escape_attr`. So `/skill:commit tidy the staged diff` runs the `commit` card against "tidy the staged diff". The completion summary is the card description run through `clamp_summary` (whitespace collapsed, capped at `SUMMARY_BUDGET = 88` chars with a `…` suffix).
+- **`/<template>`** (`TemplateCommand`, family `template`, `takes_args`) — its `run` expands the macro body against the trailing arguments with `crate::briefing::macros::apply_macros(&self.body, &ctx.args)`, supporting `$1`/`$2` positional and `$ARGUMENTS` whole-tail placeholders.
+
+A discovered row whose lower-cased token collides with a reserved built-in token is dropped by [`build_catalog`] (the `reserved_tokens` guard) rather than crashing the registry build — so splicing dynamic rows can never make [`SlashRegistry::build`] panic.
+
+## The full catalog listing (snapshot)
+
+This is the authoritative, order-preserving listing pinned by the `catalog_listing_snapshot` test (`src/console/snapshots/induscode__console__slash__tests__catalog_listing_snapshot.snap`). It is generated from `build_catalog` with one fake skill, one fake template, and a `help` template that the collision guard drops. Format per row: `/<name> (<aliases>)  [<family>]  <summary>`.
+
+```text
+/clear (reset)  [-]  Clear the conversation and start a new session
+/new  [-]  Start a fresh session
+/summarize-context (condense,compact)  [-]  Condense the conversation context
+/resume (sessions)  [-]  Resume a persisted session
+/session  [-]  Show live session statistics (ids, counts, tokens, cost)
+/cost (usage)  [-]  Show session cost and token usage
+/branch (fork)  [-]  Branch the transcript from a prior turn
+/timeline (tree)  [-]  Navigate the transcript tree
+/name  [-]  Name the session, or show the current name
+/reload  [-]  Reload session resources
+/quit  [-]  Leave the interactive console
+/exit  [-]  Leave the interactive console
+/model (models)  [-]  Switch the model bound to this session
+/models-for (scoped-models)  [models-for]  Edit, show, or reset per-scope model routing
+/settings  [-]  Open the settings overlay
+/help (?)  [-]  List the available commands
+/keys (hotkeys)  [-]  Show the keyboard shortcut map
+/whats-new (changelog)  [-]  Show what changed in this build
+/plan  [-]  Toggle plan mode (read-only research; mutating tools are blocked)
+/thinking  [-]  Cycle thinking effort level (off → low → medium → off)
+/debug  [-]  Write a session diagnostics log and toggle verbose view
+/login  [-]  Sign in to a model provider.
+/logout  [-]  Sign out of a model provider.
+/mcp  [-]  Manage MCP servers and their tools.
+/memory  [memory]  Inspect and toggle the working-memory capability.
+/composio  [composio]  Connect and inspect Composio app bridges.
+/copy  [-]  Copy the last reply to the clipboard.
+/export  [-]  Export the transcript to an HTML file.
+/share  [-]  Share the session as a secret GitHub gist.
+/skill:commit-helper  [skill]  a test skill
+/review-pr  [template]  the review-pr template (project)
+```
+
+The two trailing rows are the spliced dynamic examples; the `help`-named template is absent because it shadowed a built-in token and was filtered.
+
+## Family commands and verb tables
+
+A command with sub-verbs (`/models-for`, `/memory`, `/composio`) is a [`FamilyCommand`] built from a `&'static [SubCommand]` table — a table, not an `if`-ladder. This is the single most important structural pattern preserved from the TS (`shared.ts`'s `familyRunner`).
+
+```rust
+pub struct SubCommand {
+    pub verb: &'static str,
+    pub describe: &'static str,
+    pub run: fn(&mut SlashContext, &str) -> SlashOutcome,  // `rest` is the tail after the verb
+}
+
+pub struct FamilyCommand {
+    pub name: &'static str,
+    pub summary: &'static str,
+    pub aliases: &'static [&'static str],
+    pub family: &'static str,
+    pub subs: &'static [SubCommand],
+}
+```
+
+`FamilyCommand::run` calls [`split_verb`] to peel the leading (lower-cased) verb off the args, then `subs.iter().find(|s| s.verb == verb)`:
+
+- a **bare** invocation (empty verb) emits a usage warn assembled from the table — `/<family> expects: verb (describe), …`;
+- an **unknown** verb emits `/<family>: unrecognised action "<verb>".` followed by the same usage line;
+- a **known** verb runs `(sub.run)(ctx, &rest)`.
+
+The verb tables, copied from the source:
+
+| Family | Label const | Verbs |
+|--------|-------------|-------|
+| `/models-for` | `family::SCOPED_MODELS` (`models-for`) | `edit` (open the editor), `show` (review assignments), `reset` (clear every override) — each opens `ModalKind::ScopedModels` with a `ScopedModelsIntent`. |
+| `/memory` | `family::MEMORY` (`memory`) | `status`, `on`, `off`, `tools` — each opens the memory plugin overlay; `on`/`off` also flip the reported active flag. |
+| `/composio` | `family::COMPOSIO` (`composio`) | `status`, `accounts`, `tools`, `connect <toolkit>`, `enable <toolkit>` — `connect`/`enable` warn if no target; all surface the missing-key overlay. |
+
+The `family` module also declares `THEME`, `SKILL`, and `TEMPLATE` labels; `skill` and `template` are the families the dynamic rows report, while `theme` is declared for parity with no `/theme` command shipping.
+
+```rust
+pub mod family {
+    pub const COMPOSIO: &str = "composio";
+    pub const MEMORY: &str = "memory";
+    pub const SCOPED_MODELS: &str = "models-for";
+    pub const THEME: &str = "theme";
+    pub const SKILL: &str = "skill";
+    pub const TEMPLATE: &str = "template";
+}
+```
+
+## The registry as a value
+
+[`SlashRegistry`] is an ordered `Vec<Box<dyn SlashCommand>>` plus a derived `HashMap<String, usize>` token → slot index. Adding a command is appending a row to a group; resolution, completion, and grouping are all pure derivations.
+
+```rust
+pub struct SlashRegistry {
+    commands: Vec<Box<dyn SlashCommand>>,
+    index: HashMap<String, usize>,   // lower-cased token -> slot
+}
+
+impl SlashRegistry {
+    pub fn build(commands: Vec<Box<dyn SlashCommand>>) -> Self;     // PANICS on a duplicate token
+    pub fn commands(&self) -> &[Box<dyn SlashCommand>];            // listing order
+    pub fn find(&self, token: &str) -> Option<&dyn SlashCommand>;  // canonical or alias, case-insensitive
+    pub fn match_prefix(&self, partial: &str) -> Vec<&dyn SlashCommand>; // completion set, deduped
+    pub fn list_families(&self) -> Vec<&str>;                      // labels, first-seen order
+    pub fn commands_in_family(&self, family: &str) -> Vec<&dyn SlashCommand>;
+}
+```
+
+[`SlashRegistry::build`] folds the ordered list, indexing every token (canonical + alias) via [`tokens_of`], and **panics** on any duplicate token — a programming error surfaced loudly at assembly, never silently shadowed (`token "x" is claimed by both "a" and "b"`). [`SlashRegistry::match_prefix`] returns the completion candidates in registry order, deduped per command; an empty partial returns the whole list (the bare-`/` window).
+
+```rust
+use induscode::console::slash::{build_catalog, DynamicCommandSources, SlashRegistry};
+
+let registry = SlashRegistry::build(build_catalog(&DynamicCommandSources::default()));
+let names: Vec<&str> = registry
+    .match_prefix("mo")            // /model, /models-for, ...
+    .iter()
+    .map(|c| c.name())
+    .collect();
+```
+
+## How dispatch works
+
+The one effectful seam is [`dispatch_slash`] — re-homed off React into the console input path. It resolves the line, runs the matched command, drains the collected effects, and returns a [`DispatchResult`].
+
+```rust
+pub enum DispatchResult {
+    NotSlash,                                        // hand the line to run_turn as a normal prompt
+    Unknown(String),                                 // emit "Unknown command: /name"
+    Handled { effects: Vec<SlashEffect> },           // apply effects to the reducer
+    Submit { text: String, effects: Vec<SlashEffect> }, // apply effects, then submit `text`
+}
+
+pub fn dispatch_slash(line: &str, registry: &SlashRegistry) -> DispatchResult;
+```
+
+A `SlashOutcome::Prompt` maps to `Submit`; everything else to `Handled`. The host loop lives in `console/mount.rs`, where `submit_line` follows the verbatim routing order:
+
+1. The composer buffer is cleared and the line pushed to history.
+2. `slash::dispatch_slash(&line, registry)` runs.
+3. `NotSlash` → `spawn_submit(conductor, line)` (a normal turn).
+4. `Unknown(name)` → a warn toast `Unknown command: /name`.
+5. `Handled { effects }` → `apply_slash_effects(...)`.
+6. `Submit { text, effects }` → apply the effects, then `spawn_submit(conductor, text)`.
+
+`apply_slash_effects` walks the `Vec<SlashEffect>` and folds each into the [`ConsoleEvent`] reducer (`Event` verbatim, `OpenModal` → `ModalOpen` with a lifted payload, `CloseModal`, `Status` → `StatusSet`, `SetBuffer` → `BufferSet`, `AppendBlock` → `BlockAppend`), with `RequestExit` returning `Flow::Exit` and `Conductor` deferred to `apply_conductor_action`.
+
+## The effect → conductor mapping
+
+Conductor-backed verbs request their backend work through [`SlashEffect::Conductor`] / [`SlashEffect::RequestExit`]; the host loop performs them against the live [conductor](/rust-cli/subsystems/conductor) so the slash layer itself stays pure and snapshots deterministically.
+
+```rust
+pub enum ConductorAction {
+    NewSession,                              // /clear, /new
+    Condense { guidance: Option<String> },  // /summarize-context
+    SetSessionName(String),                  // /name <label>
+    Reload,                                  // /reload
+    TogglePlanMode,                          // /plan
+    CycleThinkingLevel,                      // /thinking
+    WriteDebugLog,                           // /debug
+    StatsBlock { cost_only: bool },          // /session (false), /cost (true)
+    ReportSessionName,                       // bare /name
+    CopyLastReply,                           // /copy
+    ExportTranscript { path: String },       // /export [path]
+    ShareTranscript,                         // /share
+    Mcp { verb: String },                    // /mcp <verb>
+}
+```
+
+In `apply_conductor_action`: `NewSession` clears the queued input; `Condense` runs `conductor.condense()` on a background task; `StatsBlock` reads `conductor.stats().await` and appends a `Session statistics` / `Session cost` markdown block; the IO and reload arms read the live transcript off the framework agent's async snapshot.
+
+## Public API
+
+All of the following live in `induscode::console::slash` (`crates/induscode/src/console/slash.rs`).
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `SlashCommand` | trait | One registry row: `name` / `summary` / `aliases` / `family` / `takes_args` / `run`. Object-safe. |
+| `SlashContext` | struct | The command's whole world: `args` + a collected `effects` buffer with one mutator per effect. |
+| `SlashOutcome` / `HANDLED` | enum / const | `Handled` / `Prompt(String)` / `Unknown`, plus the settled const. |
+| `SlashEffect` | enum | The drained UI/backend effects (`Event`, `OpenModal`, `CloseModal`, `Status`, `SetBuffer`, `AppendBlock`, `RequestExit`, `Conductor`). |
+| `SlashModalPayload` / `PluginSurface` / `ScopedModelsIntent` | enum | Typed overlay payloads. |
+| `ConductorAction` | enum | The conductor-side actions the host loop performs. |
+| `PlainCommand` / `FamilyCommand` / `SubCommand` | struct | The two `SlashCommand` row shapes + a family sub-verb. |
+| `split_verb` | fn | Peel a lower-cased leading verb off an args string. |
+| `info` / `warn` / `busy` / `success` | fn | Status-toast minters (`StatusMessage` + `StatusKind`). |
+| `looks_like_slash` / `parse_slash` / `resolve_slash` | fn | The resolution front half + the resolver. |
+| `SlashLine` / `SlashResolution` / `SLASH_PREFIX` | type / const | The parsed line, the resolution union, and the `/` prefix. |
+| `SlashRegistry` / `tokens_of` | struct / fn | The resolved table + the token enumerator. |
+| `DynamicCommandSources` / `build_dynamic_commands` | struct / fn | The discovered skills/templates and their projection. |
+| `build_catalog` / `DEFAULT_SLASH_REGISTRY` | fn / static | The catalog assembler and the lazy static built-in registry. |
+| `dispatch_slash` / `DispatchResult` | fn / enum | The one effectful seam and its result. |
+| `family` (module) | module | The family label consts (`COMPOSIO`, `MEMORY`, `SCOPED_MODELS`, `THEME`, `SKILL`, `TEMPLATE`). |
+
+The console binary itself is `indusr` (with `indusagir` as an equivalent second bin name; both compile from `src/bin/main.rs`).
+
+## Notes and parity
+
+- **29 static commands**, not "30+": 12 transcript + 9 workbench + 8 integration rows, plus the discovered dynamic rows. The 9-row workbench group adds `/cost`, `/plan`, and `/thinking` over the 7-row Python edition.
+- **No `/theme` command ships.** `family::THEME` is declared for parity but the scheme picker is reached via `/settings` only. `/export` is HTML only.
+- **Every handler is synchronous.** The TS async-only-because-of-React closures become [`SlashEffect::Conductor`] requests the host loop awaits; the command body never blocks. This is the inverse of the [Python edition](/python-cli/console/slash-commands), where every handler is `async` and awaited.
+- **`/summarize-context` with guidance** threads the trailing text as `ConductorAction::Condense { guidance: Some(...) }`; bare it is `guidance: None`.
+- **`/memory on|off`** flips only the reported active flag and re-renders the plugin overlay text; it does not detach the `memory` tool from the live [capability deck](/rust-cli/subsystems/capability-deck).
+- **[`SlashRegistry::build`] panics** on any duplicate token at assembly time; [`build_catalog`] pre-reserves static tokens (the `reserved_tokens` guard) so a colliding discovered skill/template is dropped rather than crashing the build.
+- **No `regex` dependency.** The `COMMAND_TOKEN` shape is hand-rolled in `matches_command_token`, which also rejects a second `/` so a `/usr/local/bin` path reaches the prompt.
+
+This area is a clean-room rebuild of the TypeScript `console/slash/**` lineage; see [Parity](/rust-cli/reference/parity) for the documented port deltas, and the [framework](/rust) for the LLM gateway and agent core the conductor drives.

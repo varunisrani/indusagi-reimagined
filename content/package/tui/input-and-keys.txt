@@ -1,0 +1,142 @@
+# Input, Keys, and Autocomplete
+
+> Keyboard handling is split into three pure modules under `src/ui`: key decoding
+> (`keys.ts`), action mapping (`keybindings.ts`), and completion (`autocomplete.ts`).
+> All three are re-exported from `indusagi/tui` (`src/ui/index.ts`). React dialogs
+> read keys through Ink's `useInput`; the editor reads them through these modules.
+
+## Two input paths
+
+- **Dialogs** (`indusagi/react-ink`) handle keys with Ink's `useInput((input, key) => …)`
+  from `indusagi/react-host/ink`. They branch on `key.upArrow`, `key.downArrow`,
+  `key.return`, `key.escape`, `key.backspace`/`key.delete`, and `key.ctrl && input === "u"`.
+- **The editor / toolkit** decodes raw stdin with `parseKey`/`matchesKey` and maps
+  it to a named `EditorAction` through `EditorKeybindingsManager`.
+
+## Key Decoding
+
+File: `src/ui/keys.ts` (exported via `indusagi/tui`).
+
+Public surface:
+
+- `parseKey(data: string): string | undefined` — decode raw input into its key id.
+- `matchesKey(data: string, keyId: KeyId): boolean` — test whether raw input is a key.
+- `Key` — a builder yielding strongly-typed `KeyId`s.
+- `KeyId` — the union of recognized key identifiers; `KeyEventType` is `"press" |
+  "repeat" | "release"`.
+- `isKeyRepeat(data)` / `isKeyRelease(data)` — classify Kitty-protocol event types.
+- `setKittyProtocolActive(active)` / `isKittyProtocolActive()` — the shared
+  Kitty-keyboard-protocol flag the terminal layer flips once the protocol is confirmed.
+
+The module decodes both traditional escape sequences and the
+[Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/),
+including punctuation and ctrl/shift combinations. A handful of ctrl+symbol presses
+collide with ASCII control codes (e.g. ctrl+[ is indistinguishable from ESC), which
+is inherent to legacy encoding.
+
+```ts
+import { Key, matchesKey, parseKey } from "indusagi/tui";
+
+if (matchesKey(data, Key.ctrl("c"))) abort();
+const id = parseKey(data); // e.g. "up", "ctrl+u", or undefined
+```
+
+## Keybindings
+
+File: `src/ui/keybindings.ts` (exported via `indusagi/tui`).
+
+- `EditorAction` — the union of editor actions: caret moves (`cursorUp`,
+  `cursorWordLeft`, `cursorLineStart`, `pageUp`, …), deletions (`deleteCharBackward`,
+  `deleteWordForward`, `deleteToLineEnd`, …), text entry (`newLine`, `submit`, `tab`),
+  completion-popup driving (`selectUp`, `selectDown`, `selectConfirm`, `selectCancel`,
+  …), `copy`, the emacs kill ring (`yank`, `yankPop`), `undo`, `expandTools`, and more.
+- `DEFAULT_EDITOR_KEYBINDINGS` — the default `EditorAction → KeyId[]` mapping.
+- `EditorKeybindingsConfig` — a partial override map.
+- `EditorKeybindingsManager` — resolves keys to actions:
+  - `matches(data, action, componentId?)` — does raw `data` trigger `action`?
+  - `getKeys(action)` — every `KeyId` wired to an action.
+  - `registerAction(action, keys)`, `getRegisteredActions()`.
+  - `setConfig(config, preset?)` — swap in a fresh config.
+  - `setComponentOverride(componentId, config)` / `clearComponentOverride(componentId)`
+    — per-component (per keybinding-scope) overrides.
+  - `detectConflicts()` — list binding conflicts.
+- `getEditorKeybindings()` / `setEditorKeybindings(manager)` — the process-wide
+  singleton manager.
+
+```ts
+import { getEditorKeybindings } from "indusagi/tui";
+
+const keys = getEditorKeybindings();
+if (keys.matches(data, "submit")) commit();
+```
+
+A `vim` preset and `KeybindingPreset` type exist inside the module, but the public
+`indusagi/tui` barrel re-exports only the default-mapping symbols above.
+
+## Editor Component Contract
+
+File: `src/ui/editor-component.ts` (exported via `indusagi/tui`).
+
+`EditorComponent` composes a `Component` with four concern-split interfaces so a
+custom editor (vim/emacs mode, custom keybindings) stays compatible:
+
+- `EditorReadAccess` — `getText()`, optional `getExpandedText()`.
+- `EditorWriteAccess` — `setText(text)`, optional `insertTextAtCursor(text)`,
+  `addToHistory(text)`.
+- `EditorDisplayConfig` — optional `borderColor(str)`, `setPaddingX(n)`,
+  `setAutocompleteProvider(provider)`, `getKeybindingScopeId()`.
+- `EditorEventCallbacks` — optional `onSubmit(text)`, `onChange(text)`.
+
+## Autocomplete
+
+File: `src/ui/autocomplete.ts` (exported via `indusagi/tui`).
+
+- `AutocompleteItem` — `{ value, label, description? }`.
+- `SlashCommand` — `{ name, description?, getArgumentCompletions?(prefix) }`.
+- `AutocompleteProvider` — `getSuggestions(lines, cursorLine, cursorCol)` returning
+  `{ items, prefix } | null`, and `applyCompletion(lines, cursorLine, cursorCol, item, prefix)`.
+- `CombinedAutocompleteProvider` — the default provider.
+  `new CombinedAutocompleteProvider(commands?, basePath?, fdPath?)`. Its
+  `getSuggestions` tries, in order: a `@`-prefix fuzzy file attachment search, then
+  slash-command name/argument completion, then plain path completion.
+
+`@`-prefix fuzzy file search and plain path completion both traverse the tree. When
+an `fdPath` is provided, the provider shells out to the external `fd` binary
+(`--type f --type d --full-path`, gitignore-aware) via `spawnSync`; otherwise it
+falls back to a `readdirSync`/`statSync` walk. Completions are cached per query.
+
+```ts
+import { CombinedAutocompleteProvider } from "indusagi/tui";
+
+const provider = new CombinedAutocompleteProvider(
+  [{ name: "model", description: "Pick a model" }],
+  process.cwd(),
+  "/usr/bin/fd",
+);
+const result = provider.getSuggestions(["@src/"], 0, 5);
+```
+
+## Fuzzy Matching
+
+File: `src/ui/fuzzy.ts` (exported via `indusagi/tui`).
+
+- `fuzzyMatch(query, text): FuzzyMatch` — returns `{ matches, score }`.
+- `fuzzyFilter(items, query, getText)` — filters and ranks items by score.
+
+(The dialogs use a simpler `matchesSearchQuery` from
+`src/react-ink/utils/selection-dialog.ts` for their substring filtering, distinct
+from `fuzzyMatch`.)
+
+## Text Width Helpers
+
+File: `src/ui/utils.ts` (exported via `indusagi/tui`).
+
+- `visibleWidth(str)` — ANSI-aware terminal column width.
+- `truncateToWidth(...)` — clip a string to a column budget.
+- `wrapTextWithAnsi(text, width)` — wrap to a width while preserving ANSI runs.
+
+## Next Docs
+
+- [TUI Module](/docs/tui/README)
+- [TUI Components Reference](/docs/tui/components)
+- [TUI Architecture](/docs/tui/architecture)

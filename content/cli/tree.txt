@@ -1,0 +1,142 @@
+# Session Tree Navigation
+
+> The transcript is an append-only **tree**. Branching is just moving the active leaf to an earlier node — the next message becomes that node's child, forking a new path without rewriting history.
+
+The conductor stores each session as a branchable tree of nodes (see [session.md](session.md)). The `/tree` and `/fork` commands let you walk that tree: revisit an earlier point, continue from there, or re-edit a past prompt to explore an alternative.
+
+## Table of Contents
+
+- [Commands](#commands)
+- [The Tree Model](#the-tree-model)
+- [Branch Navigation (`/tree`)](#branch-navigation-tree)
+- [Forking from a Prior Turn (`/fork`)](#forking-from-a-prior-turn-fork)
+- [Projecting a Loaded Transcript](#projecting-a-loaded-transcript)
+- [Conductor API](#conductor-api)
+- [Source Files](#source-files)
+
+## Commands
+
+Two slash commands open tree-navigation modals in the interactive console:
+
+| Command | Aliases | Opens | Action |
+|---------|---------|-------|--------|
+| `/timeline` | `/tree` | the tree navigator modal | Move the active leaf to any node in the tree. |
+| `/branch` | `/fork` | the prior-user-turn picker | Pick an earlier user prompt to branch from. |
+
+Both commands raise a modal; the selection drives the conductor. Neither writes a new session file — branching happens **in place** in the same `.ndjson` file.
+
+## The Tree Model
+
+The on-disk transcript is a tree of `TranscriptEntry` nodes, each naming its `parent` (`null` for a root). A single `SessionHead` tracks the active `leaf`:
+
+```typescript
+interface SessionHead {
+  readonly sessionId: string;
+  readonly leaf: string | null;  // id of the active leaf, or null when empty
+}
+```
+
+The **active branch** is the `parent`-chain walked from the leaf back to a root, reversed to chronological order. The store exposes it via `pathTo()` — this is the message list the agent replays on resume.
+
+```
+[user] ── [assistant] ── [user] ── [assistant] ─┬─ [user]   ← current leaf (active branch)
+                                                 │
+                                                 └─ [user]   ← alternate branch
+```
+
+The store's branching primitive is `branchAt(id)`: it validates `id` is a known node, repoints the leaf onto it, and rewrites the head line. The next `append` becomes a child of that node.
+
+```typescript
+await store.branchAt(nodeId);   // repoint the leaf
+// the next append forks a new path under nodeId
+```
+
+`reset()` rewinds the head to `null` (the next append starts a new root — used when re-editing the very first turn). `startNewSession(id)` drops all nodes and starts a fresh, empty session under a new id (the `/clear` primitive — the old transcript is left intact on disk).
+
+## Branch Navigation (`/tree`)
+
+`/tree` (`/timeline`) opens the tree navigator. Selecting a node calls the conductor's `navigateTree(nodeId)`, which:
+
+1. Calls `store.branchAt(nodeId)` to move the leaf onto the chosen node.
+2. Rebuilds that branch's root→leaf path.
+3. Rebinds the agent's message list to it.
+
+```typescript
+await conductor.navigateTree(nodeId);
+```
+
+This walks between **existing** branches without forking a new one — you continue the conversation from the chosen point.
+
+The navigator renders the tree as a flat, depth-indented list. The `SessionLibrary.tree(store)` projection produces one `BranchNode` per node:
+
+```typescript
+interface BranchNode {
+  readonly id: string;
+  readonly parent: string | null;
+  readonly label: string;    // depth-indented, role-aware one-line label
+  readonly depth: number;    // distance from the root (root = 0)
+  readonly isLeaf: boolean;  // true when the node has no children
+  readonly isCurrent: boolean; // true when this is the active leaf
+}
+```
+
+Nodes are walked from each root downward in a stable depth-first order. A node is a leaf when nothing names it as `parent`; the active leaf is marked `isCurrent`. Labels are role-aware (`user: <preview>`, `assistant`, `tool: <name>`, `condense`, `system`, `note`).
+
+## Forking from a Prior Turn (`/fork`)
+
+`/fork` (`/branch`) opens a flat list of the user prompts on the **active branch** so you can re-ask or re-edit one. Selecting a turn calls the conductor's `fork(entryId)`, which opens a new branch whose parent is `entryId` and rebinds the agent to that branch's root→leaf path.
+
+```typescript
+await conductor.fork(entryId);
+```
+
+The picker is fed by `SessionLibrary.priorTurns(store)`, which reads the root→leaf branch and keeps only user-role nodes with real text:
+
+```typescript
+interface PriorTurn {
+  readonly entryId: string;  // the transcript node to fork from
+  readonly text: string;     // full prompt text
+  readonly preview: string;  // trimmed single-line excerpt for display
+}
+```
+
+## Projecting a Loaded Transcript
+
+Both projections operate on a live `TranscriptStore` you open via the `SessionLibrary`:
+
+```typescript
+import { sessions } from "indusagi-coding-agent";
+
+const library = new sessions.SessionLibrary({
+  sessionsDir: `${process.env.HOME}/.indusagi/agent/sessions`,
+});
+
+const store = await library.open(sessionId);
+if (store) {
+  const nodes = library.tree(store);        // BranchNode[] for the navigator
+  const turns = library.priorTurns(store);  // PriorTurn[] for the fork picker
+}
+```
+
+## Conductor API
+
+The branching surface on `SessionConductor`:
+
+| Method | Effect |
+|--------|--------|
+| `fork(entryId)` | Open a new branch whose parent is `entryId`; rebind the agent to that branch. |
+| `navigateTree(nodeId)` | Make `nodeId` the active leaf; rebuild and rebind that branch's path. |
+| `snapshot().head` | Read the current `SessionHead` (`sessionId` + active `leaf`). |
+| `messages()` | The live transcript messages for the active branch. |
+
+A failed branch surfaces a typed `ConductorFault` (`kind: "persistence"`) rather than throwing through the call.
+
+## Source Files
+
+Internal source (`indus-code-rebuild/src`):
+
+- `conductor/transcript-store/store.ts` — `TranscriptStore.branchAt`, `pathTo`, `reset`, `startNewSession`.
+- `sessions/library.ts` — `SessionLibrary.tree`, `priorTurns`.
+- `sessions/contract.ts` — `BranchNode`, `PriorTurn`.
+- `conductor/conductor.ts` — `SessionConductor.fork`, `navigateTree`.
+- `console/slash/commands/transcript.ts` — the `/timeline` (`/tree`) and `/branch` (`/fork`) commands.

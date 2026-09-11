@@ -1,0 +1,265 @@
+# Smithy (Agent Builder)
+
+> `indusagi.smithy` is the agent-builder meta-tool — a config-driven and interactive "forge" that interviews a user, merges the answers over a starter profile into a validated `AgentBlueprint`, and instantiates it as a runnable runtime `Agent`. Imported as `import indusagi.smithy` (lazily re-exported as the `smithy` namespace from `indusagi`).
+
+Smithy is a leaf product surface. Its single job is to help a user design and generate new agents that run on the indusagi runtime. Instead of shipping a family of near-identical `create_*_agent` factories, it ships one data-driven generator: starter profiles supply partial blueprints, `define_agent` merges a user spec over a profile and validates it, and `to_agent_config` bridges the finished blueprint into the runtime's `AgentConfig` and `ToolBox`. The `Forge` build session wires the five internal layers — config, persona, knowledge, runtime ledger, ui transcript — into one drivable interview. The interactive view is kept behind a tiny terminal-free `ForgeView` seam, so the whole flow is scriptable and testable with no real I/O.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-directories](#sub-directories)
+- [Blueprints and profiles](#blueprints-and-profiles)
+- [The merge generator](#the-merge-generator)
+- [The Forge build session](#the-forge-build-session)
+- [CLI flags](#cli-flags)
+- [The knowledge pack](#the-knowledge-pack)
+- [Tool ledger and transcript](#tool-ledger-and-transcript)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+Everything is re-exported from `indusagi/smithy/__init__.py` — that is the single import site.
+
+### persona — blueprint, profiles, generator
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `AgentBlueprint` | class | `persona/blueprint.py` | Frozen pydantic v2 model and validation source of truth: `name` (kebab-case), `description`, `system_prompt` (alias `systemPrompt`), `tool_collection` (alias `toolCollection`), `model`, optional `tags` |
+| `BlueprintError` | class | `persona/blueprint.py` | Raised when a candidate fails the schema; carries `.issues` as a tuple of `path: message` strings |
+| `ToolCollectionName` | type | `persona/blueprint.py` | `Literal["read-only", "coding", "all"]` — the granted tool surface, kept identical to the capabilities alias |
+| `validate_blueprint` | function | `persona/blueprint.py` | Validate any value as a blueprint, raising `BlueprintError`; returns a fresh typed object |
+| `try_validate_blueprint` | function | `persona/blueprint.py` | Non-throwing variant: returns the typed blueprint or `None` |
+| `serialize_blueprint` | function | `persona/blueprint.py` | Serialize to canonical, fixed-key-order, 2-space JSON (camelCase keys); omits `tags` when empty |
+| `deserialize_blueprint` | function | `persona/blueprint.py` | Parse JSON text back into a validated blueprint; bad JSON and schema failures both surface as `BlueprintError` |
+| `agent_blueprint_schema` | const | `persona/blueprint.py` | Surface alias for the schema export — it is the `AgentBlueprint` class itself |
+| `AgentSpec` | dataclass | `persona/define_agent.py` | The minimum a caller supplies (`name` required; `description`/`system_prompt`/`tool_collection`/`model`/`tags` optional) |
+| `define_agent` | function | `persona/define_agent.py` | The single generator: merge `AgentSpec` over a named profile over a baseline, then validate into an `AgentBlueprint` |
+| `to_agent_config` | function | `persona/define_agent.py` | Project a validated blueprint onto the runtime `AgentConfig`, resolving the tool collection into a `ToolBox` |
+| `PROFILES` | const | `persona/profiles.py` | `MappingProxyType` of starter profiles `coder`/`researcher`/`reviewer` → `AgentProfile` |
+| `PROFILE_NAMES` | const | `persona/profiles.py` | `tuple[ProfileName, ...]` in insertion order, for menus and validation |
+| `AgentProfile` | dataclass | `persona/profiles.py` | A frozen partial blueprint with `name` removed |
+| `ProfileName` | type | `persona/profiles.py` | `Literal["coder", "researcher", "reviewer"]` |
+| `get_profile` | function | `persona/profiles.py` | Look up a profile by name, returning the `AgentProfile` or `None` |
+| `is_profile_name` | function | `persona/profiles.py` | `TypeGuard`: whether a string names a known profile |
+
+### forge — the build session
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `Forge` | class | `forge.py` | The build-session conductor: `build_interactive`, `build_from_config`, `instantiate`, plus `.ledger` and `.transcript` |
+| `create_forge` | function | `forge.py` | Thin factory returning a `Forge`; takes optional `ForgeOptions` |
+| `ForgeOptions` | dataclass | `forge.py` | Injectable collaborators: a full `ForgeView`, or an `ask`-only `Callable[[str], Awaitable[str]]` override; neither falls back to `ConsoleForgeView` |
+| `InterviewKey` | type | `forge.py` | `Literal["name", "purpose", "tools", "model"]` — the answer keys |
+| `InterviewAnswers` | type | `forge.py` | `dict[InterviewKey, str | None]` — collected interview answers |
+
+### config — the CLI flag reader
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `FlagReader` | class | `config/flag_reader.py` | An explicit 3-state (`expect_flag`/`expect_value`/`done`) FSM that reads Smithy's argv slice into a `SmithyConfig`; pure, no env/fs/process access |
+| `read_flags` | function | `config/flag_reader.py` | Convenience: read an argv slice into a `SmithyConfig` with a fresh `FlagReader` |
+| `SmithyConfig` | dataclass | `config/flag_reader.py` | Resolved launch config: `profile`, `out`, `model`, `non_interactive`, `answers` |
+| `FlagSpec` | dataclass | `config/flag_reader.py` | One row of the recognised-flag table: canonical name, spellings, kind |
+| `FLAG_TABLE` | const | `config/flag_reader.py` | The single source of recognised flags |
+| `SmithyFlagName` | type | `config/flag_reader.py` | `Literal["profile", "out", "model", "non-interactive", "answer"]` |
+| `FlagError` | class | `config/flag_reader.py` | Raised when an argv slice cannot be read into a valid `SmithyConfig` |
+
+### knowledge — the externalised guide pack
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `load_knowledge` | async function | `knowledge/loader.py` | Read `manifest.json` + markdown guide bodies (default package data via `importlib.resources`) into a `KnowledgePack` |
+| `KnowledgePack` | dataclass | `knowledge/loader.py` | Frozen pack: `version` + tuple of `Guide`, with a `guide(id)` lookup |
+| `Guide` | dataclass | `knowledge/loader.py` | A fully-loaded guide: manifest metadata plus the markdown body |
+| `GuideManifestEntry` | dataclass | `knowledge/loader.py` | One guide's manifest entry before its body is attached |
+| `KnowledgeManifest` | dataclass | `knowledge/loader.py` | Parsed shape of `manifest.json`: version + tuple of `GuideManifestEntry` |
+| `KnowledgeError` | class | `knowledge/loader.py` | Raised when the pack cannot be loaded or fails its shape check |
+
+### runtime — session bookkeeping
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `ToolLedger` | class | `runtime/tool_ledger.py` | Append-only account of tool executions: `record`, `entries`, `summary`, `.size`, `reset` |
+| `ToolEvent` | dataclass | `runtime/tool_ledger.py` | A single invocation to remember: `tool`, `ok`, kw-only `input`/`output` |
+| `LedgerEntry` | dataclass | `runtime/tool_ledger.py` | A settled row (subclass of `ToolEvent`) with stamped `seq` (1-based) and `at` (epoch ms) |
+| `LedgerSummary` | dataclass | `runtime/tool_ledger.py` | Point-in-time digest: `total`/`ok`/`failed`/`tools` rollups plus a `by_tool` map of `ToolTally` |
+| `ToolTally` | dataclass | `runtime/tool_ledger.py` | Per-tool slice: `calls`/`ok`/`failed` |
+
+### ui — the render seam
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `TranscriptModel` | class | `ui/transcript.py` | Table-driven visitor: `accept(turns)` sanitizes and projects gateway `Turn`s into a `RenderTranscript`; stateless |
+| `ForgeView` | class | `ui/transcript.py` | Protocol — the terminal-free text seam: `show(line)` and async `ask(question)` |
+| `ConsoleForgeView` | class | `ui/transcript.py` | Default view: writes lines to stdout, reads input off-loop via `asyncio.to_thread`; `close()` is a no-op |
+| `format_transcript` | function | `ui/transcript.py` | Format a `RenderTranscript` into flat labelled lines for a `ForgeView.show` pipe |
+| `RenderTranscript` | dataclass | `ui/transcript.py` | Result of `accept`: tuple of `RenderTurn` plus a `redaction_count` |
+| `RenderTurn` | dataclass | `ui/transcript.py` | A projected turn: a `RenderRole` plus its surviving `RenderBlock` tuple |
+| `RenderBlock` | dataclass | `ui/transcript.py` | One sanitized fragment: `kind`, `label`, `text`, optional `redacted` flag |
+| `SanitizeOptions` | dataclass | `ui/transcript.py` | Tunable thresholds: `max_length` (default 2000) and extra `secret_patterns` |
+| `DEFAULT_SANITIZE_OPTIONS` | const | `ui/transcript.py` | Default options used when a caller passes none |
+| `DEFAULT_VISITORS` | const | `ui/transcript.py` | `VisitorTable` of one pure visitor per block kind |
+| `VisitContext` | dataclass | `ui/transcript.py` | Per-block context: the `SanitizeOptions` and the turn's `RenderRole` |
+| `BlockVisitor` | type | `ui/transcript.py` | `Callable[[Block, VisitContext], RenderBlock | None]` (None drops the block) |
+| `VisitorTable` | type | `ui/transcript.py` | `Mapping[str, BlockVisitor]` keyed by block kind |
+| `RenderBlockKind` | type | `ui/transcript.py` | `Literal["text", "thinking", "tool_call", "tool_result", "image", "command"]` |
+| `RenderRole` | type | `ui/transcript.py` | `Literal["user", "assistant", "tool"]` |
+
+## Sub-directories
+
+| Directory | Holds |
+|-----------|-------|
+| `smithy/config` | `flag_reader.py` — the `FlagReader` FSM, `SmithyConfig`/`FlagSpec`/`FLAG_TABLE`; reads Smithy's own CLI argv slice |
+| `smithy/persona` | `blueprint.py` (model + validation/serde), `profiles.py` (`PROFILES` starter table), `define_agent.py` (the merge generator and `to_agent_config` bridge) |
+| `smithy/knowledge` | `loader.py` (`load_knowledge`), `manifest.json`, and `guides/*.md` |
+| `smithy/knowledge/guides` | Four markdown guides: `authoring-an-agent`, `choosing-tools`, `writing-system-prompts`, `model-selection` |
+| `smithy/runtime` | `tool_ledger.py` — `ToolLedger` and its event/entry/summary/tally dataclasses |
+| `smithy/ui` | `transcript.py` — `TranscriptModel`, the render projection, sanitizers, and the `ForgeView`/`ConsoleForgeView` text seam |
+
+## Blueprints and profiles
+
+An `AgentBlueprint` is the small declarative spec that fully determines a generated agent: `name`, `description`, `system_prompt`, `tool_collection`, `model`, and optional `tags`. It is a frozen pydantic v2 model that is **both the type and the validation source of truth**. The wire shape is camelCase (`systemPrompt`, `toolCollection`); Python callers may construct by snake_case attribute name too. `name` must be kebab-case (`^[a-z0-9][a-z0-9-]*$`, 1–64 chars). Unknown keys are stripped (`extra="ignore"`).
+
+A **profile** is a named partial blueprint with `name` removed — a starter skeleton for a common kind of agent. Three ship in `PROFILES`:
+
+| Profile | Tool collection | Model | For |
+|---------|-----------------|-------|-----|
+| `coder` | `coding` | `claude-sonnet-4` | Reads, edits, and writes code; runs commands to land changes |
+| `researcher` | `read-only` | `claude-sonnet-4` | Gathers, cross-checks, and summarises from files and the web |
+| `reviewer` | `read-only` | `claude-opus-4` | Inspects changes for correctness and quality, reports findings |
+
+Each profile pins a tool collection, a baseline model, a starter system prompt, and a description. Adding a new starter agent is a single entry here, not a new function.
+
+```python
+from indusagi.smithy import AgentSpec, define_agent, serialize_blueprint
+
+# Seed from the 'coder' profile; the spec wins on any field it sets.
+bp = define_agent(AgentSpec(name="code-reviewer", model="claude-opus-4"), profile="coder")
+print(bp.name, bp.tool_collection, bp.model)  # code-reviewer coding claude-opus-4
+print(serialize_blueprint(bp))  # canonical, fixed-key-order JSON
+```
+
+## The merge generator
+
+`define_agent` is the one generator. It merges three sources highest-first — the caller's `spec`, then the named `profile`'s defaults, then a module baseline — and funnels everything through a single `validate_blueprint` gate.
+
+```text
+spec  ->  profile  ->  baseline      (highest precedence first)
+```
+
+The merge uses a `??`-style chain (`_first_defined`): **only a `None` field falls through**. A falsy-but-present value like `""` wins the merge and then fails validation — deliberate and predictable. `tags` from the spec replace the profile's tags (they do not merge), so a caller stays in full control of labelling. An unknown profile name raises `BlueprintError` rather than a separate error type, so callers handle one failure shape.
+
+`to_agent_config` is the second half: it projects a validated blueprint onto the runtime's immutable `AgentConfig`, mapping `system_prompt` to the `system` preamble, passing `model` through, and resolving the named `tool_collection` into a runnable `ToolBox` via `capabilities.tool_box(collection, cwd)`. See [Runtime](/python/subsystems/runtime) and [Capabilities](/python/subsystems/capabilities).
+
+## The Forge build session
+
+`Forge` is the conductor that wires the four sibling layers into one drivable build session. It runs in two modes and then instantiates the result.
+
+`build_interactive(seed_profile=None)` walks a fixed four-step interview (name, purpose, tools, model) through the view's `show` + `ask`. For each step it records the answer as a dialogue turn pair **and** files one `ToolLedger` `interview.ask` event, then `_assemble` maps the answers into an `AgentSpec` and calls `define_agent`, logging a final `blueprint.define` event. The session resets `.ledger` and `.transcript` at the start of each call.
+
+`build_from_config(cfg)` does the same assembly with answers pulled from `cfg.answers` (an explicit `cfg.model` overrides an answer-supplied one) with zero I/O.
+
+`instantiate(blueprint, cwd=None)` calls `create_agent(to_agent_config(blueprint, cwd))` to mint a runnable `Agent`.
+
+```python
+from indusagi.smithy import create_forge, SmithyConfig
+
+forge = create_forge()
+cfg = SmithyConfig(
+    profile="researcher",
+    answers={"name": "doc-finder", "purpose": "Find and summarise docs", "tools": "read-only"},
+)
+bp = forge.build_from_config(cfg)
+agent = forge.instantiate(bp, cwd="/repo")  # -> runtime Agent via to_agent_config + create_agent
+```
+
+The view (and its lone `ask`) is **injected**, never constructed inside the builder, so the entire interview is scriptable with canned answers and no terminal or network:
+
+```python
+import asyncio
+from indusagi.smithy import create_forge, ForgeOptions
+
+script = iter(["my-agent", "Audit the build", "coding", ""])
+async def ask(_prompt: str) -> str:
+    return next(script)
+
+async def main():
+    forge = create_forge(ForgeOptions(ask=ask))
+    bp = await forge.build_interactive(seed_profile="coder")
+    print(bp.name, forge.ledger.summary().total)  # my-agent 5
+    print(forge.transcript.redaction_count)
+
+asyncio.run(main())
+```
+
+The ledger total is `5`: one `interview.ask` event per question (four) plus the final `blueprint.define` event.
+
+## CLI flags
+
+`FlagReader` is a strict three-state finite-state machine (`expect_flag` → `expect_value` → `done`) that walks Smithy's own argv slice token-by-token against the data-driven `FLAG_TABLE`. It is pure — no env, no filesystem, no process access — and accumulates a `SmithyConfig`. The recognised flags:
+
+| Canonical | Spellings | Kind |
+|-----------|-----------|------|
+| `profile` | `--profile`, `-p` | single |
+| `out` | `--out`, `--output`, `-o` | single |
+| `model` | `--model`, `-m` | single |
+| `non-interactive` | `--non-interactive`, `--batch`, `-y` | switch |
+| `answer` | `--answer`, `-a` | pair (repeatable `key=value`) |
+
+```python
+from indusagi.smithy import read_flags
+
+cfg = read_flags(["--profile", "coder", "-o", "out/agent.json",
+                  "--answer", "name=fixer", "-a", "purpose=fix bugs", "-y"])
+print(cfg.profile, cfg.out, cfg.non_interactive, cfg.answers)
+# coder out/agent.json True {'name': 'fixer', 'purpose': 'fix bugs'}
+```
+
+Pass `sys.argv[2:]` (Smithy's slice after the program and subcommand) to `read_flags`. A slice that cannot be read into a valid config raises `FlagError`. See [CLI](/python/reference/cli).
+
+## The knowledge pack
+
+The authoring guides Smithy consults are externalised package data, not inline constants — diffable markdown that travels with the wheel. `load_knowledge` reads `manifest.json` (version `1.0.0` plus four guide entries) via `importlib.resources` so it works in both a wheel and a source tree, then reads each markdown body off-thread and builds a frozen `KnowledgePack` with a `guide(id)` index. Failures surface as `KnowledgeError`.
+
+```python
+import asyncio
+from indusagi.smithy import load_knowledge
+
+async def main():
+    pack = await load_knowledge()  # defaults to package data
+    print(pack.version, [g.id for g in pack.guides])
+    # 1.0.0 ['authoring-an-agent', 'choosing-tools', 'writing-system-prompts', 'model-selection']
+    guide = pack.guide("choosing-tools")
+    print(guide.title, len(guide.body))
+
+asyncio.run(main())
+```
+
+## Tool ledger and transcript
+
+`ToolLedger` is a long-lived append-only log of what a build session did. `record(ToolEvent)` stamps a `LedgerEntry` with a 1-based `seq` and epoch-ms `at`, and advances per-tool counters plus session rollups incrementally — so `summary()` reads settled numbers rather than re-folding the log. Each `LedgerSummary` carries `total`/`ok`/`failed`/`tools` plus a `by_tool` map of `ToolTally`.
+
+`TranscriptModel` is a table-driven, stateless visitor over a build transcript. `accept(turns)` dispatches each block into `DEFAULT_VISITORS` (overridable per kind) and runs the body through a sanitizer that masks secrets via built-in regexes (vendor-prefixed keys like `sk-`/`ghp_`, `KEY=value` assignments), collapses runaway whitespace, redacts bodies over `SanitizeOptions.max_length` (default 2000), and reduces images to a descriptor. The result is a `RenderTranscript` with a `redaction_count`.
+
+`ForgeView` is the two-method text Protocol (`show` + async `ask`) the builder talks through; `ConsoleForgeView` is the stdio default.
+
+```python
+from indusagi.smithy import TranscriptModel, format_transcript
+from indusagi.llmgateway.contract import AssistantTurn, TextBlock
+
+turns = [AssistantTurn(blocks=(TextBlock(text="key sk-ABCDEFGHIJ1234567890 done"),))]
+rt = TranscriptModel().accept(turns)
+print(rt.redaction_count)            # secret masked -> 1
+for line in format_transcript(rt):
+    print(line)
+```
+
+## Relationship to neighbors
+
+Smithy is a top-level subpackage of indusagi (lazily exported as `indusagi.smithy`) and a downstream **consumer**, not a dependency, of other areas. It imports:
+
+- `capabilities.tool_box` and `capabilities.ToolCollection` from [Capabilities](/python/subsystems/capabilities) — `ToolCollectionName` is a local `Literal` alias kept identical so the blueprint schema validates standalone.
+- `AgentConfig`, `Agent`, and `create_agent` from [Runtime](/python/subsystems/runtime) — the conductor's instantiation target.
+- the conversation types (`Block`/`Turn`/`TextBlock`/`AssistantTurn`/`UserTurn` and the block subtypes) from the [LLM Gateway](/python/subsystems/llm-gateway) contract, which `TranscriptModel` visits.
+
+No other indusagi area imports Smithy. Within the package, `forge.py` depends on all four sibling layers, `persona/define_agent` bridges persona into runtime and capabilities, and `ui` depends only on the gateway contract. For the broader layering, see [Architecture](/python/architecture).

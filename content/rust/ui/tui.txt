@@ -1,0 +1,530 @@
+# TUI
+
+> `indusagi::tui` is the framework-free model tier of the terminal UI: pure,
+> synchronous Rust for logical key decoding, ANSI/grapheme width math, fuzzy
+> matching, layered editor keybindings, autocomplete, a headless line-editor
+> core, and the component/overlay/theme contracts the renderer fills in. None of
+> its `.rs` files `use` **`ratatui` or `crossterm`** — bytes/strings in, key-id
+> strings, scores, column counts, and buffer state out. Live painting, scroll
+> offsets, and raw terminal decode live in the separate `tui_render` module. The
+> whole module sits behind the default-on `tui` Cargo feature (which also pulls
+> in the render-substrate crates `ratatui`/`crossterm`/etc. for `tui_render`).
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Module map](#module-map)
+- [Public surface](#public-surface)
+- [Key decoding](#key-decoding)
+- [Width and wrapping math](#width-and-wrapping-math)
+- [Fuzzy matching](#fuzzy-matching)
+- [Editor keybindings](#editor-keybindings)
+- [Autocomplete](#autocomplete)
+- [Editor core and contracts](#editor-core-and-contracts)
+- [Component, overlay, and theme contracts](#component-overlay-and-theme-contracts)
+- [Process-global state](#process-global-state)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Overview
+
+The modules under `indusagi::tui` own the math and protocol logic the render
+widgets depend on, but stay side-effect-free and unit-testable. Everything here
+is the "model" half of the UI: it computes, it never paints. The crate is
+`indusagi` (the Rust edition); this module is reached at `indusagi::tui` and
+sub-paths like `indusagi::tui::keys`. Both `tui` and the render-layer `tui_render`
+are declared `pub mod` in `lib.rs` behind the default-on `tui` Cargo feature
+(`#[cfg(feature = "tui")]`), so a default build exposes them and a no-`tui` build
+omits both. It is a faithful, behavior-for-behavior port of the clean-room
+TypeScript `src/ui/` subtree, mirrored module-by-module (see the
+[TS/Python TUI primitives](/python/ui/tui) for the parity reference).
+
+Three external crates carry the heavy lifting. [`regex`](https://docs.rs/regex)
+(workspace-pinned, non-optional) drives the autocomplete `@file`/path detectors;
+[`unicode-segmentation`](https://docs.rs/unicode-segmentation) for grapheme
+clusters and [`unicode-width`](https://docs.rs/unicode-width) for east-asian
+width are optional deps enabled by the `tui` feature (which also pulls in
+`ratatui`/`crossterm`/`pulldown-cmark`/`syntect`/`two-face`/`similar`/`lru` for
+the `tui_render` layer):
+
+```toml
+# crates/indusagi/Cargo.toml (excerpt)
+regex                = { workspace = true }
+unicode-width        = { workspace = true, optional = true }
+unicode-segmentation = { workspace = true, optional = true }
+
+[features]
+# enables both the tui primitives and the tui_render layer
+tui = ["dep:ratatui", "dep:crossterm", "dep:unicode-width",
+       "dep:unicode-segmentation", "..."]
+```
+
+The module documents itself as "M6a status: fully implemented + green (240
+tests)"; the `ratatui` render layer (12 dialogs, messages, footer/statusline/
+taskpanel, `InteractiveApp`, the ui-bridge projection) is a separate module
+(`indusagi::tui_render`, M6b — formerly the `indusagi-tui-render` crate, now
+folded into `indusagi`) and is **not** part of this primitive tier.
+
+## Module map
+
+Each submodule maps directly to a TypeScript file under `src/ui/`:
+
+| Module | Source (`src/ui/…`) | Holds |
+|--------|---------------------|-------|
+| `keys` | `keys.ts` | Logical key model: legacy + Kitty CSI-u decode, the `Key` builder, event/paste guards, `matches_key`/`parse_key` |
+| `keybindings` | `keybindings.ts` | The `EditorAction` vocabulary, the readline-derived default table, the `vim` preset, and the layered resolver |
+| `fuzzy` | `fuzzy.ts` | Order-preserving subsequence fuzzy match + multi-token filter |
+| `autocomplete` | `autocomplete.ts` | Combined slash / `@file` / path completion provider (shells out to `fd`) |
+| `editor` | `editor-component.ts` + line-editor model | The `EditorComponent` contract traits plus the headless `EditorCore` text-buffer model |
+| `theme` | `theme-types.ts` | Theme contracts as bundles of boxed painter closures |
+| `contracts` | `contracts.ts` | `Component`/`Tui` traits and the overlay placement vocabulary |
+| `utils` | `utils.ts` | Width, wrap, truncate, column slice, ANSI strip + SGR state tracker |
+
+## Public surface
+
+`indusagi::tui` re-exports a narrow public surface at the module root (mirroring
+`index.ts`). Each submodule has a wider set of `pub` items — import those from
+the submodule directly.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `Key` | struct | `keys.rs` | Builder of key-id strings (`Key::ESCAPE`, `Key::ctrl("c")`) |
+| `KeyId` | type | `keys.rs` | `= String`; a base key optionally prefixed by `ctrl+`/`shift+`/`alt+` |
+| `KeyEventType` | enum | `keys.rs` | `Press` / `Repeat` / `Release` (the Kitty flag-2 subfield) |
+| `parse_key` | fn | `keys.rs` | Decode raw input `&str` → `Option<KeyId>` |
+| `matches_key` | fn | `keys.rs` | Test whether raw input corresponds to a given key id |
+| `is_key_release` / `is_key_repeat` | fn | `keys.rs` | True for a Kitty `:3` / `:2` event (paste-guarded) |
+| `is_kitty_protocol_active` / `set_kitty_protocol_active` | fn | `keys.rs` | Get/set the process-global Kitty-active flag |
+| `visible_width` | fn | `utils.rs` | Column width: ANSI-stripped, tab-expanded, grapheme/east-asian aware |
+| `truncate_to_width` | fn | `utils.rs` | Shorten to a max visible width with an ellipsis (ANSI-aware) |
+| `wrap_text_with_ansi` | fn | `utils.rs` | Word-wrap preserving SGR styling across line breaks |
+| `fuzzy_match` | fn | `fuzzy.rs` | Order-preserving subsequence match → `FuzzyMatch { matches, score }` |
+| `fuzzy_filter` | fn | `fuzzy.rs` | Multi-token AND filter + ascending-score rank |
+| `FuzzyMatch` | struct | `fuzzy.rs` | Result: `matches: bool`, `score: f64` |
+| `EditorAction` | enum | `keybindings.rs` | The 35-variant bindable-behavior vocabulary |
+| `EditorKeybindingsConfig` | struct | `keybindings.rs` | An insertion-ordered partial action→keys map (a binding layer) |
+| `EditorKeybindingsManager` | struct | `keybindings.rs` | Layered resolver (preset → user → per-component) |
+| `DEFAULT_EDITOR_KEYBINDINGS` | fn | `keybindings.rs` | The base binding layer applied to every editor |
+| `get_editor_keybindings` / `set_editor_keybindings` | fn | `keybindings.rs` | Accessors for the process-wide singleton manager |
+| `AutocompleteItem` / `SlashCommand` | struct | `autocomplete.rs` | Suggestion item and slash-command definition |
+| `AutocompleteProvider` | trait | `autocomplete.rs` | Synchronous suggestion-provider contract |
+| `CombinedAutocompleteProvider` | struct | `autocomplete.rs` | `@file` + slash + path completion |
+| `Component` / `Tui` | trait | `contracts.rs` | Component lifecycle / host contracts |
+| `OverlayAnchor` / `SizeValue` | enum | `contracts.rs` | Anchor (9 variants) / size union (`Cells`/`Percent`) |
+| `OverlayMargin` / `OverlayOptions` | struct | `contracts.rs` | Per-edge margins / overlay placement+sizing options |
+| `OverlayHandle` | trait | `contracts.rs` | Toggle an overlay's visibility (`is_hidden`/`set_hidden`/`hide`) |
+| `EditorComponent` | trait | `editor.rs` | The composed editor contract |
+| `EditorTheme` / `MarkdownTheme` / `SelectListTheme` / `SettingsListTheme` | struct | `theme.rs` | Theme contracts (bundles of painter closures) |
+
+The re-export block (`src/tui/mod.rs`), in source order:
+
+```rust
+pub use autocomplete::{
+    AutocompleteItem, AutocompleteProvider, CombinedAutocompleteProvider, SlashCommand,
+};
+pub use contracts::{
+    Component, OverlayAnchor, OverlayHandle, OverlayMargin, OverlayOptions, SizeValue, Tui,
+};
+pub use editor::EditorComponent;
+pub use fuzzy::{FuzzyMatch, fuzzy_filter, fuzzy_match};
+pub use keybindings::{
+    DEFAULT_EDITOR_KEYBINDINGS, EditorAction, EditorKeybindingsConfig, EditorKeybindingsManager,
+    get_editor_keybindings, set_editor_keybindings,
+};
+pub use keys::{
+    Key, KeyEventType, KeyId, is_key_release, is_key_repeat, is_kitty_protocol_active, matches_key,
+    parse_key, set_kitty_protocol_active,
+};
+pub use theme::{EditorTheme, MarkdownTheme, SelectListTheme, SettingsListTheme};
+pub use utils::{truncate_to_width, visible_width, wrap_text_with_ansi};
+```
+
+## Key decoding
+
+`keys` decodes raw terminal input into canonical **key-id** strings. A key id is
+a base key (`"c"`, `"escape"`, `"up"`) optionally prefixed by modifiers in the
+canonical `ctrl+shift+alt+<key>` order. `KeyId` is a plain type alias
+(`pub type KeyId = String;`, not a wrapper struct); the canonical grammar is the
+single source of truth. Per the W-8 design note the
+primitives stay **decode-agnostic** — raw bytes arrive from `crossterm` at the
+render layer; this module only matches/parses canonical strings.
+
+```rust
+use indusagi::tui::{Key, matches_key, parse_key, is_key_release};
+
+// Decode raw terminal input back into a key id.
+assert_eq!(parse_key("\u{03}").as_deref(), Some("ctrl+c"));  // ^C
+assert_eq!(parse_key("\u{1b}[A").as_deref(), Some("up"));    // arrow up
+
+// Test raw input against a typed key id from the Key builder.
+assert!(matches_key("\u{03}", &Key::ctrl("c")));
+assert!(matches_key("\u{1b}", Key::ESCAPE));
+
+// Release detection only matters under the Kitty protocol; paste payloads are guarded.
+assert!(is_key_release("\u{1b}[99;1:3u"));
+```
+
+`parse_key(data: &str) -> Option<KeyId>` and `matches_key(data: &str, key_id:
+&str) -> bool` understand both the legacy xterm/VT escape grammar (the
+`legacy_key_sequences` / `legacy_shift_sequences` / `legacy_ctrl_sequences`
+tables and the direct `legacy_sequence_key_id` map) and the modern **Kitty
+keyboard protocol**: CSI-u (`decode_csi_u_sequence`), the `1;<mod><letter>` nav
+form (`decode_nav_letter_sequence`), `<num>;<mod>~` editing keys
+(`decode_tilde_sequence`), and xterm `modifyOtherKeys` (`CSI 27;<mod>;<code>~`).
+`is_key_release` (Kitty `:3`) and `is_key_repeat` (`:2`) sniff the event subfield
+and bail the moment they see a bracketed-paste marker (`\x1b[200~`) so paste
+payloads are never misread as events.
+
+The `Key` builder exposes named keys as associated `&'static str` constants
+(`Key::ESCAPE` and its `Key::ESC` alias, `Key::ENTER`, `Key::RETURN`,
+`Key::TAB`, `Key::SPACE`, `Key::BACKSPACE`, `Key::PAGE_UP`, `Key::PAGE_DOWN`,
+the `Key::UP`/`DOWN`/`LEFT`/`RIGHT` arrows, `Key::BACKTICK`, the
+`Key::F1`..`Key::F12` row, and the full punctuation-constant set), and
+modifier combinations as functions returning `KeyId`:
+
+```rust
+impl Key {
+    pub fn ctrl(key: &str) -> KeyId;            // "ctrl+<key>"
+    pub fn shift(key: &str) -> KeyId;           // "shift+<key>"
+    pub fn alt(key: &str) -> KeyId;             // "alt+<key>"
+    pub fn ctrl_shift(key: &str) -> KeyId;
+    pub fn shift_ctrl(key: &str) -> KeyId;
+    pub fn ctrl_alt(key: &str) -> KeyId;
+    pub fn alt_ctrl(key: &str) -> KeyId;
+    pub fn shift_alt(key: &str) -> KeyId;
+    pub fn alt_shift(key: &str) -> KeyId;
+    pub fn ctrl_shift_alt(key: &str) -> KeyId;
+}
+```
+
+`normalize_key_id(key_id: &str) -> String` (a `pub fn` on the `keys` submodule,
+but not re-exported at the `tui` root) canonicalizes a key id: lowercase,
+dedupe/reorder modifiers to `ctrl+shift+alt+<key>`, and alias `esc→escape`,
+`return→enter`, `pageup→pageUp`, `pagedown→pageDown`. The companion
+`pub struct KeyValidator` (`normalize` / `is_valid`) rejects ill-formed ids. A
+process-global `AtomicBool`,
+toggled by `set_kitty_protocol_active(true)`, gates Kitty-specific match/parse
+branches; `is_kitty_protocol_active()` reads it.
+
+> Parity note: the special-key resolver in `match_key_engine` registers
+> `pageUp`/`pageDown` lookups under a lowercase spelling that `normalize_key_id`
+> never produces, so those two keys always fall through to the printable path
+> (which rejects them). This bug is ported bug-for-bug to preserve TS parity.
+
+## Width and wrapping math
+
+`utils` is the column-width substrate. `visible_width(s: &str) -> usize` measures
+terminal columns: it short-circuits pure printable ASCII to its byte length,
+otherwise expands tabs to **three** spaces, strips ANSI (CSI, OSC, APC), and sums
+per-grapheme-cluster widths via `measure_cluster_width`. East-asian Wide/
+Fullwidth glyphs and confirmed RGI emoji count as 2 columns; zero-width clusters
+(combining marks, Default_Ignorable, control, format) count as 0. Results are
+memoized in a thread-local FIFO cache (`WIDTH_CACHE_SIZE = 512`).
+
+```rust
+use indusagi::tui::{visible_width, truncate_to_width, wrap_text_with_ansi};
+
+assert_eq!(visible_width("\u{1b}[31mred\u{1b}[0m"), 3);   // ANSI not counted
+assert_eq!(visible_width("中文"), 4);                       // east-asian wide = 2 each
+assert_eq!(visible_width("😀"), 2);                         // RGI emoji = 2
+
+let lines = wrap_text_with_ansi("one two three four", 8);   // -> ["one two", "three", "four"]
+let short = truncate_to_width("a very long line", 8, "...", false);
+```
+
+`truncate_to_width(text, max_width, ellipsis, pad)` shortens to a maximum visible
+width; on truncation the output is `result + "\x1b[0m" + ellipsis`, with optional
+right-padding to exactly `max_width`. If the ellipsis itself is wider than
+`max_width`, it returns `ellipsis` sliced to `max_width` UTF-16 units.
+`wrap_text_with_ansi(text, width)` word-wraps while carrying SGR state across
+literal newlines and re-emitting active codes as a continuation-line prefix; it
+`trim_end`s each line and only emits an underline-off reset (`\x1b[24m`) at line
+ends. Empty input wraps to `[""]`.
+
+The module also exposes the lower-level machinery that overlay compositing and
+the render layer reach for:
+
+| Item | Kind | Purpose |
+|------|------|---------|
+| `extract_ansi_code(s, pos)` | fn | If an escape begins at `pos`, return `(code, byte_len)` |
+| `slice_by_column(line, start, len, strict)` | fn | Cut a span of visible columns out of an ANSI/wide line |
+| `slice_with_width(...) -> SliceWithWidth` | fn | Same, also reporting the picked width |
+| `extract_segments(...) -> Segments` | fn | Pull `before`/`after` an overlay region in one pass, carrying style |
+| `apply_background_to_line(line, width, bg_fn)` | fn | Pad to width, then run a background painter over the whole span |
+| `is_whitespace_char` / `is_punctuation_char` | fn | JS `\s` / the `PUNCTUATION_REGEX` set, char-at-a-time |
+| `AnsiStateTracker` | struct | Folds SGR codes into tracked state; re-emits in a fixed order |
+| `AnsiCodeManager` | struct | Mutable-borrow facade over `AnsiStateTracker` |
+| `GraphemeHandler` / `TextWidthCalculator` / `TextWrapper` | struct | Thin facades over the segmenter / width / wrap helpers |
+
+`AnsiStateTracker::get_active_codes` re-emits in the load-bearing fixed order
+`bold, dim, italic, underline, blink, inverse, hidden, strikethrough, fg, bg`,
+and handles 256-color (`38;5;n`) and truecolor (`38;2;r;g;b`) sequences.
+
+## Fuzzy matching
+
+`fuzzy_match(query: &str, text: &str) -> FuzzyMatch` is an order-preserving
+subsequence matcher: it locates each query char in order within the text, then
+scores the placement. The score is **lower-is-better** — gap/late penalties add,
+consecutive-run and word-boundary rewards subtract. If a direct match fails it
+retries a single digit/letter swap variant (`"foo12"` ↔ `"12foo"`, anchored on
+`^[a-z]+[0-9]+$` / `^[0-9]+[a-z]+$`) with a swap penalty.
+
+```rust
+use indusagi::tui::{fuzzy_match, fuzzy_filter, FuzzyMatch};
+
+let m: FuzzyMatch = fuzzy_match("abc", "alphabetic");
+assert!(m.matches);   // m.score is an f64, lower = tighter
+
+let files = vec!["src/main.rs", "src/agent/session.rs", "README.md"];
+let hits = fuzzy_filter(files, "src ses", |s| s.to_string());
+assert_eq!(hits, vec!["src/agent/session.rs"]);
+```
+
+`fuzzy_filter<T>(items, query, get_text)` splits the query on whitespace, keeps
+only items that match **every** token, and stable-sorts ascending by summed
+per-token score. An empty/whitespace query returns the items unchanged. The
+scoring weights are the indus-tuned constants in the `pub struct
+FuzzyScoringConfig`, frozen as the `pub const DEFAULT_FUZZY_CONFIG` (public on
+the `fuzzy` submodule, though not re-exported at the `tui` root) whose `Default`
+impl returns the same values:
+
+| Field | Value |
+|-------|-------|
+| `gap_penalty` | `3.0` |
+| `consecutive_reward` | `4.0` |
+| `word_boundary_reward` | `12.0` |
+| `late_match_penalty` | `0.15` |
+| `swapped_token_penalty` | `6.0` |
+
+A "word boundary" is whitespace or one of `- _ . / : \ @ ~`. Scores are `f64`
+specifically because of the `0.15` late-match penalty.
+
+## Editor keybindings
+
+Physical keys are decoupled from logical behavior through **`EditorAction`**, a
+35-variant enum covering motions and operations grouped into caret motion,
+deletion, text entry, completion-popup navigation, clipboard/kill-ring, history,
+tool expansion, and session management:
+
+```rust
+pub enum EditorAction {
+    CursorUp, CursorDown, CursorLeft, CursorRight,
+    CursorWordLeft, CursorWordRight, CursorLineStart, CursorLineEnd, PageUp, PageDown,
+    DeleteCharBackward, DeleteCharForward, DeleteWordBackward, DeleteWordForward,
+    DeleteToLineStart, DeleteToLineEnd,
+    NewLine, Submit, Tab,
+    SelectUp, SelectDown, SelectPageUp, SelectPageDown, SelectConfirm, SelectCancel,
+    Copy, Yank, YankPop, Undo, ExpandTools,
+    ToggleSessionPath, ToggleSessionSort, RenameSession, DeleteSession,
+    DeleteSessionNoninvasive,
+}
+```
+
+`EditorKeybindingsManager` maps actions to one or more `KeyId`s by layering, in
+order: a built-in preset (`KeybindingPreset::Default` or `::Vim`) → a user
+`EditorKeybindingsConfig` → per-component overrides. Later layers win. Bindings
+are normalized through `normalize_key_id` before resolution, and `matches`
+delegates each candidate to `matches_key`.
+
+```rust
+use indusagi::tui::{
+    get_editor_keybindings, EditorKeybindingsManager, EditorKeybindingsConfig, EditorAction,
+};
+use indusagi::tui::keybindings::{Binding, KeybindingPreset};
+
+let mgr = get_editor_keybindings();                       // process-wide singleton
+assert!(mgr.matches("\r", EditorAction::Submit, None));   // Enter triggers submit
+
+let mut user = EditorKeybindingsConfig::new();
+user.set(EditorAction::Submit, Binding::one("ctrl+s"));
+let custom = EditorKeybindingsManager::new(user, KeybindingPreset::Vim);
+let conflicts = custom.detect_conflicts();                // Vec<KeybindingConflict>
+```
+
+The default table (`default_editor_keybindings()` / the `DEFAULT_EDITOR_KEYBINDINGS`
+fn) is derived from GNU readline where one exists; its category-block insertion
+order is load-bearing because that is the order layer-merging and conflict
+scanning observe. A `Binding` is a normalized `Vec<KeyId>` built with
+`Binding::one(...)` or `Binding::many(...)`. `EditorKeybindingsManager` methods:
+
+| Method | Purpose |
+|--------|---------|
+| `new(config, preset)` | Build, merging user config over the preset over the defaults |
+| `matches(data, action, component_id)` | Does raw input fire the action (honoring a component scope)? |
+| `get_keys(action)` | List every key wired to the action |
+| `register_action(action, binding)` | Override the keys for an action directly |
+| `get_registered_actions()` | All actions that currently have a binding |
+| `set_config(config, preset)` | Swap config + preset, rebuilding the registry |
+| `set_component_override(id, config)` / `clear_component_override(id)` | Per-component scopes |
+| `detect_conflicts()` | Find keys wired to more than one action (normalizes before comparing) |
+
+The `vim` preset (`vim_editor_keybindings()`) overlays the `hjkl` alternates and
+`x` for backward delete on top of the defaults.
+
+## Autocomplete
+
+`AutocompleteProvider` is the synchronous suggestion contract:
+
+```rust
+pub trait AutocompleteProvider {
+    fn get_suggestions(&self, lines: &[String], cursor: CursorPos) -> Option<SuggestionResult>;
+    fn apply_completion(
+        &self, lines: &[String], cursor: CursorPos, item: &AutocompleteItem, prefix: &str,
+    ) -> ApplyResult;
+}
+```
+
+`CombinedAutocompleteProvider` is the concrete provider used by the editor. Its
+`get_suggestions` tries three engines in order: (1) `@file` fuzzy attachment
+search (shells out to `fd`), (2) slash commands, (3) plain path completion.
+Results are memoized in an insertion-ordered cache that evicts the oldest entry
+beyond 200.
+
+```rust
+use indusagi::tui::{CombinedAutocompleteProvider, SlashCommand, AutocompleteProvider};
+use indusagi::tui::autocomplete::{CommandEntry, CursorPos};
+
+let provider = CombinedAutocompleteProvider::new(
+    vec![CommandEntry::Command(SlashCommand {
+        name: "help".into(), description: Some("show help".into()),
+        get_argument_completions: None,
+    })],
+    "/repo".into(),     // base path for path/file completion
+    Some("fd".into()),  // optional fd binary path for fuzzy @file search
+);
+
+let res = provider.get_suggestions(&["/he".into()], CursorPos { line: 0, col: 3 });
+if let Some(r) = res {
+    println!("{} -> {:?}", r.prefix, r.items.iter().map(|i| &i.label).collect::<Vec<_>>());
+}
+```
+
+`get_suggestions(lines, cursor)` returns `Option<SuggestionResult>` (`items`,
+`prefix`); `apply_completion(...)` returns an `ApplyResult` (new `lines` plus
+`cursor_line`/`cursor_col`). The buffer is sliced in **UTF-16 code units** to
+stay byte-for-byte compatible with the TS reference. A `SlashCommand` carries an
+optional `get_argument_completions: Option<Box<dyn Fn(&str) -> Option<Vec<AutocompleteItem>> + Send + Sync>>`
+hook for completing a command's arguments; a `CommandEntry` may be a full
+`Command(SlashCommand)` or a bare `Item(AutocompleteItem)`. Tab-triggered file
+completion is exposed via `get_force_file_suggestions` and
+`should_trigger_file_completion`. The path engine reproduces Node's posix
+`path.basename`/`dirname`/`join`/`normalize`, `os.homedir()`, the
+`extractPathPrefix` delimiter set (`" \t\"'="`), and the tiered `score_entry`
+(exact 100 / prefix 80 / substring 50 / path-substring 30, +10 for directories).
+
+For composition, `autocomplete` also exposes the async surface
+`AsyncAutocompleteProvider` (one method `get_suggestions_async`) and
+`AsyncAutocompleteChain`, which returns the first productive result from a list
+of boxed providers.
+
+## Editor core and contracts
+
+`editor` exposes the `EditorComponent` contract — a composition of the
+`Component` lifecycle (from `contracts`) plus four capability traits, all with
+TS-optional members realized as overridable default methods:
+
+| Trait | Members |
+|-------|---------|
+| `EditorReadAccess` | `get_text`, `get_expanded_text` |
+| `EditorWriteAccess` | `set_text`, `insert_text_at_cursor`, `add_to_history` |
+| `EditorDisplayConfig` | `set_border_color`, `set_padding_x`, `set_autocomplete_provider`, `get_keybinding_scope_id` |
+| `EditorEventCallbacks` | `set_on_submit`, `set_on_change` |
+| `EditorComponent` | the marker super-trait composing all of the above + `Component` |
+
+Behind the contract sits the pure, headless **`EditorCore`** (a `pub struct` on
+the `editor` submodule, not re-exported at the `tui` root —
+`use indusagi::tui::editor::EditorCore`). It owns the whole editable model: a
+multi-line buffer + caret (`EditorState`), grapheme-aware deletion and word
+motion, prompt history (capped at 100, dedup + blank-skip), an Emacs-style kill
+ring (`yank` / `yank_pop` with accumulate-on-consecutive-kill), fish-style
+coalesced undo, large-paste collapsing into `[paste #N …]` markers that edit as
+one atomic unit, backslash-Enter continuation detection, and the
+submit/normalize lifecycle. Indices here are Rust `char` (Unicode scalar) counts.
+
+```rust
+use indusagi::tui::editor::EditorCore;
+
+let mut e = EditorCore::new();
+e.set_text("hello world");
+e.move_to_line_start();
+e.delete_word_forward();          // kills "hello"
+assert_eq!(e.get_text(), " world");
+e.yank();                          // pastes the killed word back
+let committed = e.submit_value();  // trims, resets, fires on_submit
+```
+
+Representative `EditorCore` operations: `insert_character`,
+`insert_text_at_cursor`, `handle_paste`, `add_new_line`, `submit_value`,
+`handle_backspace`, `handle_forward_delete`, `delete_to_start_of_line`,
+`delete_to_end_of_line`, `delete_word_backwards`, `delete_word_forward`, `yank`,
+`yank_pop`, `undo`, `add_to_history`, `navigate_history`, `move_to_line_start`,
+`move_to_line_end`, `move_word_backwards`, `move_word_forwards`,
+`get_expanded_text`, and `has_backslash_before_cursor`. It implements
+`EditorReadAccess` and `EditorWriteAccess` directly, and accepts
+`on_submit` / `on_change` callbacks (`Box<dyn FnMut(&str) + Send>`). A large
+paste (> 10 lines or > 1000 chars) is stored in the paste vault and replaced by
+a `[paste #N +K lines]` or `[paste #N K chars]` marker; `get_expanded_text()`
+restores the original content. The render-layer editor widget in `tui_render`
+drives `EditorCore` and handles the actual painting, scroll offsets, and live
+Kitty protocol.
+
+## Component, overlay, and theme contracts
+
+`contracts` defines the rendering-host vocabulary as traits and plain value
+types. `Component` is the renderable/focusable/input-handling unit (lifecycle
+hooks default to no-ops; `render(&mut self, width: usize) -> Vec<String>` and
+`invalidate` are required). `Tui` is the host callback surface (`request_render`,
+`focus`). Overlay placement is a tagged-enum vocabulary:
+
+| Type | Shape |
+|------|-------|
+| `OverlayAnchor` | 9-variant enum (`Center`, `TopCenter`, …, `BottomRight`) |
+| `OverlayMargin` | per-edge `Option<usize>` (`left`/`right`/`top`/`bottom`) |
+| `MarginSpec` | `Uniform(usize)` or `PerEdge(OverlayMargin)` |
+| `SizeValue` | `Cells(f64)` or `Percent(f64)` (the TS `number | "${number}%"` union) |
+| `OverlayOptions` | placement + sizing + a `VisiblePredicate = Box<dyn Fn(usize, usize) -> bool>` |
+| `OverlayHandle` | trait: `is_hidden`, `set_hidden`, `hide` |
+
+`theme` defines theme contracts as bundles of boxed painter closures, kept
+framework-free so the render layer fills them with concrete ANSI-emitting
+closures. The painter type aliases are `StyleFn = Box<dyn Fn(&str) -> String +
+Send + Sync>`, `SelectableStyleFn = Box<dyn Fn(&str, bool) -> String + …>`, and
+`HighlightFn = Box<dyn Fn(&str, Option<&str>) -> Vec<String> + …>`. The four
+theme structs are `SelectListTheme`, `EditorTheme` (embeds a `SelectListTheme` +
+a `border_color`), `MarkdownTheme` (all the inline/block painters, with optional
+`highlight_code: Option<HighlightFn>` and `code_block_indent: Option<String>`),
+and `SettingsListTheme` (a plain `cursor: String` plus selection-aware
+`label`/`value` painters).
+
+## Process-global state
+
+Two pieces of state are **process-global and mutable**, mirroring the TS
+module-level globals:
+
+- The Kitty-protocol flag: a `static AtomicBool` set via
+  `set_kitty_protocol_active(bool)` and read via `is_kitty_protocol_active()`.
+- The editor-keybindings singleton: a lazily-created, replaceable
+  `&'static EditorKeybindingsManager` behind a `OnceLock<RwLock<…>>`, leaked to
+  obtain the `'static` reference. `get_editor_keybindings()` fetches it
+  (creating the default on first call); `set_editor_keybindings(manager)`
+  replaces it for the whole process.
+
+Both mutate shared state for the whole process, so tests that touch them must be
+serialized (the `keys` tests guard the flag behind a `Mutex`).
+
+## Relationship to neighbors
+
+`indusagi::tui` is the pure logic tier consumed by the `ratatui` widget layer,
+`indusagi::tui_render` (M6b): its widgets drive the headless `EditorCore`, paint
+what `visible_width` / `wrap_text_with_ansi` / `slice_with_width` compute, fill
+the `theme` painter slots, and own bracketed-paste decoding, scroll offsets, and
+the live Kitty protocol via `crossterm`. Within this module, `autocomplete` and
+`keybindings` are the only intra-module importers (`autocomplete` uses
+`fuzzy::fuzzy_filter`; `keybindings` uses `keys::{matches_key, normalize_key_id}`;
+`editor` uses `autocomplete::AutocompleteProvider` and `contracts::Component`).
+
+For where the UI sits in the overall design, see [Architecture](/rust/architecture);
+for the runtime that drives an agent loop behind the console, see
+[Runtime](/rust/subsystems/runtime); for the type-and-catalog core, see
+[Core](/rust/subsystems/core). This page is the Rust counterpart of the
+[Python/TS TUI primitives](/python/ui/tui) — same module-for-module structure,
+Rust snake_case modules and CamelCase types throughout.

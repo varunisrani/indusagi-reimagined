@@ -1,0 +1,243 @@
+# Architecture
+
+> `indusagi` (Rust edition) is a terminal-first AI coding-agent framework shipped as **one merged crate**: every former `indusagi-*` library is now a `pub mod` inside the single `indusagi` crate (npm-style "one package"). `src/lib.rs` is a thin re-export barrel — it declares thirteen subsystem modules, surfaces them as value namespaces (`indusagi::gateway`, `indusagi::runtime`, …), wires the four legacy facade subpaths (`ai`/`agent`/`mcp`/`memory`), and binds the single `VERSION` constant. This page is the canonical map of how those layers fit together.
+
+The crate root binds nothing eagerly except `VERSION`; every subsystem is a real module reached either directly (`indusagi::runtime`) or through a namespace alias (`indusagi::gateway` → `llmgateway`). The barrel mirrors the clean-room TypeScript `src/index.ts` line-for-line:
+
+```rust
+// src/lib.rs — the barrel
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+// Namespaces whose name differs from the module get an alias:
+pub use crate::llmgateway      as gateway;   // export * as gateway from "./llmgateway"
+pub use crate::connectors_saas as saas;      // export * as saas    from "./connectors-saas"
+pub use crate::shell_app       as shell;     // export * as shell   from "./shell-app"
+pub use crate::connectors_saas as connectors; // Python-umbrella alias
+
+// Facade subpaths: the legacy indusagi/{ai,agent,mcp,memory} vocabulary
+pub use crate::facade::{ai, agent, memory};
+#[cfg(feature = "mcp")]
+pub use crate::facade::mcp;
+```
+
+`VERSION` is single-sourced from `Cargo.toml` via `env!("CARGO_PKG_VERSION")` — there is no second copy anywhere in the tree (it kills the TS three-way version drift). Modules whose namespace name already matches their module name (`runtime`, `capabilities`, `interop`, `swarm`, `smithy`, `tracing`) resolve directly off the `pub mod` declarations, so no alias is emitted for them (a second `pub use … as runtime;` would collide).
+
+## Table of Contents
+
+- [Workspace and crate layout](#workspace-and-crate-layout)
+- [The module map](#the-module-map)
+- [Feature gates](#feature-gates)
+- [Layered design](#layered-design)
+- [Dependency direction](#dependency-direction)
+- [Data flow: one prompt to settlement](#data-flow-one-prompt-to-settlement)
+- [The facade compatibility layer](#the-facade-compatibility-layer)
+- [The UI stack](#the-ui-stack)
+- [Subsystem pages](#subsystem-pages)
+
+## Workspace and crate layout
+
+The repository is a Cargo **virtual workspace** (`indusagi-rust/Cargo.toml`). The thirteen former subsystem library crates have been **merged into the single `indusagi` crate** as modules, so they are no longer workspace members. That one crate carries **both** the library and the CLI binary. Two crates remain, plus the build helper:
+
+| Crate | Kind | Role |
+|-------|------|------|
+| `indusagi` | `[lib]` (`name = "indusagi"`, `src/lib.rs`) **and** `[[bin]]` (`name = "indusagi"`, `src/main.rs`) | The merged framework — every subsystem is a module here — plus the CLI binary (a thin `main()` + `ExitCode` shim over `indusagi::shell_app::run`). `cargo add indusagi` for the library, `cargo install indusagi` for the binary. |
+| `indusagi-testkit` | dev-only lib (`publish = false`) | Shared fakes/fixtures (`ScriptedModel`, wiremock helper, render harness) over the gateway + runtime contracts |
+| `xtask` | bin | Build/automation helper |
+
+```toml
+# indusagi-rust/Cargo.toml (excerpt)
+[workspace]
+members = [
+    "crates/indusagi",
+    "crates/indusagi-testkit",
+    "xtask",
+]
+default-members = ["crates/indusagi"]
+resolver = "3"
+
+[workspace.package]
+version      = "0.1.0"   # single source for the whole tree; continues the npm 0.13.x line
+edition      = "2024"
+rust-version = "1.96"
+```
+
+The `indusagi` crate's binary target is intentionally tiny: its `main()` owns the (current-thread) tokio runtime and calls `indusagi::shell_app::run`, since the whole pipeline (argv → flag grammar → mode → boot → runner → exit code) lives inside the merged crate. `indusagi-testkit` is a normal dependency of `indusagi`, while `indusagi` depends back on it only as a dev-dependency, so the resulting cycle is dev-only (cargo permits it).
+
+The release profile is tuned for a latency-sensitive agent (`opt-level = 3`, not `"z"`):
+
+```toml
+[profile.release]
+opt-level     = 3
+lto           = "thin"
+codegen-units = 1
+strip         = true
+panic         = "abort"
+```
+
+## The module map
+
+Every top-level module lives directly under `crates/indusagi/src/`. Each was a former `indusagi-*` crate and is documented on its own subsystem page.
+
+| Module | Namespace alias | Former crate | One-line role | Doc |
+|--------|-----------------|--------------|---------------|-----|
+| `core` | — | `indusagi-core` | Cross-cutting primitives: cancellation, env/brand registry, locator, canonical-JSON + content hash, ids, errors, re-iterable channel, wall clock | (foundation) |
+| `tracing` | `tracing` | `indusagi-tracing` | Homegrown, OTel-free span tracer: `Segment`/`SegmentHandle`, `SignalChannel`, sampling, redaction, sinks, `TelemetryHub` | [Tracing](/rust/subsystems/tracing) |
+| `llmgateway` | `gateway` | `indusagi-llmgateway` | Zero-SDK multi-provider LLM gateway: connectors, the `Emission` protocol, SSE/NDJSON framers, model catalog, credentials/PKCE, `stream`/`complete` | [LLM Gateway](/rust/subsystems/llm-gateway) |
+| `capabilities` | `capabilities` | `indusagi-capabilities` | Built-in tool suite over a frozen `define_tool` kernel and abstract `Fs`/`Shell` seams; `ToolRegistry`, `tool_box` | [Capabilities](/rust/subsystems/capabilities) |
+| `tui` | — | `indusagi-tui` | Host-agnostic terminal primitives: logical keys, keybindings, fuzzy match, editor, theme contracts, width/wrap. Feature `tui` | [TUI primitives](/rust/ui/tui) |
+| `tui_render` | — | `indusagi-tui-render` | Ratatui 0.30 immediate-mode render layer: `App`, 12 dialogs, markdown/diff/highlight, ui-bridge adapter, interactive loop. Feature `tui` | [Render layer](/rust/ui/tui-render) |
+| `interop` | `interop` | `indusagi-interop` | MCP bridge both ways over `rmcp`: client `ServerEndpoint`/`ServerFleet` graft remote tools, `ProviderHost` publishes ours. Feature `mcp` | [Interop / MCP](/rust/subsystems/interop) |
+| `connectors_saas` | `saas` / `connectors` | `indusagi-connectors-saas` | Composio SaaS connectors: hexagonal `SaasBackend` port, `SaasGateway`, control tools, OAuth-poll FSM | [SaaS Connectors](/rust/subsystems/connectors) |
+| `runtime` | `runtime` | `indusagi-runtime` | Pure-FSM agent runtime: `cadence` reducer, conductor, tool scheduler, compaction, session DAG store; `create_agent` | [Runtime](/rust/subsystems/runtime) |
+| `swarm` | `swarm` | `indusagi-swarm` | File-backed multi-agent crew: `Crew`, roster, dependency-aware ticket board, cursor mailbox, git-worktree isolation. Feature `swarm` | [Swarm](/rust/subsystems/swarm) |
+| `smithy` | `smithy` | `indusagi-smithy` | Agent-builder meta-tool: flag FSM, blueprint validation, embedded knowledge pack, redacting `Forge` | [Smithy](/rust/subsystems/smithy) |
+| `facade` | — | `indusagi-facade` | Thin compatibility shims projecting the legacy `type`/`role` vocabulary (`ai`/`agent`/`mcp`) onto the core; `memory` is intentionally empty | [Facades](/rust/architecture#the-facade-compatibility-layer) |
+| `shell_app` | `shell` | `indusagi-shell-app` | The CLI shell: flag parser, boot pipeline, print/NDJSON/REPL runners, `auth` OAuth subcommand, `run` entry | [Shell App](/rust/subsystems/shell-app) |
+
+The `core` module is the private floor — it ships the load-bearing primitives no subsystem owns but all of them need, re-exporting the most common ones at its root:
+
+```rust
+// src/core/mod.rs
+pub use brand::{BRAND, Brand, env_name};
+pub use cancel::{CancelExt, CancellationToken};
+pub use canonical::{HASH_WIDTH, canonical_json, content_hash};
+pub use channel::{BoxStream, Channel};
+pub use errors::{CoreError, CoreResult};
+pub use locate::{Locator, LocatorOverrides};
+pub use time::now_ms;
+pub use version::VERSION;
+```
+
+`CancellationToken` is the framework's single cancellation currency (a cooperative cancel yields a typed `CoreError`, never a panic); `content_hash` is the parity-critical content-addressing surface used by the session DAG; `Locator` honors `INDUSAGI_HOME` on every state path; `now_ms` is the canonical `Date.now()` analogue.
+
+## Feature gates
+
+The default build keeps the full historical surface (`default = ["rustls", "mcp", "tui"]`), so it is byte-identical to the prior unconditional dependency set. Optional subsystems are behind cargo features, mirroring the umbrella's optional-subsystem taxonomy:
+
+| Feature | Default | Gates | Pulls in |
+|---------|---------|-------|----------|
+| `rustls` | on | the merged `reqwest` TLS backend | `reqwest/rustls` |
+| `mcp` | on | the `interop` module + the facade `mcp` shim | `rmcp`, `http` |
+| `tui` | on | the `tui` + `tui_render` modules | `ratatui`, `crossterm`, `pulldown-cmark`, `syntect`, `two-face`, `similar`, `lru`, `unicode-width`, `unicode-segmentation` |
+| `composio` | off | the `connectors_saas` Composio adapter (pure code gate; `reqwest` is already present) | — |
+| `swarm` | off | the `swarm` module | — |
+| `full` | off | everything at once | `mcp` + `tui` + `composio` + `swarm` |
+
+In `src/lib.rs` the feature gates appear on the module declarations themselves:
+
+```rust
+#[cfg(feature = "tui")]
+pub mod tui;
+#[cfg(feature = "mcp")]
+pub mod interop;
+#[cfg(feature = "swarm")]
+pub mod swarm;
+#[cfg(feature = "tui")]
+pub mod tui_render;
+```
+
+So a `--no-default-features` build of `indusagi` drops the protocol bridge and the entire UI stack while keeping the gateway, runtime, capabilities, tracing, smithy, and connectors compiling.
+
+## Layered design
+
+The framework reads top-to-bottom as three tiers, just like the [Python edition](/python/architecture).
+
+**High-level facades** sit at the top. `indusagi::agent` is the friendly entry point in the old vocabulary; `indusagi::ai` is the LLM-message facade (camelCase `type`/`role` content parts, the `Model` descriptor, `stream`/`complete`); `indusagi::mcp` is the camelCase MCP client/server shim. These are deliberately thin shims that keep the legacy public names exactly while projecting all real work downward — `agent` → `runtime` + `capabilities`, `ai` → `llmgateway`, `mcp` → `interop`. `indusagi::memory` is an intentional empty stub (`export {}`) kept only for import-path parity.
+
+**Core subsystems** do the work. The agent loop lives in [Runtime](/rust/subsystems/runtime); the model wire lives in the [LLM Gateway](/rust/subsystems/llm-gateway); the tools live in [Capabilities](/rust/subsystems/capabilities); external surfaces live in [Interop](/rust/subsystems/interop), [SaaS Connectors](/rust/subsystems/connectors), and [Swarm](/rust/subsystems/swarm); the agent generator is [Smithy](/rust/subsystems/smithy); observability is [Tracing](/rust/subsystems/tracing); the CLI is the [Shell App](/rust/subsystems/shell-app).
+
+**The UI stack** is an optional, toolkit-isolated pair the shell app plugs into. Pure terminal primitives are in [TUI](/rust/ui/tui); the ratatui widget library + the runtime→render projection are in [the render layer](/rust/ui/tui-render).
+
+A unifying convention runs through every layer: a frozen `contract` module holding immutable types and closed enums, surrounded by single-purpose driver modules, with a small public barrel at `mod.rs`. State is event-sourced — the runtime's `RunSnapshot` is never mutated in place — and side effects are confined to named seams (the gateway connectors, the local `Fs`/`Shell` backends, the MCP transports). Cancellation flows through one currency (`core::CancellationToken`); content addressing flows through one hasher (`core::content_hash`); model cards come from one catalog.
+
+## Dependency direction
+
+Dependencies flow **strictly downward**, and the rule that prevents drift is: *each type has exactly one canonical source, and neighbors refuse to re-export each other's vocabulary.*
+
+```text
+  facades:  agent ──┐   ai ──┐    mcp ──┐    memory (empty stub)
+                    │        │          │
+  core:    runtime ─┴─► llmgateway ◄────┘   interop ◄── mcp
+            │   ▲                            ▲
+            │   └── capabilities ────────────┘
+            ▼
+        core (CancellationToken, env/locate registry, canonical/hash, channel)
+```
+
+- `llmgateway` is the foundation and the **single source of truth** for the gateway contract (`ModelCard`, `Conversation`, `Turn`/`Block`, `Emission`, `Channel`, `StreamOptions`, `GatewayError`). It owns the **one** model catalog — `model_cards()` hands out a `&'static [ModelCard]`, and the facade's `catalog` module re-exports *that exact static slice* rather than copying it (the R-4 drift gate asserts identical pointers).
+- `runtime` consumes the gateway's provider-neutral vocabulary and its `stream` function but **deliberately does not re-export gateway types** — it imports them from `llmgateway::contract`, so there is no second copy. Its public surface (`AgentConfig`, `RunSnapshot`, `Signal`, `Effect`, `RunEvent`, `RunPhase`, `create_agent`, the `cadence` reducer) branches the FSM.
+- `capabilities` sits between two outward contracts it imports rather than redefines: the runtime's tool boundary and the gateway's `ToolDescriptor`/`JsonSchema`. It exposes the `define_tool` kernel, the twelve built-in tools, the `local_fs`/`local_shell` backends, and `tool_box`.
+- `interop`, `connectors_saas`, and `swarm` all build on the same `ToolRegistry`/`ToolBox` abstractions — `interop` grafts remote MCP tools in (under `server__tool` names) and publishes local tools out; `connectors_saas` hydrates SaaS toolkits through the `SaasBackend` port; `swarm` runs several agents as a file-coordinated crew.
+- `smithy` is a downstream consumer that emits an `AgentConfig` via `to_agent_config(...)`, which instantiates through `runtime::create_agent`.
+- `tracing` projects a `RunEvent` stream onto nested `Segment`s via its optional `adapter` module without the runtime knowing about it.
+- `core` is the private floor every module reads through (branded env vars via the env registry, never `std::env` directly; state under `~/.pindusagi` via the `Locator`).
+
+The facades invert this: `agent`/`ai`/`mcp` sit *above* the core, importing from it but never imported by it. `runtime`'s `capabilities_bridge` module supplies `agent_with_capabilities`, the convenience wiring that binds the gateway + a capabilities `ToolBox` into one runnable agent.
+
+## Data flow: one prompt to settlement
+
+A host composes a runnable agent from the runtime and capabilities layers:
+
+```rust
+use indusagi::runtime::{agent_with_capabilities, AgentConfig};
+use indusagi::capabilities::tool_box;
+
+let agent = agent_with_capabilities(/* model + */ tool_box(/* collection, cwd */));
+let snapshot = agent.submit("list the TODOs in this repo").await;
+assert_eq!(snapshot.phase, indusagi::runtime::RunPhase::Settled);
+```
+
+The runtime is a **pure finite-state machine plus a stateful conductor**. `submit` drives one prompt to a terminal phase (settled or faulted) and resolves the final immutable `RunSnapshot`. Under the hood the loop is an effect/signal cycle: the pure reducer (`cadence`) decides *what should happen* by returning `Effect`s, and the conductor carries them out, feeding results back as `Signal`s until the run settles.
+
+1. **Prompt → conductor.** `create_agent` binds the pure `cadence(config)` reducer — a `(&RunSnapshot, Signal) -> Transition` step function with an **exhaustive signal match and no `_` arm** (a new `Signal` variant forces a compile error). A `submit` seeds a blank assistant turn and emits an invoke-model `Effect`. The conductor's drive loop pulls one signal, `step`s the reducer, swaps in the new snapshot, and performs the requested effects.
+
+2. **Gateway invoke.** The invoke-model effect reaches `llmgateway::stream(model_id, conversation, options)` through the injectable `ModelInvoker` seam (so `indusagi-testkit`'s `ScriptedModel` can replay deterministically with no network). `stream` resolves a `ModelCard` from the one catalog, picks the `Connector` for the card's `api` dialect via `connector_for_api`, and returns a re-iterable `Channel` of normalized `Emission`s — without importing any vendor SDK.
+
+3. **Reduce streamed deltas.** Each streamed `Emission` (text/thinking/tool-call/usage/stop) is folded into the open assistant turn by the reducer, publishing the matching `RunEvent`s along the way; `conversion::fold_reply` is the pure reducer that re-assembles blocks in `thinking → text → tool calls` order.
+
+4. **Tool calls via capabilities.** On stream end the reducer either settles (no tools) or dispatches one run-tool `Effect` per call. The conductor batches the calls through the `Scheduler` (bounded concurrency `DEFAULT_CONCURRENCY`, per-call cancel tokens chained parent→round→child) over the config's `ToolRunner`. The `tool_box(...)` assembler produces that `ToolBox`, backed by `local_fs`/`local_shell` — and every tool only ever touches the abstract `Fs`/`Shell` seams, never `std::fs`/`std::process` directly.
+
+5. **Loop until settled.** Tool-settled signals arrive in completion order; once all pending tools are done, the reducer re-invokes the model — back to step 2. Before each invocation the conductor runs a lazy compaction gate (`memory::should_compact` / `find_cut_point` / `compact`): if accumulated history crosses the configured trigger ratio of the model's context window, the older prefix is distilled into one summary turn and the reducer re-invokes over shrunken history. A turn-budget guard force-faults a run that exceeds the configured max turns.
+
+Throughout, each transition publishes `RunEvent`s to a `RunLedger`; a subscriber taps that live stream, and an abort tears the run down via the cooperative `CancellationToken`.
+
+## The facade compatibility layer
+
+Beside the core subsystems, the `facade` module (`indusagi-facade`) exposes a stable, camelCase public vocabulary for migrating code. The TS package shipped four subpath exports as pure re-export barrels fronting a hand-written *second* engine (`ml`/`bot`/`mcp-core`, ~28.7k LOC); per the scoping decision that engine is **not** re-ported. Instead each shim keeps the old `type`/`role` names exactly and projects everything else onto the green core:
+
+| Subpath | Rust module | Projects onto | Role |
+|---------|-------------|---------------|------|
+| `indusagi/ai` | `facade::ai` | `llmgateway` | LLM message facade: content parts (`TextContent`/`ThinkingContent`/`ImageContent`/`ToolCall`), messages, `Usage`, the `Model` descriptor (`Model::from_card`), `ProviderRegistry`/`ModelRegistry`, `stream`/`complete`, env-key probing |
+| `indusagi/agent` | `facade::agent` | `runtime` + `capabilities` | The high-level `Agent` (`prompt`/`steer`/`follow_up`/`wait_for_idle`/`abort`), the mutable `AgentStateData`, `create_*_tool` factories, the message-type registry |
+| `indusagi/mcp` | `facade::mcp` (feature `mcp`) | `interop` | camelCase MCP stack: `MCPClient`/`MCPServer`, `MCPError`/`MCPErrorCode`, schema converters, config loaders — each riding one core `ServerEndpointImpl`/`ProviderHost` |
+| `indusagi/memory` | `facade::memory` | — | A phantom facade: declares **no** items by design (W-4), kept only for import-path parity; real conversational memory is the runtime compaction engine |
+
+Two cross-cutting facade modules guard against drift: `facade::catalog` re-exports the gateway's one static catalog (the drift gate asserts the same `as_ptr()`), and `facade::session_v3` is the append-only **v3 JSONL** `SessionManager`, read-compatible byte-for-byte with real TS-written session files (records are held as `serde_json::Value` maps so unknown fields survive load → migrate → rewrite untouched; `preserve_order` keeps key order). `facade::event_stream` is the multi-cursor producer/consumer stream (a shared FIFO + per-cursor offset so several consumers replay from the start), implemented with `std::sync` primitives — the facade is a *thin* layer that deliberately does not pull in a tokio executor.
+
+The `interop` subsystem and the `mcp` facade both speak MCP but are distinct: `interop` is the clean-room protocol bridge over `rmcp`, while `mcp` re-exports a camelCase shim over it.
+
+## The UI stack
+
+The core layers above are toolkit-free. The terminal UI is a separate, optional stack gated behind the `tui` feature:
+
+| Module | Role |
+|--------|------|
+| [`tui`](/rust/ui/tui) | Host-agnostic, ratatui-free TUI primitives: logical `Key` model, `EditorKeybindings`, `fuzzy_match`, the autocomplete provider, editor/theme contracts, width/wrap utilities |
+| [`tui_render`](/rust/ui/tui-render) | The ratatui 0.30 **immediate-mode** render layer: `App`/`AppState`, the `Dialog`/`DialogStack` overlay machine, the `Component` trait, markdown/structured-diff/syntax-highlight to ratatui spans, the `bridge` adapter (`to_agent_messages`, `live_usage`, `gateway_usage_to_ml`), and the `interactive_app` driver loop |
+
+The render layer replaces the deleted Ink/React reconciler entirely: state lives in plain Rust structs, every frame is one `terminal.draw(|f| …)` pass, and ratatui's double-buffered cell-diff replaces React's virtual-DOM diff. `tui_render` re-exports `crate::tui` at its root, so a render consumer (the shell's `repl` runner) reaches both layers through one module without taking a second dependency. The `bridge` module is the seam that projects a runtime `RunSnapshot` into renderable `AgentMessage`s and computes `LiveUsage` for a status line — importable without standing up the full app.
+
+## Subsystem pages
+
+- [LLM Gateway](/rust/subsystems/llm-gateway) — `indusagi::llmgateway` (alias `gateway`)
+- [Runtime](/rust/subsystems/runtime) — `indusagi::runtime`
+- [Capabilities](/rust/subsystems/capabilities) — `indusagi::capabilities`
+- [Interop / MCP](/rust/subsystems/interop) — `indusagi::interop`
+- [SaaS Connectors](/rust/subsystems/connectors) — `indusagi::connectors_saas` (aliases `saas`/`connectors`)
+- [Swarm](/rust/subsystems/swarm) — `indusagi::swarm`
+- [Smithy](/rust/subsystems/smithy) — `indusagi::smithy`
+- [Tracing](/rust/subsystems/tracing) — `indusagi::tracing`
+- [Shell App](/rust/subsystems/shell-app) — `indusagi::shell_app` (alias `shell`)
+- UI: [TUI primitives](/rust/ui/tui), [Render layer](/rust/ui/tui-render)
+
+For parity with the other editions see the [Python architecture](/python/architecture). For the friendly entry points, start with `indusagi::agent` and `indusagi::runtime::create_agent`.

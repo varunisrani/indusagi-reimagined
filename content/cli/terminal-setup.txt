@@ -1,0 +1,57 @@
+# Terminal Setup
+
+> Most terminals work out of the box. The notes below cover the few cases where a key needs help.
+
+The console draws its own software caret and reads keys through Ink's input layer. It does not draw the hardware cursor by default. The only setup most users need is making sure `Shift+Enter` reaches the console as a distinct key so it can insert a soft newline.
+
+## Soft newline
+
+The console reads `Shift+Enter` (a held shift with return) as a soft newline. If your terminal cannot distinguish `Shift+Enter` from a bare `Enter`, you can always use `Ctrl+J`, which the console treats as a newline regardless of terminal support.
+
+## Hardware cursor
+
+By default the console hides the terminal's own cursor and draws a software caret (the inverted block in the composer), which works everywhere. If you prefer the terminal's hardware cursor — for example to position an IME candidate window — turn on the `showHardwareCursor` preference:
+
+```json
+{
+  "showHardwareCursor": true
+}
+```
+
+You can also toggle it in `/settings` → "Hardware cursor". It is off by default for compatibility.
+
+## Clipboard image paste
+
+`Ctrl+V` attaches an image from the OS clipboard. It shells out to a platform tool, so the tool must be installed:
+
+| Platform | Tool(s) tried |
+|----------|---------------|
+| macOS | `pngpaste` (falls back to `osascript`) |
+| Linux (Wayland) | `wl-paste --type image/png` |
+| Linux (X11) | `xclip -selection clipboard -t image/png -o` |
+
+If no image is on the clipboard, or the platform tool is missing, the console shows a "No image on the clipboard." status and leaves the buffer unchanged. Clipboard image paste is not supported on Windows (see [windows.md](windows.md)).
+
+On macOS install `pngpaste` with `brew install pngpaste`; on Linux install `wl-clipboard` (for `wl-paste`) or `xclip`.
+
+## External editor
+
+`Ctrl+G` opens the current composer buffer in an external editor and reads the edited text back. The editor command is resolved from `$VISUAL`, then `$EDITOR`, then a `vi` fallback. A command with flags is honoured (e.g. `EDITOR="code --wait"`).
+
+```bash
+export VISUAL="nvim"
+# or
+export EDITOR="code --wait"
+```
+
+## Terminal title
+
+The console sets the terminal window/tab title to the live session name (falling back to `indus console`) via the standard OSC 2 control sequence. This is skipped automatically when stdout is not a TTY, so redirecting output to a file or pipe never leaks escape bytes.
+
+## Colours
+
+The console renders with 24-bit colours derived from the active scheme (see [themes.md](themes.md)). Most modern terminals support truecolor. Check yours:
+
+```bash
+echo $COLORTERM  # "truecolor" or "24bit" indicates support
+```

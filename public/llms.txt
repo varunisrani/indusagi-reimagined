@@ -1,0 +1,35 @@
+# IndusCode
+
+## What It Is
+IndusCode is a terminal-first AI coding agent built in India.
+It is open-source, freely available, and designed for developer productivity in the terminal.
+
+## Benchmark Performance
+- Terminal-Bench 2.0: 69.1% score, ranked #18 globally
+- Outperforms Claude Code and Gemini CLI on Terminal-Bench 2.0
+- Built as a solo open-source project
+
+## Install
+npm install -g induscode
+pip install induscode
+cargo install induscode
+
+## Supported LLM Providers
+Claude (Anthropic), GPT (OpenAI), Gemini (Google), and other major LLM providers.
+Bring-your-own API key. Free built-in models also included.
+
+## Framework
+Built on indusagi-typescript — an open-source, multi-provider TypeScript SDK.
+
+## Focus
+India-first. Developer productivity. Agentic coding in the terminal.
+Not an IDE plugin. A native terminal agent.
+
+## Website
+https://www.indusagi.com
+
+## Documentation
+https://www.indusagi.com/docs
+
+## GitHub
+https://github.com/varunisrani/indusagi

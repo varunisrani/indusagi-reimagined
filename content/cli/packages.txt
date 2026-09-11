@@ -1,0 +1,127 @@
+> indusagi can help you create indusagi packages. Ask it to bundle your addons or skills.
+
+# Indusagi Packages
+
+A package source is a string the addon loader understands — an `npm:` spec, a `git:`
+/ `https:` repo, or a bare local path. The package commands manage the configured
+*set* of those sources, persisted in settings under the `extensionPackages` key.
+
+The implementation is `indus-code-rebuild/src/launch/packages.ts`
+(`runPackageCommand`), routed from boot in `src/boot/boot.ts`.
+
+> **Status:** The package commands record and report source *strings* — they do not
+> currently fetch, clone, or `npm install` anything, and the recorded
+> `extensionPackages` set is **not yet consumed at launch** (the addon host is not
+> wired into the runner; see [loading-extensions](loading-extensions.md)). There is
+> no package-resource filtering, no `bundledDependencies` handling, and no convention
+> directory loading. Treat this page as the command reference for the source list;
+> see `FEATURE_GAP_ROADMAP.md` for the integration status.
+
+## Table of Contents
+
+- [Install and Manage](#install-and-manage)
+- [Source Types](#source-types)
+- [Identity and Deduplication](#identity-and-deduplication)
+- [Where Sources Are Stored](#where-sources-are-stored)
+
+## Install and Manage
+
+> **Security:** Addons run with full system access and execute arbitrary code, and
+> skills can instruct the model to perform any action. Review source code before
+> trusting third-party packages.
+
+The five subcommands are recognised only as the **first** token of the invocation
+(`PACKAGE_COMMANDS`: `install`, `remove`, `update`, `list`, `config`). The binary is
+`indus` (also installed as `indusagi`):
+
+```bash
+indus install npm:@foo/bar@1.0.0       # add a source to the configured set
+indus install git:github.com/user/repo
+indus install https://github.com/user/repo
+indus install /abs/path/to/package     # a local path is a valid source
+
+indus remove npm:@foo/bar              # drop a source from the set
+indus list                             # print the configured sources
+indus update                           # re-read the set and confirm what is configured
+indus config                           # print settings file paths + merged contents
+```
+
+- `install` is idempotent: re-adding an equivalent source reports `Already
+  installed`. A missing source argument prints an error and exits non-zero.
+- `remove` reports `not installed` (non-zero) when the source is not in the set.
+- `update` re-reads the persisted set and confirms it; there is no separate fetch
+  step. (Sources are resolved lazily at startup by design — but see the status note;
+  that resolution is not yet wired.)
+- `config` prints the resolved global and project settings paths and the merged
+  settings JSON.
+
+## Source Types
+
+A source string is classified for equality by its prefix:
+
+### npm
+
+```
+npm:@scope/pkg@1.2.3
+npm:pkg
+```
+
+A trailing `@version` is ignored for identity (a leading scope `@` is kept).
+
+### git / https
+
+```
+git:github.com/user/repo@v1
+https://github.com/user/repo@v1
+```
+
+Raw `https://` (and `http://`) URLs work without the `git:` prefix. The scheme, a
+trailing `.git`, and any `@ref` are dropped for identity.
+
+### Local paths
+
+```
+/absolute/path/to/package
+./relative/path/to/package
+```
+
+A local path matches verbatim for identity. It is a valid source string.
+
+## Identity and Deduplication
+
+`install`/`remove` compare sources by a normalized key (`sourceKey`), so two
+spellings of the same package compare equal:
+
+- `npm:` — the package name, ignoring `@version`.
+- git/https — the host+path, ignoring scheme, `.git`, and `@ref`.
+- local — the verbatim path.
+
+This is why `install npm:foo` and `install npm:foo@2.0.0` deduplicate to one entry.
+
+## Where Sources Are Stored
+
+Sources persist in settings under the `extensionPackages` key (a `string[]`,
+default `[]`), through the two-tier `PreferenceStore`. `indus config` prints the
+exact file locations:
+
+```
+Global settings:  <home>/.indusagi/settings.json
+Project settings: <cwd>/.indusagi/settings.json
+```
+
+You can also edit the key directly:
+
+```json
+{
+  "extensionPackages": [
+    "npm:@foo/bar",
+    "git:github.com/user/repo"
+  ]
+}
+```
+
+## Related
+
+- [Loading Extensions](loading-extensions.md) — how addon modules are discovered and loaded
+- [Extensions](extensions.md) — the addon API
+- [Settings](settings.md) — configuration files and keys

@@ -1,0 +1,142 @@
+# Terminal UI
+
+> The interactive console is the default mode. Run `indus` (or `indusagi`) with no `--print`/`--json`/`--rpc` flag and it takes over the terminal.
+
+The interactive console is a single Ink/React application that drives one session from a live terminal. It owns one immutable reducer store, subscribes to the session conductor's signal stream, and renders the masthead, transcript, streaming preview, activity panel, composer, and status strip. Every *decision* lives in a pure, Ink-free module (the reducer, the keymap, the slash resolver, the completion source, the paste coalescer); the surface only wires events in and renders state out.
+
+The console subsystem lives in `src/console`. The public barrel is `src/console/index.ts`.
+
+## Table of Contents
+
+- [Layout](#layout)
+- [Mounting](#mounting)
+- [Components](#components)
+- [The transcript](#the-transcript)
+- [Streaming and the activity panel](#streaming-and-the-activity-panel)
+- [The composer](#the-composer)
+- [Status strip](#status-strip)
+- [Overlays](#overlays)
+- [Slash commands](#slash-commands)
+- [Shell escape](#shell-escape)
+- [Terminal title and resize](#terminal-title-and-resize)
+
+## Layout
+
+Top to bottom, the surface renders these regions (see `src/console/components/TerminalConsole.tsx`):
+
+| Region | Component | Source |
+|--------|-----------|--------|
+| Masthead | `Banner` | `src/console/components/Banner.tsx` |
+| Transcript | `MessageList` (framework) | `indusagi/react-ink` |
+| Streaming preview | `StreamingMarkdown` (framework) | `indusagi/react-ink` |
+| Activity panel | `TaskPanel` (framework) | `indusagi/react-ink` |
+| Composer | `Composer` | `src/console/components/Composer.tsx` |
+| Status strip | `StatusBar` | `src/console/components/StatusBar.tsx` |
+| Overlays | `OverlayHost` | `src/console/overlays/host.tsx` |
+
+The transcript viewport is sized to the live terminal height. The surface reserves rows for the banner, composer, and footer (more when a modal occupies the screen) and never collapses the transcript below a floor of `MIN_VISIBLE_ROWS` (8 rows). It re-reads `process.stdout.rows` on every terminal `resize` event.
+
+## Mounting
+
+`mountConsole` (in `src/console/mount.ts`) is the single entry point a run mode calls to render the console and resolve when it exits:
+
+```typescript
+import { mountConsole } from "src/console";
+
+await mountConsole(conductor, {
+  scheme: "midnight",       // colour scheme name; falls back to the default
+  slash: registry,          // defaults to the built-in catalog
+  initialInput: "fix the build",  // optional first turn submitted on mount
+  verbose: false,           // render the extra diagnostics line in the banner
+  services,                 // runtime handles the overlays drive
+});
+```
+
+`mountConsole` resolves the scheme through `resolveTheme`, assembles `ConsoleProps`, renders `TerminalConsole` via Ink's `render`, and returns a `MountResult` (`{ clean: boolean }`) once the surface tears down — either when the user exits or when the slash `requestExit` callback fires.
+
+## Components
+
+The console ships three of its own presentational components, all themed through the framework `InkThemeAdapter` (`theme.adapter`):
+
+### Banner
+
+`Banner` is the masthead drawn once at the top of a session: an "INDUS CODE" block-letter wordmark (ANSI-Shadow box-drawing figlet) tinted with the accent role, an emblem, a brand/version line, a personalized "Welcome back, {name}!" line, a bordered "Session" panel (model id + cwd), an optional "Startup Map" panel of gathered session resources, and an optional changelog block.
+
+The masthead has three presentations:
+
+- **Loud** (default) — full wordmark, emblem, Session panel, Startup Map.
+- **Compact** — a single emblem + brand + version + model line, used on a repeat launch of a version whose masthead the user has already seen (tracked by the `lastSeenVersion` preference).
+- **Quiet** — the same single line with the emblem dropped, used when the `quietStartup` preference is on (and the launch is not `--verbose`).
+
+An opt-in static colour sweep (`logoSweep` preference) tints the wordmark and emblem along a frozen primary→secondary gradient. The sweep is suppressed under the `reducedMotion` preference or on a non-TTY terminal.
+
+### Composer
+
+`Composer` is the prompt-input row: a round-bordered box with the `›` accent glyph, the live buffer with an inverted block caret, and — when the parent has computed one — a completion window of up to 8 slash/path suggestions with the highlighted entry marked by a `▸`. It is purely presentational; all key handling lives in the parent `TerminalConsole`. The caret is drawn by inverting the character under the caret offset, so no terminal cursor control is needed.
+
+### StatusBar
+
+`StatusBar` stacks the framework `StatusLine` (the transient status toast) above the framework `Footer` (the persistent session/usage strip), both fed from a projected `SessionSnapshot`. It is purely presentational.
+
+## The transcript
+
+The live conversation drives the framework `MessageList`, which renders assistant turns, tool calls, tool results, and any display blocks. The console re-reads `conductor.messages()` on every render; the conductor-signal subscription pulses a re-render so the list tracks streaming growth.
+
+`MessageList` honours these console state flags:
+
+| Prop | Source | Effect |
+|------|--------|--------|
+| `showThinking` | `showReasoning` setting / `Ctrl+T` toggle | Whether reasoning rows are shown |
+| `showImages` | `showImages` setting | Whether inline images render |
+| `expandToolOutputs` | `Ctrl+O` toggle | Whether collapsed tool output is shown in full |
+| `displayBlocks` | reducer `blocks` | `/help`, `/keys`, `/whats-new` panels |
+
+## Streaming and the activity panel
+
+While the model streams, narration deltas accumulate into a `StreamingMarkdown` preview rendered below the transcript. A `tool_start` signal ends the current narration segment so text after a tool call starts a fresh preview rather than concatenating.
+
+The activity panel (framework `TaskPanel`) is mounted only when there is something to show — a running tool or a non-empty pending-input queue. It renders the live tool-execution cards (keyed by tool-call id) and the queued follow-up/steering messages.
+
+## The composer
+
+Typed text accumulates into a *burst* committed once on a short debounce (12 ms), so a character-by-character paste lands whole instead of dropping the rapid follow-on characters. A large coalesced paste is hidden behind a paste marker in the buffer and re-expanded at submit time. Any non-text key flushes the pending burst first (except submit, which folds the burst into the line it sends).
+
+Completion is derived from the live buffer and caret on every keystroke (`completeAt`). It offers `/`-command suggestions and `@file`/path suggestions read from a real filesystem directory reader rooted at the cwd.
+
+## Status strip
+
+The footer reads a `SessionSnapshot` projected each render from the live conductor: the bound model id, context-window occupancy (the latest turn's footprint over the model's context window), the streaming/compacting/tooling phase, the pending-message count, the session id/name, the cwd, the "(auto)" auto-compact marker (mirroring the `autoCompact` preference), and the cumulative session stats (message counts, token tallies, cost). The footer also shows the current VCS branch (read once via `git rev-parse --abbrev-ref HEAD`, omitted outside a repo) and the number of distinct providers the model catalog spans.
+
+## Overlays
+
+`OverlayHost` mounts the modal dialogs over the transcript. When a modal is open the framework dialog owns the keyboard and the console's own input handler is gated off, so keys are not double-handled. The modal kinds are:
+
+| Kind | Opened by | Dialog |
+|------|-----------|--------|
+| `models` | `/model`, `Ctrl+L` | `ModelDialog` |
+| `scopedModels` | `/models-for` | `ScopedModelsDialog` |
+| `theme` | (defined but no opener is wired in this build) | `ThemeDialog` |
+| `settings` | `/settings` | `SettingsDialog` |
+| `sessions` | `Ctrl+R` | session resume list |
+| `tree` | `Esc Esc` (when configured) | transcript-tree navigator |
+
+The model picker restricts the list to models from providers the user has signed into. The settings picker writes each changed value to the preference store immediately and, for reducer-backed toggles, dispatches so the live surface reflects the change. See [themes.md](themes.md) for the colour-scheme picker.
+
+## Slash commands
+
+Submitting a line that starts with `/` resolves it against the slash registry (`resolveSlash`). The built-in catalog is assembled from three topic groups plus dynamic rows discovered on disk:
+
+- **Transcript/session control** — see `src/console/slash/commands/transcript.ts`.
+- **Workbench pickers** — `/model`, `/models-for`, `/settings`, `/help`, `/keys`, `/whats-new`, `/debug` (`workbench.ts`).
+- **Integration bridges** — login/logout, MCP, memory, Composio, copy/export/share (`integrations.ts`).
+- **Dynamic rows** — one `/skill:<name>` per discovered Agent-Skills card and one `/<template-name>` per prompt-template macro, discovered from `.indusagi/skills` and `.indusagi/commands` (project then user).
+
+`/help` lists every command with its summary; `/keys` renders the keyboard map (see [keybindings.md](keybindings.md)).
+
+## Shell escape
+
+A line beginning with `!` runs the rest as a shell command via `conductor.executeBash` and keeps its output in the conversation context. A `!!` prefix runs the command but excludes its output from context. An empty body is a no-op. The status strip reports the shell exit code.
+
+## Terminal title and resize
+
+The console writes the terminal window/tab title via the OSC 2 control sequence (`ESC ] 2 ; <title> BEL`), reflecting the live session name (falling back to `indus console`). The write is skipped when stdout is not a TTY so a redirected run does not leak escape bytes. The transcript viewport tracks the live window height across `resize` events.

@@ -1,0 +1,362 @@
+# Sessions & Branching
+
+> `induscode::core::sessions` is the catalog-and-navigation layer over a workspace's persisted conversations. Where the [conductor](/rust-cli/subsystems/conductor) drives one live transcript, `SessionLibrary` owns the whole directory of saved sessions — enumerating, opening, renaming, and deleting them, and projecting a loaded session DAG into the flat shapes a chooser UI resumes, branches, and forks from. It re-implements **no** transcript parsing: it sits directly on the framework session DAG ([`indusagi::runtime::store::SessionStore`](/rust)), reads its `.jsonl` files, and reduces nodes to short display previews. Reached as `use induscode::core::sessions::SessionLibrary;`.
+
+## Table of Contents
+
+- [What this is](#what-this-is)
+- [Module layout](#module-layout)
+- [Public API](#public-api)
+- [The branchable session DAG](#the-branchable-session-dag)
+- [Listing sessions: shallow vs deep](#listing-sessions-shallow-vs-deep)
+- [Opening and resuming](#opening-and-resuming)
+- [Navigation projections: tree and prior turns](#navigation-projections-tree-and-prior-turns)
+- [Forking from a prior turn](#forking-from-a-prior-turn)
+- [Rename and delete](#rename-and-delete)
+- [On-disk layout and per-cwd scoping](#on-disk-layout-and-per-cwd-scoping)
+- [How boot wires it](#how-boot-wires-it)
+- [Pure helpers](#pure-helpers)
+- [Parity notes](#parity-notes)
+- [Gotchas](#gotchas)
+
+## What this is
+
+The sessions module is a thin reader/manager over the conductor's persisted transcripts. It re-implements **no** transcript parsing or message serialization — that all lives in the framework [`SessionStore`](/rust) (the writer of the append-only DAG: one content-hashed node per turn, plus a head marker tracking the active leaf). `SessionLibrary` is the reader/manager of the *collection*: its own logic is purely directory enumeration, tree flattening, and text reduction to short previews.
+
+The crate is `induscode`, the Rust edition of the coding agent (binaries `indusr` and `indusagir`), built on the single published [`indusagi`](/rust) framework crate. Whereas the TS agent sat the library on the conductor's `TranscriptStore`/`fsBackend`/`replay` surface, the Rust library is built directly over the framework session DAG — [`indusagi::runtime::store::SessionStore`](/rust) / `SessionGraph` — which `induscode::core` already depends on. The framework `Turn` carries the `user`/`assistant`/`tool` roles every catalog/navigator projection needs; the conductor's richer 6-role node is a future swap, and the `SessionStore` seam stays identical.
+
+```rust
+use induscode::core::sessions::{BranchNode, PriorTurn, SavedSession, SessionLibrary, SessionLibraryOptions};
+```
+
+## Module layout
+
+The whole subsystem is three Rust files under `crates/induscode/src/core/sessions/`, folded into `induscode::core` and re-exported from `mod.rs`.
+
+| Module | Path | Contents |
+|--------|------|----------|
+| `sessions` | `core/sessions/mod.rs` | Module barrel; `pub use` of `BranchNode`, `PriorTurn`, `SavedSession`, `SessionLibrary`, `SessionLibraryOptions`. |
+| `sessions::contract` | `core/sessions/contract.rs` | The three pure value types — display-only projections with stable string ids and short previews, carrying no framework message objects. |
+| `sessions::library` | `core/sessions/library.rs` | `SessionLibrary` (the collection handle), `SessionLibraryOptions`, and the pure helpers (`active_branch_nodes`, `is_conversational`, `by_most_recent`, `label_for`, `tool_name_of`, `message_text`, `preview_of`, `collapse_whitespace`). |
+
+```rust
+// core/sessions/mod.rs
+pub mod contract;
+pub mod library;
+
+pub use contract::{BranchNode, PriorTurn, SavedSession};
+pub use library::{SessionLibrary, SessionLibraryOptions};
+```
+
+## Public API
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `SessionLibrary` | struct | `core/sessions/library.rs` | Collection-level handle over a workspace `sessions/` directory. `async list`/`open`/`rename`/`remove` manage files; pure `tree`/`prior_turns` project a loaded `SessionGraph`; `path_of`/`directory` expose locations. |
+| `SessionLibraryOptions` | struct | `core/sessions/library.rs` | Construction inputs — a single `sessions_dir: PathBuf` pointing at the workspace `sessions/` directory. |
+| `SavedSession` | struct | `core/sessions/contract.rs` | Catalog row for one persisted session: `id` (filename stem), `path`, plus best-effort `name`/`last_modified`/`size`/`message_count`/`preview` that are `None` on a shallow listing. |
+| `BranchNode` | struct | `core/sessions/contract.rs` | Row in the flattened DAG: `id`, `parent`, render-ready `label`, `depth`, `is_leaf`, `is_current`. |
+| `PriorTurn` | struct | `core/sessions/contract.rs` | Fork candidate — a past user turn with `entry_id` (fork-target node id), full `text`, and a trimmed single-line `preview`. |
+
+`SessionLibrary` holds two private fields — `dir: PathBuf` and `store: SessionStore` — and is built from `SessionLibraryOptions`:
+
+```rust
+pub struct SessionLibraryOptions {
+    /// Absolute path to the workspace `sessions/` directory.
+    pub sessions_dir: PathBuf,
+}
+
+pub struct SessionLibrary {
+    dir: PathBuf,
+    store: SessionStore,
+}
+
+impl SessionLibrary {
+    pub fn new(options: SessionLibraryOptions) -> Self;
+    pub fn directory(&self) -> &Path;
+    pub async fn list(&self, deep: bool) -> Vec<SavedSession>;
+    pub async fn open(&self, id: &str) -> Option<SessionGraph>;
+    pub async fn rename(&self, from_id: &str, to_id: &str) -> std::io::Result<PathBuf>;
+    pub async fn remove(&self, id: &str) -> std::io::Result<bool>;
+    pub fn path_of(&self, id: &str) -> PathBuf;
+    pub fn tree(&self, graph: &SessionGraph) -> Vec<BranchNode>;
+    pub fn prior_turns(&self, graph: &SessionGraph) -> Vec<PriorTurn>;
+}
+```
+
+`SessionLibrary::new` builds a framework `SessionStore` rooted at `sessions_dir` and keeps the directory alongside it. All disk I/O runs on `tokio::fs` so the `async` surface never blocks the runtime.
+
+The three value structs are deliberately minimal display-only records — they carry stable string ids and short text previews, no framework `Turn` payloads — so a UI can list, rename, delete, walk, and fork without rehydrating message content. Field names are idiomatic snake_case (`last_modified`, `message_count`, `entry_id`, `is_leaf`, `is_current`), unlike the TS/Python editions that kept camelCase.
+
+```rust
+// core/sessions/contract.rs
+pub struct SavedSession {
+    pub id: String,
+    pub path: std::path::PathBuf,
+    pub name: Option<String>,
+    pub last_modified: Option<u64>,   // epoch milliseconds
+    pub size: Option<u64>,            // bytes on disk
+    pub message_count: Option<usize>, // conversational nodes on the active branch
+    pub preview: Option<String>,      // opening-turn excerpt
+}
+
+pub struct BranchNode {
+    pub id: String,
+    pub parent: Option<String>,
+    pub label: String,
+    pub depth: usize,
+    pub is_leaf: bool,
+    pub is_current: bool,
+}
+
+pub struct PriorTurn {
+    pub entry_id: String, // fork target node id
+    pub text: String,
+    pub preview: String,
+}
+```
+
+All three derive `Clone, Debug, PartialEq, Eq`.
+
+## The branchable session DAG
+
+The framework [`SessionStore`](/rust) persists a conversation as a content-addressed, branchable **DAG**, not a flat list. Each `indusagi::runtime::contract::SessionNode` carries one `Turn`, names its `parent` by hash, and has an `id` that is a content hash of the turn plus its lineage (`hash_node(parent, turn, created_at)`). The active conversation — what the agent replays — is the root→leaf branch reachable by walking `parent` links up from the head leaf.
+
+```rust
+// indusagi::runtime::contract::SessionNode
+pub struct SessionNode {
+    pub id: String,            // content hash of (turn + parent + created_at)
+    pub parent: Option<String>, // None for a root
+    pub turn: Turn,            // User | Assistant | Tool
+    pub created_at: i64,       // epoch milliseconds
+}
+```
+
+Branching is just two nodes sharing a parent. The framework `SessionGraph` exposes the verbs the library reads and a forking UI calls:
+
+| Method | Signature | Role |
+|--------|-----------|------|
+| `all` | `fn all(&self) -> Vec<SessionNode>` | Every node in the DAG; the source `tree` flattens. |
+| `get` | `fn get(&self, node_id: &str) -> Option<&SessionNode>` | Look up one node by id; the library walks the parent chain with it. |
+| `leaf` | `fn leaf(&self) -> Option<&str>` | The active head's leaf id; drives `is_current` and the active-branch walk. |
+| `size` | `fn size(&self) -> usize` | Node count. |
+| `append` | `fn append(&mut self, turn: Turn) -> SessionNode` | Chain a new turn onto the head; the conductor's write verb. |
+| `branch_from` | `fn branch_from(&mut self, node_id: &str) -> Result<SessionNode, String>` | Move the head to an existing node so the next `append` forks there. |
+| `path_to` | `fn path_to(&self, leaf: &str) -> Result<Vec<Turn>, String>` | The linear root→leaf turn context (turns only, no ids). |
+| `resume` | `fn resume(&mut self, leaf: &str) -> Result<Vec<Turn>, String>` | `branch_from` + `path_to` — re-enter a session at a chosen tip. |
+
+Forking is simply repointing the head at an earlier node: `graph.branch_from(id)` advances the head so the next `append` becomes that node's child, leaving every existing node untouched. This is what lets you resume a session and re-ask an earlier prompt down a fresh branch without destroying the old one.
+
+`SessionLibrary` gives a UI the two views it needs over this structure:
+
+- `tree(graph)` flattens the **whole** DAG (every root and all descendants) into an ordered `Vec<BranchNode>`.
+- `prior_turns(graph)` walks **only** the active root→leaf branch and returns the user prompts on it as `Vec<PriorTurn>` fork candidates.
+
+## Listing sessions: shallow vs deep
+
+`list(false)` returns rows built from file metadata only — `id`, `path`, `size`, and `last_modified` — so a large directory lists fast. `list(true)` additionally opens each transcript to fill `message_count` (the count of conversational `User`/`Assistant`/`Tool` nodes along the active branch) and the opening-turn `preview`/`name` (a short excerpt of the first user prompt).
+
+```rust
+use induscode::core::sessions::{SessionLibrary, SessionLibraryOptions};
+
+let lib = SessionLibrary::new(SessionLibraryOptions {
+    sessions_dir: "/abs/path/to/workspace/sessions/--my-proj--".into(),
+});
+
+let rows = lib.list(false).await;       // shallow: newest-modified first; [] if dir missing
+if let Some(newest) = rows.first() {
+    // newest: &SavedSession
+}
+
+let rows = lib.list(true).await;        // deep: also fills message_count + opening preview
+for r in &rows {
+    println!("{} {:?} {:?}", r.id, r.message_count, r.preview);
+}
+```
+
+Internally `list` calls `session_ids` (an `async` directory scan), builds either a `shallow_row` or a `deep_row` per id, then sorts the whole vector with the `by_most_recent` comparator (most-recently-modified first, ties broken by id ascending). A missing directory yields an empty list rather than an error.
+
+- `session_ids` reads the directory with `tokio::fs::read_dir`, keeps only files ending in `.jsonl`, and strips the suffix to the bare stem. A directory that does not exist yields `[]`.
+- `shallow_row` stats the file via `file_meta` (its byte `size` and modification time) and leaves `name`/`message_count`/`preview` as `None`.
+- `deep_row` also `open`s the session; if the graph hydrates, it walks the active branch nodes, counts the conversational ones into `message_count`, finds the first `User` node, and reduces its text into `preview` — which is also copied into `name` (matching the TS, where the opener fills both). If `open` returns `None`, it falls back to a shallow-shaped row.
+
+A console picker would seed with a shallow list for responsiveness and load the deep list lazily (e.g. when an all-scope toggle is flipped).
+
+## Opening and resuming
+
+`open(id)` hydrates a saved session back into a live `SessionGraph`, or returns `None` when no file with that id exists:
+
+```rust
+let graph = lib.open("alpha").await;    // Option<SessionGraph>
+```
+
+The library adds nothing to the rehydration beyond delegating to the framework store: `open` calls `self.store.load_session(id)`, which reads the `.jsonl` file, replays each line through the migrator pipeline, collects node records, tracks the last head marker as the leaf, and reconstructs the in-memory `SessionGraph` via `SessionGraph::hydrate`. A blank or corrupt line is skipped; a missing file would load an *empty* graph at the store level, so the library first checks the file exists (via the private `missing`) to preserve the TS `null`/`None` result for an unknown id.
+
+`id` is always the **bare filename stem**, never a path — that is what the framework store loads by, and what the conductor's resume path uses.
+
+## Navigation projections: tree and prior turns
+
+Both `tree` and `prior_turns` are **pure** — they do no I/O and require a pre-opened `SessionGraph`.
+
+`tree(graph)` reads `graph.all()` and `graph.leaf()`, builds a `children_of` map keyed by parent id (`None` for roots), tracks every id named as a parent in a `has_children` set, then depth-first preorder-walks every root, emitting one `BranchNode` per node:
+
+- `label` — a depth-indented, role-aware one-liner (`user: <preview>`, `assistant`, or `tool: <name>`), built by `label_for`.
+- `depth` — distance from the root (a root is depth 0).
+- `is_leaf` — true when no node names this node as `parent`.
+- `is_current` — true when this node's id equals the active head leaf.
+
+`prior_turns(graph)` walks the active root→leaf branch (via the private `active_branch_nodes`), keeps the `Turn::User` nodes whose reduced text is non-empty, and emits one `PriorTurn` each with `entry_id`, full trimmed `text`, and a single-line `preview`.
+
+```rust
+let graph = lib.open("alpha").await.expect("session");
+
+for node in lib.tree(&graph) {            // Vec<BranchNode> — the whole DAG
+    println!("{}{} cur={} leaf={}", "  ".repeat(node.depth), node.label, node.is_current, node.is_leaf);
+}
+
+for turn in lib.prior_turns(&graph) {     // Vec<PriorTurn> — active branch only
+    println!("{} {}", turn.entry_id, turn.preview);
+}
+```
+
+Because the framework `path_to` returns bare `Vec<Turn>` without ids, `prior_turns` cannot use it directly — it needs the *nodes* (id + turn) to honor `PriorTurn.entry_id` (the fork target). So the library's `active_branch_nodes` helper walks the parent chain from the head itself, mirroring the same root→leaf order; an empty graph (no head) yields `[]`.
+
+## Forking from a prior turn
+
+To re-ask or re-edit an earlier prompt, pick a `PriorTurn` and hand its `entry_id` to the framework graph's branch verb — the library produces the candidate; the graph performs the fork:
+
+```rust
+let mut graph = lib.open("alpha").await.expect("session");
+let candidates = lib.prior_turns(&graph);
+
+// pick a candidate, then fork the live graph at its node:
+graph.branch_from(&candidates[0].entry_id).unwrap();  // Err on an unknown id
+// the next graph.append(...) now becomes a child of that node, on a new branch
+```
+
+The library's job ends at projection — it never mutates the DAG itself. Forking (`branch_from`), resuming (`resume`), and appending (`append`) are all framework `SessionGraph` verbs, persisted by the [conductor](/rust-cli/subsystems/conductor) through the `SessionStore`. The library's test suite exercises this exact dance: it seeds a session, calls `graph.branch_from(root_id)` at the opening user turn, appends a divergent assistant reply, and asserts `tree` shows one root with two depth-1 children, exactly one of which is `is_current`.
+
+## Rename and delete
+
+These are the two file-level mutations a session manager needs; both run on `tokio::fs`.
+
+```rust
+let new_path: PathBuf = lib.rename("alpha", "renamed").await?;  // returns new abs path
+let removed: bool      = lib.remove("renamed").await?;          // true removed, false already-absent
+```
+
+`rename(from_id, to_id)` validates that the source file exists and the target id is absent (via the private `missing`), ensures the directory exists, then performs a `tokio::fs::rename`. It returns an `Err`:
+
+- `ErrorKind::NotFound` — `SessionLibrary.rename: no session "<from_id>"` when the source is missing.
+- `ErrorKind::AlreadyExists` — `SessionLibrary.rename: session "<to_id>" already exists` when the target id is taken.
+
+Rename is a pure file move — it does *not* rewrite the in-file head marker (which still names the old leaf id). The store tolerates this on the next load because the head's *leaf* is what matters, not the session label, and the leaf id is content-derived, not the filename.
+
+`remove(id)` unlinks the file idempotently: it returns `Ok(true)` when a file was removed, `Ok(false)` when there was nothing to delete (including a racing `NotFound` on the unlink itself), and only propagates other I/O errors — it never errors on an already-absent session.
+
+## On-disk layout and per-cwd scoping
+
+Each session is its own **append-only `.jsonl` file** under the workspace `sessions/` root. Every line is one JSON record of one of two shapes, written by the framework `SessionStore::append_node`:
+
+```jsonl
+{"type":"node","node":{"id":"<hash>","parent":null,"turn":{"role":"user","blocks":[{"kind":"text","text":"…"}]},"createdAt":1700000000000}}
+{"type":"head","leaf":"<hash>"}
+```
+
+Appending a node writes its node record followed by a fresh head record naming it, so the **last** head marker in the file always names the live leaf. Loading replays the file and reconstructs the DAG. Note the on-disk wire fields stay camelCase (`createdAt`, `sessionId`) for JSONL parity across the TS/Python/Rust editions, even though the in-memory Rust structs are snake_case.
+
+The session file extension is the framework's:
+
+```rust
+// core/sessions/library.rs
+const SESSION_FILE_EXT: &str = ".jsonl";   // matches SessionStore's SESSION_EXT
+const PREVIEW_LIMIT: usize = 72;           // single-line preview cap
+```
+
+The TS agent hard-coded `.ndjson`; the Rust library must match whatever the backend it reads chooses, and the framework `SessionStore` writes `.jsonl` — so `SESSION_FILE_EXT` is `.jsonl`. Writer (the conductor's store) and reader (this library) agree on both the directory and the suffix, closing the historical `.ndjson`-vs-`.jsonl` mismatch.
+
+Sessions are partitioned **per working directory** so conversations from different cwds never collide. `SessionLibrary` always receives the **already-scoped** directory (e.g. `…/sessions/--my-proj--`) — it does no slugging of its own. The slug helper lives in [boot](/rust-cli/subsystems/boot):
+
+```rust
+// induscode::boot::resources
+pub fn session_scope_dir(sessions_root: &Path, cwd: &str) -> PathBuf {
+    sessions_root.join(format!("--{}--", slug_cwd(cwd)))
+}
+```
+
+Both the conductor (writer) and the library (reader) reach it through this one shared helper, so the layout can never drift.
+
+## How boot wires it
+
+Boot resolves the per-cwd session directory once and threads it into both the persistence store and the console. In `induscode::boot::runners`, `session_scope_dir_for(inv, &ctx.workspace)` computes the scoped directory from the invocation cwd, the conductor's `SessionStore` is rooted there for writes, and a `SessionLibrary` rooted at the same directory serves the console's resume/branch/fork overlays:
+
+```rust
+// induscode::boot::runners
+let sessions_dir = session_scope_dir_for(inv, &ctx.workspace);
+let store = indusagi::runtime::store::SessionStore::new(sessions_dir.clone());
+// …the same `sessions_dir` is also handed to a SessionLibrary for the console reads.
+```
+
+The resume flags are parsed by [launch](/rust-cli/subsystems/launch) (`FLAG_SPECS`) into the boot `Invocation`:
+
+| Flag | Aliases | Behavior |
+|------|---------|----------|
+| `--continue` | `-c` | `Invocation.continue_latest` — resume the newest session in this cwd. Boot takes the first row from the library's newest-first `list()` and resumes by that bare id. |
+| `--resume` | `-r` | `Invocation.resume` — open a picker over the listed sessions and resume the chosen id (or start fresh). |
+
+Both loaders share the single `list()` call and the cwd-scoped directory; resume always goes by the bare session **id** (filename stem), never a path. See [launch](/rust-cli/subsystems/launch) for the flag grammar and [boot](/rust-cli/subsystems/boot) for the runner and resource-assembly machinery.
+
+## Pure helpers
+
+The text reduction and ordering logic lives in free functions at the bottom of `library.rs`, each a 1:1 port of the corresponding TS helper:
+
+| Helper | Signature | Purpose |
+|--------|-----------|---------|
+| `active_branch_nodes` | `fn active_branch_nodes(graph: &SessionGraph) -> Vec<SessionNode>` | Walk the parent chain from the head leaf and reverse → root→leaf nodes (id + turn); `[]` for an empty graph. |
+| `is_conversational` | `fn is_conversational(node: &SessionNode) -> bool` | `true` for `Turn::User` / `Assistant` / `Tool` — the roles counted into `message_count`. |
+| `by_most_recent` | `fn by_most_recent(a: &SavedSession, b: &SavedSession) -> Ordering` | Sort comparator: newest `last_modified` first (a `None` mtime sorts as 0, i.e. last), ties broken by id ascending. |
+| `label_for` | `fn label_for(node: &SessionNode, depth: usize) -> String` | Depth-indented (`"  ".repeat(depth)`) role-aware label: `user: <preview>`, `assistant`, or `tool: <name>`. |
+| `tool_name_of` | `fn tool_name_of(_turn: &Turn) -> String` | Returns the `"tool"` placeholder — a framework tool turn carries `ToolResult` blocks keyed by `call_id`, with no tool *name* field. |
+| `message_text` | `fn message_text(turn: &Turn) -> String` | Concatenate the `Block::Text` segments of a turn, ignoring thinking/image/tool blocks; `""` for a turn with none. |
+| `preview_of` | `fn preview_of(text: &str, limit: usize) -> String` | Collapse whitespace, and if over `limit` chars, cut to `limit - 1` **by char** (UTF-8 safe) and append `…` (U+2026). |
+| `collapse_whitespace` | `fn collapse_whitespace(text: &str) -> String` | `split_whitespace().join(" ")` — the Rust analogue of the TS `text.replace(/\s+/g, " ").trim()`. |
+
+`label_for` only renders the three framework roles. The TS `condense`/`system`/`note` arms belong to a future 6-role conductor node and are not reachable over the framework `Turn` yet, so they are omitted.
+
+```rust
+fn label_for(node: &SessionNode, depth: usize) -> String {
+    let indent = "  ".repeat(depth);
+    match &node.turn {
+        Turn::User { .. } => format!("{indent}user: {}", preview_of(&message_text(&node.turn), PREVIEW_LIMIT)),
+        Turn::Assistant { .. } => format!("{indent}assistant"),
+        Turn::Tool { .. } => format!("{indent}tool: {}", tool_name_of(&node.turn)),
+    }
+}
+```
+
+## Parity notes
+
+The Rust sessions module is a clean port of the TS `src/sessions` (`contract.ts`, `library.ts`) and is mirrored by the Python [`induscode.sessions`](/python-cli/subsystems/sessions). The contracts match field-for-field, and the methods are 1:1 with the TS `SessionLibrary` surface. The deliberate edition differences:
+
+| Concern | TS / Python | Rust |
+|---------|-------------|------|
+| Field casing | camelCase fields (`lastModified`, `messageCount`, `entryId`, `isLeaf`, `isCurrent`) | snake_case fields (`last_modified`, `message_count`, `entry_id`, `is_leaf`, `is_current`) |
+| File extension | `.ndjson` (TS hard-coded) | `.jsonl` (matches the framework `SessionStore`) |
+| Backing store | conductor `TranscriptStore` over an `fsBackend` + `replay` | framework `indusagi::runtime::store::SessionStore` / `SessionGraph` |
+| Node roles | 6-role conductor node (incl. `condense`/`system`/`note`) | 3-role framework `Turn` (`User`/`Assistant`/`Tool`); richer node is a future swap |
+| Async runtime | `asyncio.to_thread` / Promises | `tokio::fs` directly |
+| List signature | `list(deep=False)` keyword | `list(deep: bool)` positional |
+
+The on-disk JSONL wire fields stay camelCase across all three editions, so a `.jsonl` written by the TS or Python agent loads unchanged in the Rust agent (modulo the extension rename).
+
+## Gotchas
+
+- **Epoch-MS timestamps.** `SavedSession.last_modified` is the file mtime in milliseconds (`duration_since(UNIX_EPOCH).as_millis() as u64`), not seconds. The node `created_at` is `i64` epoch ms.
+- **`.jsonl`, not `.ndjson`.** The Rust library reads/writes `.jsonl` to match the framework store; the `SESSION_FILE_EXT` constant moves in lockstep with whatever backend it reads.
+- **Newest-first listing.** `list` always returns rows sorted by most-recently-modified first, id ascending as tiebreak; a `None` mtime sorts last.
+- **`tree`/`prior_turns` are pure.** They take a pre-opened `&SessionGraph` and do no I/O; call `open` first.
+- **`open` returns `None` for an unknown id.** The library checks the file exists before delegating, because the framework `load_session` would otherwise hand back an empty graph for a missing file.
+- **Rename does not rewrite the head.** The in-file head marker keeps naming the same leaf hash after a rename; the store tolerates it on the next load (the leaf is content-derived, not the filename).
+- **Forking is a framework verb.** The library only produces `PriorTurn` candidates; `branch_from(entry_id)` lives on the framework [`SessionGraph`](/rust), persisted by the [conductor](/rust-cli/subsystems/conductor).
+- **`tool:` label is a placeholder.** A framework tool turn carries no tool *name* (only `ToolResult` blocks keyed by `call_id`), so `label_for` always renders `tool: tool`.
+- **Scoping is boot's job.** The library never slugs the cwd; it takes the already-scoped `--<slug>--` directory from `boot::resources::session_scope_dir`.

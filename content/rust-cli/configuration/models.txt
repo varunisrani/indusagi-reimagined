@@ -1,0 +1,411 @@
+# Models & Providers
+
+> How the Rust `induscode` edition selects which model a run talks to. Pick one with `--model`/`-m`, browse the full catalog with `--list-models`, switch interactively in the `/model` picker, or scope a query down to a subset with the per-scope picker. The catalog is the framework's own model registry surfaced through the `indusagi/ai` facade — 708 models across 24 providers (the `mock` echo provider filtered out) — read by the printer, the picker, and the resolver alike, so there is exactly one catalog path through the app.
+
+## Table of Contents
+
+- [Selecting a model](#selecting-a-model)
+- [The model flags](#the-model-flags)
+- [Listing the catalog](#listing-the-catalog)
+- [The CatalogFilter](#the-catalogfilter)
+- [How the catalog is surfaced](#how-the-catalog-is-surfaced)
+- [Resolving the effective model id](#resolving-the-effective-model-id)
+- [The model picker overlay](#the-model-picker-overlay)
+- [Authentication filtering](#authentication-filtering)
+- [The scoped-models overlay](#the-scoped-models-overlay)
+- [Reasoning effort](#reasoning-effort)
+- [Public API](#public-api)
+- [See also](#see-also)
+
+## Selecting a model
+
+Pass a model selector with `--model` (short alias `-m`). The value is a catalog
+model identifier: either the canonical `provider/modelId` form or a bare
+provider-scoped model id. Both forms are tolerated everywhere the agent resolves
+a model — `claude-sonnet-4-5` and `anthropic/claude-sonnet-4-5` land on the same
+card.
+
+```bash
+indusr -m anthropic/claude-sonnet-4-5 -p "summarize this repo"
+indusr -m claude-sonnet-4-5 "refactor the auth module"   # bare model id
+indusr --list-models                                     # browse the catalog
+indusr --list-models claude                              # filter by substring
+```
+
+`--model` is one row of the single declarative flag table (`flag_specs()` in
+`launch::flags`) — a `FlagKind::String` flag whose canonical `name` is `"--model"`
+with the alias `-m`, filed under `FlagGroup::Model`. The parser folds the value
+into the parsed invocation; the boot session runner then resolves it to a concrete
+catalog id via [`resolve_model_id`](#resolving-the-effective-model-id). When
+`--model` is omitted, a default is chosen (see the same section).
+
+## The model flags
+
+All five `FlagGroup::Model` rows come from `launch::flags::flag_specs()`. The
+`describe` strings below are copied verbatim from `flags.rs`:
+
+| Flag | Aliases | Kind | Purpose |
+|---|---|---|---|
+| `--model` | `-m` | String | Select the model, provider-qualified or bare (e.g. `provider/name`). |
+| `--fallback-model` | — | String | Model to switch to mid-turn when the selected model is overloaded (HTTP 529). |
+| `--account` | — | String | Authenticate the run with a named stored credential account. |
+| `--thinking` | — | String | Set the reasoning effort (one of: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`). |
+| `--list-models` | — | String | List the available models (optionally filtered by a substring) and exit. |
+
+The `--thinking` `describe` string is built once at runtime from
+`THINKING_EFFORTS` (`thinking_describe()` in `flags.rs`), so the usage banner
+enumerates the same rungs the validator accepts — see
+[Reasoning effort](#reasoning-effort). For the complete 18-row grammar and the
+parser internals see [Launch](/rust-cli/subsystems/launch).
+
+## Listing the catalog
+
+`--list-models` prints the catalog as an aligned text table and exits without
+starting a session. It is one of the leading verbs `route()` short-circuits in
+`main.rs` **before** the boot handoff (it never needs a session). It takes an
+optional substring argument; when present it becomes the case-insensitive
+`search` field of a [`CatalogFilter`](#the-catalogfilter).
+
+```bash
+indusr --list-models                 # the whole catalog (708 models / 24 providers)
+indusr --list-models claude          # only ids matching "claude" (substring)
+indusr --list-models gpt             # only ids matching "gpt"
+```
+
+The entry point is `print_model_catalog` in `launch::catalog`:
+
+```rust
+// crates/induscode/src/launch/catalog.rs
+pub fn print_model_catalog(
+    io: &mut dyn CatalogIo,
+    filter: &CatalogFilter,
+    source: &dyn CatalogModelSource,
+)
+```
+
+It pulls every row from `source`, applies `filter`, sorts by provider then model
+id (`sort_rows`), and writes the aligned table through `io`. The six columns
+(`HEADERS` in `catalog.rs`) are:
+
+| Column | Meaning |
+|---|---|
+| Provider | Owning provider slug (kebab-case serde spelling, e.g. `google-vertex`) |
+| Model | Provider-scoped (bare) model id |
+| Context | Context-window size — `128K` / `1.0M` / `-` when unknown (`format_token_count`) |
+| Max Output | Maximum output tokens, same compact format |
+| Thinking | `yes` when the model advertises a reasoning budget |
+| Images | `yes` when the model accepts image input |
+
+Token counts are formatted compactly by `format_token_count`: `0` renders as
+`-`, ≥ 1,000,000 as `1M` / `1.5M`, ≥ 1,000 as a rounded `128K`, otherwise the
+bare number. The layout (`layout`) computes each column width from its widest
+cell, emits a Title-Case header, a dash rule, then every body row. When the
+filter matches nothing, a single `No models match the given filter.` line is
+printed instead of an empty table.
+
+The output sink is the `CatalogIo` trait — `StdoutCatalogIo` writes through
+`println!` in production; `VecCatalogIo` buffers every line into a `Vec<String>`
+for tests:
+
+```rust
+pub trait CatalogIo {
+    fn print(&mut self, line: &str);
+}
+```
+
+## The CatalogFilter
+
+`CatalogFilter` (a `#[derive(Clone, Debug, Default, PartialEq, Eq)]` struct)
+carries more than the `--list-models` substring exposes — every field is
+optional and an absent field matches everything:
+
+```rust
+// crates/induscode/src/launch/catalog.rs
+pub struct CatalogFilter {
+    pub provider: Option<String>,   // restrict to one provider (case-insensitive)
+    pub thinking_only: bool,        // keep only models with a reasoning budget
+    pub images_only: bool,          // keep only models that accept image input
+    pub search: Option<String>,     // case-insensitive substring over "provider/modelId"
+}
+```
+
+`filter_rows` lowercases the `provider` needle and matches it for exact equality;
+`search` is trimmed, lowercased, and run as a plain substring test over the
+synthesized `"provider/modelId"` haystack — no fuzzy matcher and no external
+ranking. From the CLI only `search` is reachable; programmatic callers can build
+the other three directly:
+
+```rust
+use induscode::launch::catalog::{print_model_catalog, CatalogFilter, RegistrySource, StdoutCatalogIo};
+
+// Anthropic reasoning models whose id contains "claude":
+let filter = CatalogFilter {
+    provider: Some("anthropic".into()),
+    thinking_only: true,
+    search: Some("claude".into()),
+    ..Default::default()
+};
+print_model_catalog(&mut StdoutCatalogIo, &filter, &RegistrySource);
+```
+
+## How the catalog is surfaced
+
+The printer sources its rows through a seam, the `CatalogModelSource` trait, so
+the live path and the test path render identically:
+
+```rust
+pub trait CatalogModelSource {
+    fn rows(&self) -> Vec<CatalogRow>;
+}
+```
+
+| Source | Backed by | Used by |
+|---|---|---|
+| `RegistrySource` | the live `indusagi/ai` facade catalog (`get_providers()` × `get_models(provider)`), `mock` filtered out | production `--list-models` |
+| `SliceSource` | an injected `Vec<ModelCard>` projected through `to_row` | tests |
+
+`RegistrySource::rows()` walks the **facade** catalog — `get_providers()` then
+`get_models(&provider)` from `indusagi::facade::ai` — skipping the
+`EXCLUDED_PROVIDERS` set (`&["mock"]`), and projects each facade `Model` to a
+`CatalogRow` via `facade_model_to_row`. This is the same 708-model / 24-provider
+matrix the `/model` picker reads, not the framework gateway's smaller set of
+routing cards, so the printed listing and the interactive picker always agree on
+the visible set. The `mock` echo provider is excluded so a bare `--list-models`
+shows only the real provider/model matrix.
+
+Each `CatalogRow` (a `pub` struct, since the seam yields rows directly) carries
+`provider`, `model_id`, `context_window`, `max_output`, `thinking`, and `images`.
+A facade row's `provider` is the facade `provider` string; an injected
+`ModelCard` row's `provider` is rendered through the card's serde kebab-case
+spelling by `provider_label` (so `ProviderId::GoogleVertex` → `google-vertex`),
+`thinking` mirrors `reasoning`, and `images` is `modalities.contains(&Modality::Image)`.
+
+The facade catalog is the framework's generated model registry — see the
+framework's [Facade](/rust/subsystems/facade) (`indusagi::facade::ai`) and the
+[LLM Gateway](/rust/subsystems/llm-gateway) for how a model id resolves to a wire
+connector and how the catalog is generated.
+
+## Resolving the effective model id
+
+When the run actually starts, `resolve_model_id` in `launch::catalog` picks the
+effective id. It mirrors the merged framework + product precedence
+(`indusagi::shell_app::config::resolve_model_id` and the boot session runner):
+
+```rust
+// crates/induscode/src/launch/catalog.rs
+pub fn resolve_model_id(
+    invocation_model: Option<&str>,
+    saved_model: Option<&str>,
+    authed: &std::collections::HashSet<String>,
+) -> String
+```
+
+The four tiers, in order:
+
+1. **Explicit `--model`** (`invocation_model`) — a non-empty selector that names
+   a real catalog model wins outright.
+2. **Saved `settings.default_model`** (`saved_model`) — but only when
+   `saved_model_usable` returns true: the id must name a real catalog model **and**
+   its owning provider must be in the `authed` set. A stale saved id from an
+   unauthenticated provider (e.g. an `anthropic/claude-haiku-…` left in settings
+   while only `minimax` is signed in) is skipped, so the bound model never sticks
+   on an unusable saved choice.
+3. **An authenticated provider's current model** — when neither of the above is
+   set, the resolver defaults to a callable model of a provider the user has a
+   credential for, picked by `provider_default_model`. That helper consults the
+   `PREFERRED_DEFAULT` table (a provider's catalog often leads with a deprecated
+   model), falling back to the provider's newest catalog entry:
+
+   | Provider | Preferred default ids, in priority order |
+   |---|---|
+   | `anthropic` | `claude-sonnet-4-5`, `claude-haiku-4-5`, `claude-sonnet-4-6`, `claude-sonnet-4-0`, `claude-opus-4-5` |
+   | `openai` | `gpt-5.1`, `gpt-4.1`, `gpt-4o` |
+   | `minimax` | `MiniMax-M2`, `MiniMax-M2.7` |
+
+4. **`FALLBACK_MODEL_ID`** — the catalog-guaranteed last resort from
+   `indusagi::shell_app::config`, hardened to `CAPABLE_DEFAULT_MODEL_ID`
+   (`"claude-sonnet-4"`, a large-window Anthropic model) should the framework
+   fallback ever name no backing card. This guarantees a bare `indusr` with no
+   key never lands on a tiny- or zero-window card that would trip a spurious
+   auto-condense on the first turn.
+
+"A real catalog model" is tested by `model_known`, which accepts either the
+facade catalog (`facade_knows` — a canonical `provider/id` or a bare id resolved
+when unambiguous) **or** a gateway routing card (`get_card`). The owning provider
+for any id is resolved by `model_provider` (the prefix of a canonical id, else
+the first facade provider carrying a bare id, else the gateway card's provider).
+This keeps an unauthenticated, no-flag launch from defaulting to a model the
+caller has no key for. See [Auth](/rust-cli/configuration/auth) for how
+credentials are stored and [Boot](/rust-cli/subsystems/boot) for where in the
+pipeline resolution runs.
+
+## The model picker overlay
+
+Inside the interactive console, `/model` opens the single-model picker — the
+`ModalKind::Models` modal, rendered by `console::overlays::models`. The Rust port
+paints the frozen framework `ModelDialog`
+(`indusagi::tui_render::components::dialogs`) as a full-screen modal layer:
+
+```rust
+// crates/induscode/src/console/overlays/models.rs
+pub fn draw_models(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    models: Vec<ModelOption>,
+    selected: usize,
+)
+```
+
+The module is the **render half**; opening the picker (pushing the dialog) and
+binding the chosen model (`select_model`) are the host's job. It owns the pure
+projections the host reuses to pre-fetch the rows before the push:
+
+| Function | Returns | What it does |
+|---|---|---|
+| `catalog()` | `Vec<ModelOption>` | The full facade catalog as picker rows — `mock` excluded, de-duplicated by canonical `provider/modelId` (first wins), sorted by provider then id |
+| `catalog_for(authed)` | `Vec<ModelOption>` | `catalog()` restricted to authenticated providers, with the empty→all fallback |
+| `provider_for(model_id)` | `Option<String>` | The owning provider slug for a bare id (indexed once, first wins) so the footer renders `provider/id` not `no-model` |
+| `bound_index(models, bound)` | `Option<usize>` | The row matching the currently-bound model (bare or canonical) so the cursor seeds onto it |
+| `is_active(state)` | `bool` | True when `state.modal.kind == ModalKind::Models` |
+
+Each row is a framework `ModelOption { provider, id, name }`. `model_to_option`
+keeps `id` **bare** (e.g. `claude-sonnet-4-5`); the frozen `ModelDialog`
+reconstructs the canonical `provider/id` label for display, so there is no
+double-prefixing. `bound_index` matches a bound id whether it is bare or
+canonical (it compares against both the row's bare id and the bare segment after
+a slash). A fresh `ModelDialog` is built each draw and seeded with the host's
+shared `modal_selected` cursor (re-clamped), so the render path stays pure. The
+picker reads the same facade catalog as `--list-models`, so the two never drift.
+
+## Authentication filtering
+
+The picker is auth-filtered to providers the user can actually call, with a
+fallback so it is never empty. The host pre-fetches the authenticated providers
+with `authenticated_providers`, which unions two sources:
+
+```rust
+// crates/induscode/src/console/overlays/models.rs
+pub fn authenticated_providers(auth_path: &Path) -> HashSet<String>
+```
+
+- **Vault half** — reads the on-disk `auth.json` at `auth_path` (the nested
+  `{ providerId: { account: cred } }` map) and returns every top-level key whose
+  value is a non-empty accounts object (≥ 1 saved account). Any missing /
+  unreadable / non-object file degrades to the empty set, so a broken vault never
+  sinks the picker.
+- **Env half** — unions in every `PROVIDER_DIRECTORY`
+  (`launch::credentials::PROVIDER_DIRECTORY`) provider whose conventional api-key
+  env var is set and non-empty (e.g. `ANTHROPIC_API_KEY` → `anthropic`,
+  `GEMINI_API_KEY` → `google`, `MOONSHOT_API_KEY` → `kimi`). The directory ids
+  already match the facade catalog spelling, so the returned set compares directly
+  against `ModelOption::provider`.
+
+`catalog_for(Some(&set))` then filters the catalog to those rows via
+`auth_filter`; when `set` is `None` or empty, the whole catalog is returned. A
+secondary fallback inside `auth_filter` shows the full catalog if filtering
+removed everything (an authenticated provider with no catalog model), so the
+picker is never empty:
+
+```rust
+pub fn auth_filter(models: Vec<ModelOption>, authed: &[String]) -> Vec<ModelOption>
+```
+
+This is the `useAuthenticatedProviders` filter from the TS edition, ported as a
+pure host-side projection — see [Auth](/rust-cli/configuration/auth).
+
+## The scoped-models overlay
+
+`/models-for` opens the per-scope model picker — the `ModalKind::ScopedModels`
+modal, rendered by `console::overlays::scoped_models` over the frozen framework
+`ScopedModelsDialog`. Where `/model` binds a single active model, this overlay
+edits the `enabledModels` preference: a checkbox list that narrows which catalog
+models a scope (a query, a capability) may use.
+
+```rust
+// crates/induscode/src/console/overlays/scoped_models.rs
+pub fn draw_scoped_models(
+    f: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    models: Vec<ModelOption>,
+    enabled: &[String],
+    cursor: usize,
+)
+```
+
+The module owns the two pure projections that translate between the stored
+override and the on-screen checkbox selection:
+
+| Function | What it does |
+|---|---|
+| `seed_selection(models, enabled)` | Seed the checkboxes: an **empty** `enabled` override means *every* model is enabled, so the seed is every model id; otherwise the stored ids |
+| `collapse_selection(all_ids, selected)` | Collapse on save: a **full** selection (`selected.len() == all_ids.len()`) is stored as `[]` (= every model enabled); a partial selection is stored verbatim |
+| `is_active(state)` | True when `state.modal.kind == ModalKind::ScopedModels` |
+
+The semantics: an empty stored override is the "all models" sentinel, so toggling
+every box back on collapses the saved value to `[]` rather than persisting the
+full list. As with `/model`, this is the render half only — the
+`open_scoped_models(ScopedIntent::Reset)` path emits a `ResetScopedModels` effect
+without pushing a dialog, and the save→`SaveScopedModels` wiring is the host's
+job. The scoped picker tracks a `cursor` (the highlighted row) separately from
+its checkbox `selected_ids`. See [Console Dialogs](/rust-cli/console/dialogs) for
+the dialog stack and the overlay catalog.
+
+## Reasoning effort
+
+`--thinking` (and the `/thinking` slash command) sets the reasoning-effort rung
+for the run. The accepted vocabulary is the closed `THINKING_EFFORTS` set from
+`launch::contract` (the `ThinkingEffort` enum: `Off`, `Minimal`, `Low`, `Medium`,
+`High`, `XHigh`, rendered lower-case by `as_str()`); the `--thinking` `describe`
+string is generated from it at runtime so the usage banner and the validator never
+drift:
+
+```
+off  minimal  low  medium  high  xhigh
+```
+
+`off` disables extended reasoning entirely; the remaining rungs ascend in effort
+(`xhigh` is the highest budget). Validation is the pure membership test
+`is_thinking_effort` / `ThinkingEffort::parse` over `THINKING_EFFORTS`, applied
+before the run starts.
+
+```bash
+indusr -m claude-sonnet-4-5 --thinking high "design the migration"
+indusr -m claude-sonnet-4-5 --thinking off  "just answer briefly"
+```
+
+## Public API
+
+Exported from `induscode::launch::catalog` (the printer + resolver) and
+`induscode::console::overlays` (the picker projections):
+
+| Name | Kind | Source | Purpose |
+|---|---|---|---|
+| `print_model_catalog` | fn | `launch/catalog.rs` | Render the aligned model table over a `CatalogModelSource` |
+| `CatalogFilter` | struct | `launch/catalog.rs` | `--list-models` filter: `provider`, `thinking_only`, `images_only`, `search` |
+| `CatalogIo` / `StdoutCatalogIo` / `VecCatalogIo` | trait / structs | `launch/catalog.rs` | The line sink the table prints onto (stdout / buffered) |
+| `CatalogModelSource` / `RegistrySource` / `SliceSource` | trait / structs | `launch/catalog.rs` | The seam the printer sources rows from (live facade catalog by default) |
+| `CatalogRow` | struct | `launch/catalog.rs` | One normalized table row (provider, model_id, context, max output, thinking, images) |
+| `resolve_model_id` | fn | `launch/catalog.rs` | The four-tier effective-model resolver (invocation → saved → authed default → fallback) |
+| `saved_model_usable` | fn | `launch/catalog.rs` | Whether a saved default names a real model whose provider is authenticated |
+| `model_provider` | fn | `launch/catalog.rs` | The owning provider slug for a bare or canonical id |
+| `catalog` / `catalog_for` | fn | `console/overlays/models.rs` | The picker rows (full catalog / auth-filtered) |
+| `authenticated_providers` | fn | `console/overlays/models.rs` | The signed-in provider set (vault ∪ env keys) |
+| `auth_filter` / `provider_for` / `bound_index` / `draw_models` | fn | `console/overlays/models.rs` | The picker filter, footer resolver, cursor seed, and render |
+| `is_active` | fn | `console/overlays/models.rs` | True when `state.modal.kind == ModalKind::Models` |
+| `seed_selection` / `collapse_selection` / `draw_scoped_models` | fn | `console/overlays/scoped_models.rs` | The scoped-picker seed, collapse, and render |
+| `is_active` | fn | `console/overlays/scoped_models.rs` | True when `state.modal.kind == ModalKind::ScopedModels` |
+| `flag_specs` / `FlagSpec` / `FlagKind` / `FlagGroup` | fn / struct / enums | `launch/flags.rs` | The single declarative flag table the parser and usage walk |
+
+## See also
+
+- [Auth](/rust-cli/configuration/auth) — stored credentials, `--account`, and the auth vault
+- [Settings](/rust-cli/configuration/settings) — persisted defaults including `default_model` and `enabledModels`
+- [Launch](/rust-cli/subsystems/launch) — the flag grammar, the parser, and the catalog printer
+- [Boot](/rust-cli/subsystems/boot) — where `--list-models` and model resolution run
+- [Conductor](/rust-cli/subsystems/conductor) — the session core that binds the resolved model
+- [Console Dialogs](/rust-cli/console/dialogs) — the overlay/dialog stack hosting the pickers
+- [Facade](/rust/subsystems/facade) — `indusagi::facade::ai`, the catalog the picker and printer read
+- [LLM Gateway](/rust/subsystems/llm-gateway) — the framework model registry and wire routing
+- [Python Models](/python-cli/configuration/models) and the [TS CLI](/cli) — the matching surface in the other editions

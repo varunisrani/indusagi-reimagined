@@ -1,0 +1,178 @@
+# Print / JSON Output Mode
+
+> Drive indusagi from a script: `-p` prints the clean final answer and exits.
+
+A non-interactive **oneshot** run submits one prompt to settlement and writes the
+result to stdout, then exits. The oneshot channel supports two output shapes:
+
+- **clean text** — only the final assistant answer, one trailing line. This is
+  what `--print` / `-p` produces on the CLI.
+- **NDJSON event log** — every session signal as one JSON line. This shape is
+  reachable in-process (`channels.runOneshot` with `shape: "ndjson"`), not via a
+  CLI flag — see the [note below](#how-the-mode-is-resolved).
+
+There is no `--mode` flag: the run mode is derived from the flags below.
+
+## Table of Contents
+
+- [Flags](#flags)
+- [Clean text output](#clean-text-output)
+- [NDJSON event log](#ndjson-event-log)
+- [Signal frames](#signal-frames)
+- [Exit codes](#exit-codes)
+- [Examples](#examples)
+
+## Flags
+
+The relevant flags are declared once in `src/launch/invocation/flags.ts` and
+folded into the parsed invocation by `src/launch/invocation/read.ts`.
+
+| Flag | Alias | Kind | Effect |
+|------|-------|------|--------|
+| `--print` | `-p` | boolean | Run a single request, print only the result, and exit. |
+| `--json` | `--rpc` | boolean | Speak the headless line protocol (see [rpc.md](rpc.md)). |
+| `--interactive` | `-i` | boolean | Force the interactive session even when a prompt is supplied. |
+| `--model` | `-m` | string | Select the model, provider-qualified or bare (e.g. `anthropic/claude-sonnet-4-5`). |
+| `--thinking` | — | string | Reasoning effort: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`. |
+| `--cwd` | — | string | Scope the run to a working directory. |
+| `--system` | — | string | Replace the built-in system prompt (path is read as a file, else literal text). |
+| `--append-system` | — | string | Append extra text after the system prompt. |
+| `--tools` | — | list | Allow only the named built-in tools (comma-separated or repeated). |
+| `--no-tools` | — | boolean | Disable every built-in tool for this run. |
+| `--mcp` | — | list | Attach an external MCP server endpoint (comma-separated or repeated). |
+
+### How the mode is resolved
+
+`deriveMode()` in `src/launch/invocation/read.ts` applies this precedence:
+
+1. `--json` / `--rpc` → the headless line protocol (`rpc` output mode).
+2. `--print` (without `--interactive`) → a single non-interactive request (`json` output mode).
+3. otherwise → the interactive terminal session (`text`).
+
+The launch `OutputMode` maps one-to-one onto a boot runner in
+`src/boot/invocation.ts`:
+
+| Output mode | Selected by | Runner |
+|-------------|-------------|--------|
+| `text` | default | interactive REPL |
+| `json` | `--print` | oneshot |
+| `rpc` | `--json` / `--rpc` | link (JSON-RPC) |
+
+> Note: `--print` plus `--json` lands in the `rpc` link mode, *not* a one-shot
+> JSON dump, because `--json` wins the precedence in `deriveMode()`. The oneshot
+> runner does have an `ndjson` shape — it reads the `json` flag off the
+> invocation (`shapeOf()` in `src/boot/runners/oneshot-runner.ts`) — but the only
+> invocation that sets `json` resolves to the link runner instead, so no CLI flag
+> combination dispatches the oneshot runner with its `ndjson` shape. In practice:
+> `-p` for clean text, the [SDK](sdk.md) (`channels.runOneshot`) for the oneshot
+> NDJSON log, and the [link protocol](rpc.md) for structured streaming from the
+> CLI.
+
+## Clean text output
+
+```bash
+indus -p "List the files in src and summarise what each does"
+```
+
+The oneshot **text** strategy (`src/channels/oneshot.ts`) accumulates every
+`text` signal delta into a buffer and writes it once, as a single trailing line,
+when the turn settles. Thinking deltas, tool frames, and bookkeeping signals are
+ignored — you get the final answer, not a token-by-token dribble:
+
+```
+src/entry.ts is the binary. src/boot/boot.ts parses arguments and dispatches to a runner. ...
+```
+
+## NDJSON event log
+
+The oneshot **ndjson** strategy streams every conductor signal as one framed
+line through the shared NDJSON framer (`src/channels/framer.ts`). Each line is
+separator-safe by construction: the framer escapes the two Unicode line
+separators (U+2028 / U+2029) that are legal inside a JSON string but would break
+a naive line splitter, and terminates every line with exactly one `\n`.
+
+The stream is bracketed by a `start` and an `end` frame:
+
+```json
+{"type":"signal","name":"start","body":{}}
+{"type":"signal","name":"prompt","body":{"kind":"prompt","text":"List files"}}
+{"type":"signal","name":"text","body":{"kind":"text","delta":"src/"}}
+{"type":"signal","name":"text","body":{"kind":"text","delta":"cli.ts ..."}}
+{"type":"signal","name":"tool_start","body":{"kind":"tool_start","id":"t1","name":"ls"}}
+{"type":"signal","name":"tool_end","body":{"kind":"tool_end","id":"t1","ok":true}}
+{"type":"signal","name":"turn_end","body":{"kind":"turn_end","usage":{...}}}
+{"type":"signal","name":"idle","body":{"kind":"idle"}}
+{"type":"signal","name":"end","body":{"phase":"idle","usage":{...},"fault":null}}
+```
+
+The `body` of every mid-run frame is the verbatim `SessionSignal` from the
+conductor; the `name` is its `kind`. The closing `end` frame carries the settled
+phase, the cumulative `usage`, and the `fault` (when the run faulted).
+
+## Signal frames
+
+The signal `kind` (and thus the frame `name`) is one of the
+`SessionSignal` variants declared in `src/conductor/contract.ts`:
+
+| Kind | Body fields | Meaning |
+|------|-------------|---------|
+| `prompt` | `text` | The user turn was committed to the conversation. |
+| `text` | `delta` | A chunk of assistant answer text. |
+| `thinking` | `delta` | A chunk of reasoning/thinking text. |
+| `tool_start` | `id`, `name` | A tool invocation began (correlate by `id`). |
+| `tool_end` | `id`, `ok` | A tool invocation finished (`ok` = no error). |
+| `turn_end` | `usage` | The assistant turn settled; token spend reported. |
+| `persisted` | `entryId` | The latest node was committed to the transcript. |
+| `compacted` | — | The transcript was condensed to fit the context window. |
+| `fault` | `fault` | A typed `ConductorFault` occurred (`kind`, `message`, `cause?`). |
+| `queue` | `count` | The pending-input queue changed; `count` is its new depth. |
+| `idle` | — | The conductor has no in-flight work and is ready for input. |
+
+The injected `start` / `end` frames are oneshot-only bookkeeping and are *not*
+conductor signal kinds.
+
+## Exit codes
+
+The oneshot exit code comes from the settled `ConductorState.phase`
+(`exitCodeFor()` in `src/channels/oneshot.ts`):
+
+| Code | Condition |
+|------|-----------|
+| `0` | Clean settlement (phase is anything but `faulted`). |
+| `1` | The final turn ended in a fault (phase is `faulted`). |
+| `2` | No request text was supplied to run (`src/boot/runners/oneshot-runner.ts`). |
+
+## Examples
+
+Clean answer captured into a variable:
+
+```bash
+answer="$(indus -p "What does src/entry.ts do?")"
+echo "$answer"
+```
+
+Scope the run to another directory, with a restricted tool set:
+
+```bash
+indus -p --cwd /path/to/project --tools read,grep,ls "find all TODO comments"
+```
+
+### Getting the NDJSON event log
+
+The oneshot `ndjson` shape (the `start`/signal/`end` frames shown above) is a
+property of the oneshot **channel**, not of any CLI flag combination: because
+`--json` always wins the mode precedence (`deriveMode()`), `indus -p --json`
+resolves to the `rpc` link mode, never a one-shot JSON dump. No CLI flag
+dispatches the oneshot runner with its `ndjson` shape.
+
+To consume the oneshot NDJSON event log, drive the oneshot channel in-process
+with `channels.runOneshot(ctx, { shape: "ndjson", prompts })` — see the
+[SDK](sdk.md). For streamed structured frames from the CLI, use the
+[link protocol](rpc.md): its signal frames share the same `{type,name,body}`
+shape (so `jq 'select(.name == "text") | .body.delta'` still applies), but you
+submit prompts as `submit` requests on stdin and the stream carries no
+oneshot-only `start` / `end` frames.
+
+For long-lived, bidirectional control (multiple prompts, abort, model cycling,
+session resume), use the [link / JSON-RPC protocol](rpc.md) instead. To embed
+the agent in-process, see the [SDK](sdk.md).

@@ -1,0 +1,263 @@
+# Memory Module - Developer Guide
+
+> `indusagi/memory` exports nothing. To use the memory behaviour — context
+> condensation, run-event observation, and durable session history — you drive
+> `createAgent` from `indusagi/runtime` and inject a store and/or ledger. This
+> guide shows how, and how the internal pieces fit together.
+
+## Table of contents
+
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Configuring condensation](#configuring-condensation)
+- [Observing a run through the ledger](#observing-a-run-through-the-ledger)
+- [Persisting and resuming sessions](#persisting-and-resuming-sessions)
+- [The pieces in isolation](#the-pieces-in-isolation)
+- [Schema migration on load](#schema-migration-on-load)
+- [Notes and limits](#notes-and-limits)
+
+## Overview
+
+There is no `Memory` class. "Memory" in this codebase is three runtime concerns
+that the conductor (`createAgent`) coordinates:
+
+1. **Condensation** — when accumulated history nears the model window, the oldest
+   prefix is distilled into one summary turn and a recent tail is kept verbatim.
+2. **The ledger** — every step of a run publishes a `RunEvent` you can subscribe
+   to for streaming output and progress.
+3. **The session store** — settled history is written to disk as a
+   content-addressed, branchable DAG so it can be resumed later.
+
+All three are reached through the public `indusagi/runtime` entrypoint.
+
+## Architecture
+
+```
+indusagi/runtime  →  createAgent(config, deps)
+  │
+  ├─ context condensation   src/runtime/memory/
+  │     estimateContextTokens · shouldCompact · findCutPoint · summarize · compact
+  │
+  ├─ run event ledger       src/runtime/ledger/
+  │     RunLedger · SnapshotAccumulator
+  │
+  └─ session store          src/runtime/store/
+        hashNode · SessionGraph · SessionStore
+```
+
+`indusagi/memory` itself is `export {}` — a placeholder subpath with no symbols.
+
+## Configuring condensation
+
+Condensation is governed by `AgentConfig.compaction`, a `CompactionPolicy`.
+Omit it and condensation is disabled.
+
+```typescript
+import { createAgent } from "indusagi/runtime";
+import type { AgentConfig } from "indusagi/runtime";
+
+const config: AgentConfig = {
+  model: "claude-sonnet-4",
+  compaction: {
+    triggerRatio: 0.8, // condense once history reaches 80% of the window
+    keepRecent: 8,     // always keep the last 8 turns verbatim
+  },
+};
+
+const agent = createAgent(config);
+const final = await agent.submit("Walk me through the build pipeline.");
+```
+
+When the next model call is about to exceed `triggerRatio` of the model's
+context window, the conductor condenses the oldest prefix into one
+`user`-role summary turn prefixed with `"[condensed earlier context]"`, keeping
+the most recent `keepRecent` turns untouched. The cut never splits a
+`tool_call` from its matching `tool_result`. The defaults applied when no policy
+is supplied are `triggerRatio: 0.8` and `keepRecent: 8`.
+
+The footprint check is heuristic, not a real tokenizer: roughly 4 characters per
+token plus a small per-turn surcharge. It intentionally errs toward condensing a
+little early rather than overflowing the window.
+
+## Observing a run through the ledger
+
+Every agent owns a `RunLedger`. Subscribe to its `RunEvent` stream to render
+incremental output and track progress. `agent.subscribe(handler)` taps the same
+stream and returns a disposer.
+
+```typescript
+const agent = createAgent({ model: "claude-sonnet-4" });
+
+const unsubscribe = agent.subscribe((event) => {
+  switch (event.kind) {
+    case "text_delta":
+      process.stdout.write(event.delta);
+      break;
+    case "tool_started":
+      console.log(`\n[tool] ${event.name} started`);
+      break;
+    case "tool_finished":
+      console.log(`[tool] ${event.name} finished`);
+      break;
+    case "settled":
+      console.log(`\n[done] ${event.snapshot.messages.length} turns`);
+      break;
+    case "faulted":
+      console.error(`\n[fault] ${event.error.kind}`);
+      break;
+  }
+});
+
+await agent.submit("List the files in src/runtime.");
+unsubscribe();
+```
+
+If you want only "where is the run right now" rather than the raw stream, attach
+a `SnapshotAccumulator` to a `RunLedger` and read `getSnapshot()`. Note that
+`RunLedger` and `SnapshotAccumulator` are internal to the runtime package and are
+not re-exported from a public subpath; the example below illustrates their shape
+for hosts working inside the runtime.
+
+```typescript
+// Internal usage (src/runtime/ledger):
+import { RunLedger, SnapshotAccumulator } from "./ledger";
+
+const ledger = new RunLedger();
+const acc = new SnapshotAccumulator();
+const detach = acc.attach(ledger);
+
+// ...the loop publishes events to `ledger`...
+
+const current = acc.getSnapshot(); // most recent RunSnapshot, or undefined
+detach();
+```
+
+Snapshot-bearing events (`snapshot`, `settled`, `faulted`) advance the
+accumulator; delta and tool-lifecycle events are ignored by it.
+
+## Persisting and resuming sessions
+
+Pass a `SessionStore` as `deps.store` and the conductor writes settled history to
+disk; later you can `resume` an agent from a session id. The store is honoured
+only when it is a real `SessionStore` instance (the `deps.store` field is typed
+`unknown` and `instanceof`-checked).
+
+```typescript
+// Internal usage (src/runtime/store):
+import { SessionStore } from "./store";
+
+const store = new SessionStore("/tmp/indusagi-sessions");
+
+const agent = createAgent({ model: "claude-sonnet-4" }, { store });
+await agent.submit("Start a new task.");
+
+// Later, in a fresh agent over the same store:
+const resumed = createAgent({ model: "claude-sonnet-4" }, { store });
+await resumed.resume(sessionId); // rehydrates messages from the persisted DAG
+```
+
+On disk each session is one append-only JSONL file `<root>/<sessionId>.jsonl`.
+Every line is one record: a node record (`{ type: "node", node }`) or a head
+marker (`{ type: "head", leaf }`). The last head marker names the live leaf.
+
+## The pieces in isolation
+
+These are internal helpers. Hosts working inside the runtime can use them
+directly; downstream consumers reach them only via `createAgent`.
+
+### Estimating token footprint
+
+```typescript
+import { estimateContextTokens } from "./memory";
+
+const tokens = estimateContextTokens(snapshot.messages);
+```
+
+### Deciding and performing a condensation
+
+```typescript
+import { shouldCompact, findCutPoint, compact } from "./memory";
+
+if (shouldCompact(messages, modelCard, { triggerRatio: 0.8, keepRecent: 8 })) {
+  const cut = findCutPoint(messages, 8); // 0 = nothing to drop
+  const condensed = await compact(
+    messages,
+    modelCard,
+    { triggerRatio: 0.8, keepRecent: 8 },
+    invokeModel, // a ModelInvoker
+  );
+  // condensed === [summaryTurn, ...recentTail]
+}
+```
+
+`compact` is safe to call unconditionally: when the cut point is `0` it returns
+the original `messages` unchanged.
+
+### Building a session graph by hand
+
+```typescript
+import { SessionGraph } from "./store";
+
+const graph = new SessionGraph("session-42");
+const a = graph.append({ role: "user", blocks: [{ kind: "text", text: "hi" }] });
+const b = graph.append({ role: "assistant", blocks: [{ kind: "text", text: "hello" }] });
+
+graph.leaf;          // b.id (the current head)
+graph.pathTo(b.id);  // [turnA, turnB] in root→leaf order
+
+// Fork a new line of history from an earlier node:
+graph.branchFrom(a.id);
+const c = graph.append({ role: "user", blocks: [{ kind: "text", text: "again" }] });
+// a now has two children (b and c)
+
+// Re-enter at a chosen tip:
+const context = graph.resume(b.id); // positions head at b and returns its path
+```
+
+Node ids are content hashes (`hashNode`): appending an identical turn with the
+same lineage and timestamp collapses to the same node rather than duplicating it.
+
+## Schema migration on load
+
+`SessionStore` accepts an ordered list of `Migrator`s. Each migrator's `upgrade`
+runs on every raw decoded record at load time, in sequence, so older on-disk
+schemas upgrade forward transparently.
+
+```typescript
+import { SessionStore } from "./store";
+import type { Migrator } from "./contract"; // src/runtime/contract/session.ts
+
+const renameField: Migrator = {
+  id: "2026-06-rename-leaf",
+  upgrade(raw) {
+    // Transform one raw record one schema version forward, then return it.
+    return raw;
+  },
+};
+
+const store = new SessionStore("/var/lib/indusagi/sessions", [renameField]);
+const graph = await store.loadSession("session-42");
+```
+
+A record that does not narrow to a `{ type: "node" | "head" }` shape after
+migration is skipped. A missing session file yields an empty `SessionGraph`.
+
+## Notes and limits
+
+- `indusagi/memory` ships **no** runtime symbols. Do not import values from it.
+- There is **no** semantic search, embeddings, vector store, working-memory
+  processor, or observational memory in this codebase. The only context strategy
+  is heuristic condensation.
+- The token estimate is a coarse character-count heuristic, not provider-exact.
+- `RunLedger`, `SnapshotAccumulator`, `SessionStore`, `SessionGraph`, `hashNode`,
+  and the compactor functions are **internal** to the runtime package: they are
+  consumed by `createAgent` and are not exported under a public `indusagi/*`
+  subpath. Downstream code configures them through `AgentConfig.compaction` and
+  the `deps` (`store`, `ledger`, `invokeModel`) passed to `createAgent`.
+- `RunLedger` delivery is synchronous and isolates throwing subscribers; a
+  handler that throws does not break fan-out to the others.
+
+---
+
+**Module**: `indusagi/memory` (phantom facade) · runtime: `indusagi/runtime`
+**Status**: Context-management machinery is internal to the runtime

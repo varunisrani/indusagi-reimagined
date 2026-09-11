@@ -1,0 +1,359 @@
+# Memory Module - API Reference
+
+> `indusagi/memory` re-exports nothing. The symbols below live in the runtime's
+> internal `memory`, `ledger`, and `store` directories and are reached through
+> `indusagi/runtime`'s `createAgent`, not through a standalone import.
+
+## Table of contents
+
+- [Exports from `indusagi/memory`](#exports-from-indusagimemory)
+- [Context condensation (`src/runtime/memory`)](#context-condensation)
+- [Run event ledger (`src/runtime/ledger`)](#run-event-ledger)
+- [Session store (`src/runtime/store`)](#session-store)
+- [Supporting contract types](#supporting-contract-types)
+
+## Exports from `indusagi/memory`
+
+The module `src/facade/memory.ts` is a phantom facade:
+
+```typescript
+export {};
+```
+
+There are **no** value or named type exports from `indusagi/memory`. Any code
+that imports a symbol from it (for example `import { Memory } from "indusagi/memory"`)
+will fail to resolve. The machinery documented below is internal to the runtime
+package and is not published under its own subpath; the public entrypoint that
+drives it is `createAgent` from `indusagi/runtime`.
+
+## Context condensation
+
+Source: `src/runtime/memory/` — barrel `src/runtime/memory/index.ts`.
+
+### `estimateContextTokens`
+
+```typescript
+function estimateContextTokens(messages: readonly Turn[]): number;
+```
+
+Estimates the token footprint of a history with a cheap heuristic: it sums the
+character length of every block across every turn, divides by an average of 4
+characters per token, and adds a fixed 4-token surcharge per turn for role/message
+framing. No real tokenizer is used. (`src/runtime/memory/estimate.ts`)
+
+Per-block character counts:
+
+| Block kind | Counted characters |
+|------------|--------------------|
+| `text` / `thinking` | `block.text.length` |
+| `tool_call` | `block.name.length` + serialized `block.input` length |
+| `tool_result` | serialized `block.output` length |
+| `image` | `block.dataBase64.length` |
+| anything else | `0` |
+
+### `shouldCompact`
+
+```typescript
+function shouldCompact(
+  messages: readonly Turn[],
+  model: ModelCard,
+  cfg?: CompactionPolicy,
+): boolean;
+```
+
+Returns `true` when `estimateContextTokens(messages)` is at least
+`model.contextWindow * cfg.triggerRatio`. Returns `false` when
+`model.contextWindow <= 0` (a misconfigured card never triggers condensation).
+Falls back to the default policy `{ triggerRatio: 0.8, keepRecent: 8 }` when
+`cfg` is omitted. (`src/runtime/memory/compactor.ts`)
+
+### `findCutPoint`
+
+```typescript
+function findCutPoint(messages: readonly Turn[], keepRecent: number): number;
+```
+
+Returns the index of the first turn that is preserved verbatim. The tail starts
+at `length - keepRecent` (clamped to range), then the boundary is nudged forward
+while the candidate first-preserved turn carries a `tool_result`, so a
+`tool_call`/`tool_result` pair is never split across the cut. `0` means nothing
+is condensed; `length` means everything is.
+
+### `summarize`
+
+```typescript
+function summarize(
+  messages: readonly Turn[],
+  invoke: ModelInvoker,
+): Promise<Turn>;
+```
+
+Distills a stretch of history into one synthetic `user`-role turn. It renders the
+turns into a transcript, invokes `invoke` with a fixed distillation system
+preamble, collects the streamed reply (preferring the terminal `done` emission,
+falling back to concatenated `text` deltas), and returns a turn whose single text
+block is prefixed with the heading `"[condensed earlier context]"`. The summary
+is filed under the `user` role so it remains valid input for the next invocation.
+
+### `compact`
+
+```typescript
+function compact(
+  messages: readonly Turn[],
+  model: ModelCard,
+  cfg: CompactionPolicy | undefined,
+  invoke: ModelInvoker,
+): Promise<readonly Turn[]>;
+```
+
+Resolves the policy (default `{ triggerRatio: 0.8, keepRecent: 8 }`), computes the
+tool-safe cut via `findCutPoint`, and — when there is a prefix worth condensing —
+calls `summarize` on it, returning `[summary, ...tail]`. When the cut point is
+`0`, the original `messages` are returned unchanged, so `compact` is safe to call
+unconditionally. The `model` argument is currently unused by the body
+(`void model`) and reserved.
+
+## Run event ledger
+
+Source: `src/runtime/ledger/` — barrel `src/runtime/ledger/index.ts`.
+
+### `RunLedger`
+
+```typescript
+class RunLedger {
+  subscribe(handler: RunEventHandler): Unsubscribe;
+  publish(event: RunEvent): void;
+  clear(): void;
+  get size(): number;
+}
+```
+
+A synchronous fan-out hub. `subscribe` registers a handler and returns a disposer
+that removes it (idempotent; a duplicate subscription of the same reference is a
+no-op that still returns a working disposer). `publish` delivers an event to every
+currently registered handler in registration order over a snapshot of the set —
+so subscribing/unsubscribing inside a handler is safe and takes effect on the next
+publish. A throwing handler is isolated: its error is swallowed so siblings still
+receive the event. (`src/runtime/ledger/bus.ts`)
+
+```typescript
+type RunEventHandler = (event: RunEvent) => void;
+type Unsubscribe = () => void;
+```
+
+### `SnapshotAccumulator`
+
+```typescript
+class SnapshotAccumulator {
+  observe(event: RunEvent): void;
+  getSnapshot(): RunSnapshot | undefined;
+  get hasSnapshot(): boolean;
+  reset(): void;
+  attach(ledger: RunLedger): () => void;
+}
+```
+
+Tracks only the most recent `RunSnapshot`. `observe` folds one event in: events
+that carry a snapshot (`snapshot`, `settled`, `faulted`) replace the tracked
+snapshot; all other events (`text_delta`, `thinking_delta`, `tool_started`,
+`tool_finished`) are ignored. `attach` subscribes the accumulator to a
+`RunLedger` and returns the ledger's disposer. (`src/runtime/ledger/accumulator.ts`)
+
+## Session store
+
+Source: `src/runtime/store/` — barrel `src/runtime/store/index.ts`.
+
+### `hashNode`
+
+```typescript
+function hashNode(
+  parent: string | null,
+  turn: Turn,
+  createdAt: number,
+): string;
+```
+
+Computes a node's content-address id: a SHA-256 over `JSON.stringify({ parent,
+turn, createdAt })`, rendered as hex and truncated to 32 characters. A `null`
+parent (a root) is encoded distinctly so roots never collide with chained nodes.
+(`src/runtime/store/hash.ts`)
+
+### `SessionGraph`
+
+```typescript
+class SessionGraph {
+  constructor(sessionId: string, clock?: Clock);
+  static hydrate(
+    sessionId: string,
+    nodes: readonly SessionNode[],
+    leaf: string | null,
+    clock?: Clock,
+  ): SessionGraph;
+
+  readonly sessionId: string;
+  get leaf(): string | null;
+  get size(): number;
+
+  get(nodeId: string): SessionNode | undefined;
+  all(): SessionNode[];
+  append(turn: Turn): SessionNode;
+  branchFrom(nodeId: string): SessionNode;
+  pathTo(leaf: string): Turn[];
+  resume(leaf: string): Turn[];
+}
+```
+
+A mutable, branchable in-memory DAG of `SessionNode`s for one session. `append`
+chains a fresh node onto the current head (or advances to an existing node on a
+content-hash collision) and moves the head to it. `branchFrom` points the head at
+an older node so the next `append` forks; it throws on an unknown node. `pathTo`
+walks parent pointers from a leaf back to the root and reverses, yielding the
+linear root→leaf turn context; it throws on a broken lineage. `resume` combines
+`branchFrom` + `pathTo`. (`src/runtime/store/dag.ts`)
+
+```typescript
+type Clock = () => number; // defaults to Date.now; injectable for tests
+```
+
+### `SessionStore`
+
+```typescript
+class SessionStore {
+  constructor(root: string, migrators?: readonly Migrator[]);
+  appendNode(sessionId: string, node: SessionNode): Promise<void>;
+  loadSession(sessionId: string): Promise<SessionGraph>;
+  listSessions(): Promise<string[]>;
+}
+```
+
+A filesystem-backed store of branchable session DAGs. Each session is one
+append-only JSONL file `<root>/<sessionId>.jsonl`; every line is one record —
+either `{ type: "node", node }` or `{ type: "head", leaf }`. `appendNode` writes
+the node record followed by a fresh head record (the last head marker always names
+the live leaf). `loadSession` replays the file, runs each raw record through the
+`migrators` pipeline, collects node records, tracks the last head as the leaf, and
+returns a hydrated `SessionGraph`; a missing file yields an empty graph.
+`listSessions` returns the ids of every `.jsonl` file under `root` (empty when the
+root does not exist). (`src/runtime/store/persist.ts`)
+
+## Supporting contract types
+
+These types are imported by the modules above. They are defined in the runtime
+contract (`src/runtime/contract/`) or the gateway contract (`src/llmgateway/contract/`),
+and the runtime-contract ones are re-exported from `indusagi/runtime`.
+
+### `CompactionPolicy`
+
+From `indusagi/runtime` (`src/runtime/contract/config.ts`).
+
+```typescript
+interface CompactionPolicy {
+  readonly triggerRatio: number; // fraction of the window (0..1) at which condensation triggers
+  readonly keepRecent: number;   // trailing turns kept untouched during condensation
+}
+```
+
+It is also a field on `AgentConfig`:
+
+```typescript
+interface AgentConfig {
+  readonly model: string;
+  readonly system?: string;
+  readonly tools?: ToolBox;
+  readonly maxOutputTokens?: number;
+  readonly thinking?: ThinkingLevel;
+  readonly compaction?: CompactionPolicy; // absent disables condensation
+  readonly maxTurns?: number;             // defaults to 64
+}
+```
+
+### `RunEvent`
+
+From `indusagi/runtime` (`src/runtime/contract/events.ts`). A tagged union:
+
+```typescript
+type RunEvent =
+  | { kind: "snapshot";       snapshot: RunSnapshot }
+  | { kind: "text_delta";     delta: string }
+  | { kind: "thinking_delta"; delta: string }
+  | { kind: "tool_started";   id: string; name: string }
+  | { kind: "tool_finished";  id: string; name: string; outcome: ToolOutcome }
+  | { kind: "settled";        snapshot: RunSnapshot }
+  | { kind: "faulted";        error: RunError; snapshot: RunSnapshot };
+```
+
+### `ModelInvoker`
+
+From `indusagi/runtime` (`src/runtime/contract/events.ts`).
+
+```typescript
+type ModelInvoker = (
+  conversation: Conversation,
+  options: StreamOptions,
+) => Channel;
+```
+
+The injectable seam `summarize` / `compact` call to reach a model. `Conversation`,
+`StreamOptions`, and `Channel` are gateway types imported directly from
+`indusagi/llmgateway` (or `../llmgateway/contract`), not re-exported by the runtime.
+
+### `RunSnapshot` / `PendingTool` / `RunPhase`
+
+From `indusagi/runtime` (`src/runtime/contract/run-state.ts`).
+
+```typescript
+type RunPhase =
+  | "idle" | "invoking" | "streaming"
+  | "dispatching" | "compacting" | "settled" | "faulted";
+
+interface PendingTool {
+  readonly id: string;
+  readonly name: string;
+  readonly stage: "queued" | "running" | "done";
+}
+
+interface RunSnapshot {
+  readonly runId: string;
+  readonly sessionId: string;
+  readonly phase: RunPhase;
+  readonly messages: readonly Turn[];
+  readonly pending: readonly PendingTool[];
+  readonly usageTotal: Usage;
+  readonly model: string;
+  readonly error?: RunError;
+}
+```
+
+### `SessionNode` / `SessionHead` / `Migrator`
+
+Defined in `src/runtime/contract/session.ts`. These are re-exported from the
+runtime *contract* sub-barrel (`src/runtime/contract/index.ts`) but **not** from
+the top-level `indusagi/runtime` barrel, so they are internal-facing today.
+
+```typescript
+interface SessionNode {
+  readonly id: string;            // content hash of turn + lineage
+  readonly parent: string | null; // null for a root
+  readonly turn: Turn;
+  readonly createdAt: number;     // epoch ms
+}
+
+interface SessionHead {
+  readonly sessionId: string;
+  readonly leaf: string;
+}
+
+interface Migrator {
+  readonly id: string;
+  upgrade(raw: unknown): unknown; // one raw stored record forward by one schema version
+}
+```
+
+`Turn`, `Block`, `Usage`, `ModelCard`, and `Conversation` are gateway types
+(`src/llmgateway/contract/`), imported from `indusagi/llmgateway`.
+
+## Environment variables
+
+None. The memory machinery is configured entirely through `AgentConfig`
+(specifically `compaction`) and the `deps` passed to `createAgent`. There are no
+`MEMORY_*` env vars.

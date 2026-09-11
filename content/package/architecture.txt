@@ -1,0 +1,140 @@
+# Architecture
+
+> `indusagi` is organized as a stack of capability layers. The root entry
+> (`src/index.ts`) re-exports each layer as a namespace; every layer is also a
+> standalone subpath export. This page is the canonical map of how those layers fit
+> together.
+
+The framework's public surface is grouped by capability layer. A layer is a
+self-contained subsystem with its own `index.ts` barrel and its own subpath
+export. The root `src/index.ts` re-exports nine of them as namespaces plus a
+`VERSION` string:
+
+```ts
+import {
+  gateway, runtime, capabilities, interop,
+  saas, swarm, smithy, tracing, shell, VERSION,
+} from "indusagi";
+```
+
+`VERSION` is exported as `"0.1.0"` from `src/index.ts` (the npm package version is
+tracked separately in `package.json`).
+
+## Table of Contents
+
+- [The layer table](#the-layer-table)
+- [Data flow: one prompt to settlement](#data-flow-one-prompt-to-settlement)
+- [The facade compatibility layer](#the-facade-compatibility-layer)
+- [The UI stack](#the-ui-stack)
+- [Subsystem pages](#subsystem-pages)
+
+## The layer table
+
+| Layer | Namespace | Subpath | Source dir | Responsibility |
+|-------|-----------|---------|------------|----------------|
+| L1 Foundation | `gateway` | `indusagi/llmgateway` | `src/llmgateway` | Multi-provider LLM dispatch (`stream`/`complete`), the model catalog, the connector registry, and credential/PKCE plumbing |
+| L2 Agent | `runtime` | `indusagi/runtime` | `src/runtime` | The host-facing `createAgent` factory, the pure `cadence` FSM, the session DAG, compaction, and the run-event ledger |
+| L3 Tools | `capabilities` | `indusagi/capabilities` | `src/capabilities` | The eleven built-in tools, the `ToolRegistry` kernel, Node-backed backends, and the `toolBox` assembler |
+| L3 External | `interop` | `indusagi/interop` | `src/interop` | The Model Context Protocol bridge — client endpoints/fleets that graft remote tools, and a provider host that publishes our own |
+| L3 External | `saas` | `indusagi/connectors-saas` | `src/connectors-saas` | The `SaasGateway` façade over a `SaasBackend` port, with the Composio adapter and a fluent `ScopePlanner` |
+| L3 External | `swarm` | `indusagi/swarm` | `src/swarm` | Multi-agent crews — roster, dependency-aware ticket board, cursor mailbox, activity log, and git-worktree isolation |
+| L5 Product | `smithy` | `indusagi/smithy` | `src/smithy` | The IndusForge agent-builder: blueprints, profiles, knowledge pack, and the `Forge` build session |
+| L5 Product | `shell` | `indusagi/shell-app` | `src/shell-app` | The CLI: `main` entry, boot pipeline, flag parser, settings, and the print/wire/repl runners |
+| Cross-cutting | `tracing` | `indusagi/tracing` | `src/tracing` | A homegrown, OTel-free span tracer — `Segment` values, a `Recorder`, sinks, redaction, and a runtime `RunEvent` bridge |
+
+Two namespace names differ from their subpaths: the namespace is `saas` while the
+subpath is `indusagi/connectors-saas`, and the namespace is `shell` while the
+subpath is `indusagi/shell-app`.
+
+## Data flow: one prompt to settlement
+
+A host composes a runnable agent from the foundation and tool layers:
+
+```ts
+import { runtime, capabilities } from "indusagi";
+
+const agent = runtime.createAgent({
+  model: "claude-sonnet-4",
+  tools: capabilities.toolBox("coding"),
+});
+
+const snapshot = await agent.submit("list the TODOs in this repo");
+console.log(snapshot.phase);
+```
+
+`agent.submit(input)` drives one prompt to a terminal phase (`settled` or
+`faulted`) and resolves the final `RunSnapshot`. Under the hood:
+
+1. **Runtime → Gateway.** `createAgent` binds the pure `cadence` reducer to the
+   config and threads `Signal`s through it (see [Runtime](/docs/subsystems/runtime)).
+   The reducer returns `Effect`s; the conductor performs them. An `invoke_model`
+   effect reaches the gateway's `stream(config.model, conversation, options)` by
+   default — the model entrypoint is injectable as `AgentDeps.invokeModel` so tests
+   can script it without the network.
+2. **Gateway dispatch.** `stream` resolves the `ModelCard` from the catalog, picks
+   the `Connector` for the card's `api` dialect via `connectorForApi`, and returns a
+   streaming `Channel` of `Emission`s (see [LLM Gateway](/docs/subsystems/llm-gateway)).
+3. **Tool calls.** When the model requests tools, the conductor batches the calls
+   and runs them through a scheduler over `config.tools?.runner`. The
+   `capabilities.toolBox(...)` assembler produces that `ToolBox`, backed by the real
+   Node filesystem and shell (see [Capabilities](/docs/subsystems/capabilities)).
+4. **Compaction.** Before each invocation, the conductor checks accumulated history
+   against the model's context window and condenses the older prefix when it crosses
+   the configured `triggerRatio`, preserving the most recent `keepRecent` turns.
+5. **Events.** Each transition publishes `RunEvent`s to a `RunLedger`; `agent.subscribe`
+   taps that live stream. A turn-budget guard force-faults a run that exceeds
+   `AgentConfig.maxTurns` (default 64).
+
+External tools graft into the same `ToolBox` surface: the [interop](/docs/subsystems/interop-mcp)
+bridge mounts remote MCP tools, and the [SaaS](/docs/subsystems/connectors-saas)
+gateway hydrates Composio toolkits into a registry. [Swarm](/docs/subsystems/swarm)
+runs several such agents as a crew, and [Smithy](/docs/subsystems/smithy) generates
+new agent blueprints that instantiate through `createAgent`. [Tracing](/docs/subsystems/tracing)
+projects a `RunEvent` stream onto nested spans without the runtime knowing about it.
+
+## The facade compatibility layer
+
+Beside the capability layers, `src/facade/` exposes a set of thin compatibility
+subpaths the coding agent consumes under friendlier names. Each re-exports a larger
+internal module:
+
+| Subpath | Source | Re-exports |
+|---------|--------|-----------|
+| `indusagi/ai` | `src/facade/ai.ts` → `src/facade/ml/index.ts` | The model layer: provider adapters, the api/env-key registries, the generated catalog, `stream`, and `kit` helpers |
+| `indusagi/agent` | `src/facade/agent.ts` → `src/facade/bot/index.ts` | The bot loop: `agent`, `agent-loop`, `proxy`, `messages`, `session-manager`, and the `actions` registry |
+| `indusagi/mcp` | `src/facade/mcp.ts` → `src/facade/mcp-core/index.ts` | The MCP client/server stack: client pool, server, schema converters, config, and errors |
+| `indusagi/memory` | `src/facade/memory.ts` | A phantom facade — the file is `export {}`; consumers import a JSDoc-only type |
+
+The `indusagi/interop` layer and the `indusagi/mcp` facade both speak MCP but are
+distinct: `interop` is the clean-room protocol bridge (`src/interop`), while `mcp`
+re-exports the `src/facade/mcp-core` stack. See
+[Package Exports](/docs/package-exports) for the full mapping.
+
+## The UI stack
+
+The non-UI layers above are toolkit-free. The terminal UI is a separate, optional
+stack the shell app plugs into the `InteractiveView` seam:
+
+| Subpath | Source | Role |
+|---------|--------|------|
+| `indusagi/tui` | `src/ui` | TUI primitives: keys/keybindings, autocomplete, fuzzy match, width helpers, theme types |
+| `indusagi/react-ink` | `src/react-ink` | Ink components — message rows, dialogs, markdown and diff renderers (see [React-Ink](/docs/subsystems/react-ink)) |
+| `indusagi/react-host` | `src/react-host` | The host-React loader (`loadHostReact()`) plus `ink` and `jsx-runtime` bindings |
+
+The `src/ui-bridge` module wires the runtime into Ink: `InteractiveApp` is the root
+component and `mountInteractive(agent, opts)` renders it with `render` from
+`indusagi/react-host/ink`, resolving once the user leaves. This is the richer view
+that satisfies the shell app's `InteractiveView` seam.
+
+## Subsystem pages
+
+- [LLM Gateway](/docs/subsystems/llm-gateway) — `src/llmgateway`
+- [Runtime](/docs/subsystems/runtime) — `src/runtime`
+- [Capabilities](/docs/subsystems/capabilities) — `src/capabilities`
+- [Interop / MCP](/docs/subsystems/interop-mcp) — `src/interop`
+- [SaaS Connectors](/docs/subsystems/connectors-saas) — `src/connectors-saas`
+- [Swarm](/docs/subsystems/swarm) — `src/swarm`
+- [Smithy](/docs/subsystems/smithy) — `src/smithy`
+- [Tracing](/docs/subsystems/tracing) — `src/tracing`
+- [Shell App](/docs/subsystems/shell-app) — `src/shell-app`
+- [React-Ink](/docs/subsystems/react-ink) — `src/react-ink`

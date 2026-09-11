@@ -1,0 +1,503 @@
+# Testing
+
+> The Rust `induscode` agent is tested by **inline `#[cfg(test)]` modules** that
+> live next to the code, a **`publish = false` `induscode-testkit` harness** that
+> carries the agent-layer fakes, and **15 `insta` snapshot baselines** that pin the
+> ratatui TUI cell-for-cell against a `TestBackend`. Every test is network-free —
+> a scripted `ModelInvoker`, a localhost `wiremock` transcript server, and
+> `tempfile` sandboxes stand in for the model, the wire, and the home directory.
+> Run them with `cargo test -p induscode` (or `cargo nextest run`).
+
+## Table of Contents
+
+- [Test philosophy](#test-philosophy)
+- [Running the suite](#running-the-suite)
+- [The induscode-testkit harness](#the-induscode-testkit-harness)
+- [Vendored framework seams](#vendored-framework-seams)
+- [Agent-layer fakes](#agent-layer-fakes)
+- [Snapshot tests for the TUI](#snapshot-tests-for-the-tui)
+- [Unit and integration layout](#unit-and-integration-layout)
+- [Hermetic discipline](#hermetic-discipline)
+- [The behavior-trace parity unit](#the-behavior-trace-parity-unit)
+- [Green test count](#green-test-count)
+- [Relationship to the framework suite](#relationship-to-the-framework-suite)
+
+## Test philosophy
+
+Tests live **inside the crate** in `#[cfg(test)] mod tests` blocks at the bottom
+of each source file — the idiomatic Rust placement, not a parallel `tests/` tree.
+There is no `conftest.py` analogue and no shared-fixtures module compiled into the
+product: each test module declares the doubles it needs, and the cross-cutting
+doubles come from the dev-only [`induscode-testkit`](#the-induscode-testkit-harness)
+crate, which is wired in as a path `[dev-dependencies]` entry.
+
+The suite is built on three rules that make it deterministic and CI-portable
+across all three operating systems:
+
+| Rule | How it is enforced |
+|------|--------------------|
+| No network | A scripted `ModelInvoker` ([`ScriptedModel`](#vendored-framework-seams)) replays recorded emission turns; the 11 wire connectors replay recorded SSE/NDJSON bodies through a localhost [`TranscriptServer`](#vendored-framework-seams) (`wiremock`), never a real provider. |
+| No real home | Real-fs tests run under a [`TempWorkspace`](#agent-layer-fakes) (`tempfile::TempDir`, removed on drop) — never `~/.indusagi/`. |
+| No PTY | TUI tests draw into a ratatui `TestBackend` in-memory `Buffer` and assert against the cell grid — there is no terminal device, so the [snapshot suite](#snapshot-tests-for-the-tui) runs headless in CI. |
+
+The product crate is `induscode` (the merged crate at `crates/induscode`), and its
+two `[[bin]]` targets are `indusr` and `indusagir` — see
+[induscode (Rust) Overview](/rust-cli) for the binary surface.
+
+## Running the suite
+
+```bash
+cd indus-code-rust
+
+# the whole agent suite — inline #[cfg(test)] modules + snapshot baselines
+cargo test -p induscode
+
+# faster, parallel, with a nicer summary
+cargo nextest run -p induscode
+
+# the testkit's own self-tests (the fakes and the fixture loader)
+cargo test -p induscode-testkit
+```
+
+`default-members = ["crates/induscode"]` in the virtual workspace manifest means a
+bare `cargo test` targets the product crate. The workspace has exactly three
+members — `crates/induscode`, `crates/induscode-testkit`, and `xtask`.
+
+Run one module or one test by path filter:
+
+```bash
+# every test in the conductor subsystem module
+cargo test -p induscode conductor::
+
+# one snapshot test
+cargo test -p induscode draw_models_snapshot
+```
+
+### Reviewing snapshot diffs
+
+The TUI snapshots use [`insta`](https://insta.rs). When a render changes, `insta`
+fails the test and writes a `.snap.new` next to the baseline. Review and accept:
+
+```bash
+cargo install cargo-insta     # one-time
+
+cargo insta test -p induscode # run + collect pending snapshots
+cargo insta review            # interactive accept/reject of diffs
+cargo insta accept            # accept all pending (non-interactive)
+```
+
+## The induscode-testkit harness
+
+`induscode-testkit` (`crates/induscode-testkit`) is the dev-only test scaffold:
+
+```toml
+# crates/induscode-testkit/Cargo.toml
+[package]
+name    = "induscode-testkit"
+publish = false   # dev-only support crate; never published
+
+[dependencies]
+induscode = { path = "../induscode" }
+indusagi  = { workspace = true }
+ratatui   = { workspace = true }
+wiremock  = "0.6"
+tempfile  = "3"
+```
+
+It does two things, declared in `src/lib.rs`:
+
+1. **Vendors the framework's test seams** — the scripted `ModelInvoker`, the
+   ratatui `TestBackend` render harness, and the `wiremock` transcript server —
+   built directly on the **published** `indusagi` umbrella crate.
+2. **Declares the agent-layer fakes** the framework testkit does not carry —
+   `FakeAgent`, `CaptureView`, `BehaviorTrace`, the agent-local golden loader, and
+   `TempWorkspace`.
+
+The public surface is the flat re-export from `lib.rs`:
+
+```rust
+// crates/induscode-testkit/src/lib.rs
+pub use render::{buffer_to_string, render_frame, render_lines};
+pub use script::ScriptedModel;
+pub use wire::TranscriptServer;
+
+pub use capture_view::CaptureView;
+pub use fake_agent::FakeAgent;
+pub use trace::BehaviorTrace;
+pub use workspace::TempWorkspace;
+```
+
+| Module | Type / fn exported | Role |
+|--------|--------------------|------|
+| `render` | `render_frame`, `render_lines`, `buffer_to_string`, `TestBackend` | The ratatui in-memory render harness for snapshot tests. |
+| `script` | `ScriptedModel` | A `ModelInvoker` that replays recorded turns and panics past the script. |
+| `wire` | `TranscriptServer` | A localhost `wiremock` server that serves recorded provider bodies. |
+| `fake_agent` | `FakeAgent`, `RecordedTurn` | A network-free `Agent`-trait fake that records prompts and appends `ack:{prompt}`. |
+| `capture_view` | `CaptureView`, `EndOfInput` | A headless `InteractiveView` capture seam for boot/runner tests with no TTY. |
+| `trace` | `BehaviorTrace`, `ToolCall` | The normalized parity-trace unit compared across the TS and Rust agents. |
+| `fixture` | `fixtures_dir`, `fixture_path`, `load_text`, `load_json` | The agent-local golden-corpus loader. |
+| `workspace` | `TempWorkspace` | A `tempfile`-backed throwaway workspace, cleaned up on drop. |
+
+### Why the seams are vendored, not re-imported
+
+The framework ships its own `indusagi-testkit` path crate, but that crate depends
+on the **path** `indusagi`, which would put a second, type-incompatible copy of
+`indusagi` in the graph alongside the crates.io `indusagi 0.1.0` the agent builds
+against. So `induscode-testkit` **vendors** `ScriptedModel`, the `render_*`
+helpers, and `TranscriptServer` verbatim into `src/{script,render,wire}.rs`, built
+on the published `indusagi` public contract types — keeping the whole agent
+workspace resolving a single `indusagi` crate (enforced by `cargo deny check
+bans`). See the framework's [testing strategy](/rust/reference/testing) for the
+upstream originals.
+
+## Vendored framework seams
+
+### ScriptedModel — the scripted ModelInvoker
+
+`ScriptedModel` (`src/script.rs`) is the Rust port of the TS `scriptModel` +
+`channelOf(emissions)`. It implements the framework's
+`indusagi::runtime::contract::ModelInvoker` trait, replaying one recorded turn per
+`invoke` call and **panicking past the script** so a runaway drive loop surfaces
+as a failed assertion rather than a wedged suite:
+
+```rust
+// crates/induscode-testkit/src/script.rs
+pub struct ScriptedModel {
+    turns: Vec<Arc<Vec<Emission>>>,
+    cursor: AtomicUsize,
+}
+
+impl ScriptedModel {
+    pub fn new(turns: Vec<Vec<Emission>>) -> Self { /* … */ }
+    pub fn single(turn: Vec<Emission>) -> Self { Self::new(vec![turn]) }
+    pub fn calls(&self) -> usize { /* turn count issued so far */ }
+}
+
+impl ModelInvoker for ScriptedModel {
+    fn invoke(&self, _conversation: Conversation, _options: StreamOptions) -> Channel {
+        // returns a re-iterable Channel::of(..) for turns[cursor]; panics past the end
+    }
+}
+```
+
+The returned `Channel` is **re-iterable** (iterating it twice replays the same turn
+without advancing the cursor), mirroring the production gateway stream contract.
+`model.calls()` is asserted to pin the exact number of drive-loop turns. The
+self-tests cover ordered replay, re-iterability, and the
+`#[should_panic(expected = "only 1 turn(s) recorded")]` runaway guard.
+
+### TranscriptServer — the wiremock transcript replay
+
+`TranscriptServer` (`src/wire.rs`) wraps a `wiremock::MockServer` so connector
+tests replay a recorded provider body through the **real** framer + decoder + fold
+rather than mocking the connector:
+
+```rust
+// crates/induscode-testkit/src/wire.rs
+pub const SSE_CONTENT_TYPE: &str = "text/event-stream";
+pub const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
+
+impl TranscriptServer {
+    pub async fn start() -> Self { /* ephemeral localhost port */ }
+    pub fn uri(&self) -> String { /* http://127.0.0.1:<port> */ }
+    pub async fn serve_sse(&self, method: &str, path: &str, body: impl Into<String>);
+    pub async fn serve_ndjson(&self, method: &str, path: &str, body: impl Into<String>);
+    pub async fn serve_status(&self, method: &str, path: &str, status: u16);
+}
+```
+
+`serve_status` drives the HTTP-status → `GatewayError`-kind table tests. The
+self-tests use a dependency-free `TcpStream` GET (no HTTP client of their own) to
+prove the SSE content-type and status codes round-trip.
+
+### The render harness
+
+`render.rs` is the ratatui snapshot engine. Three functions cover the two render
+shapes view code takes:
+
+```rust
+// crates/induscode-testkit/src/render.rs
+pub fn render_frame<F>(w: u16, h: u16, draw: F) -> String
+where F: FnOnce(&mut ratatui::Frame);
+
+pub fn render_lines(w: u16, lines: &[ratatui::text::Line<'_>]) -> String;
+
+pub fn buffer_to_string(buffer: &Buffer) -> String;
+```
+
+`render_frame` draws into a fixed `w`×`h` `TestBackend` and stringifies the buffer;
+`render_lines` lays a `Vec<Line>` (the shape view functions like the diff renderer
+return) one-per-row; `buffer_to_string` flattens a `Buffer` into snapshot text —
+**glyph layout only, style dropped**. Color/modifier are asserted separately by the
+unit tests that read `buf[(x, y)].bg` etc. The doc-comment intent: the snapshot
+pins the flicker / wrapping / clamping contract, not the palette.
+
+## Agent-layer fakes
+
+### FakeAgent — the Agent-trait fake
+
+`FakeAgent` (`src/fake_agent.rs`) is the Rust port of the TS `fakeAgent()` from
+`conductor.test.ts` / `submit.test.ts` / `session-persist.test.ts`. It records
+each prompt and appends a `RecordedTurn { prompt, ack: "ack:{prompt}" }`, and
+counts aborts so boot/console tests assert a **count** rather than callback-spy:
+
+```rust
+// crates/induscode-testkit/src/fake_agent.rs
+pub struct RecordedTurn { pub prompt: String, pub ack: String }
+
+impl FakeAgent {
+    pub fn record_prompt(&self, input: &str);  // appends ack:{input}
+    pub fn record_abort(&self);
+    pub fn prompts(&self) -> Vec<String>;
+    pub fn turns(&self) -> Vec<RecordedTurn>;
+    pub fn abort_count(&self) -> usize;
+}
+```
+
+### CaptureView — the headless InteractiveView
+
+`CaptureView` (`src/capture_view.rs`) is the headless `InteractiveView` capture
+seam: `render` pushes events into a `Vec`, `prompt` pops the next scripted input
+line and returns `EndOfInput` once the queue drains (the EOF-not-sentinel
+discipline). Boot/runner tests then assert "this invocation drove the view with
+these events and asked for input N times":
+
+```rust
+// crates/induscode-testkit/src/capture_view.rs
+pub struct EndOfInput;
+
+impl CaptureView {
+    pub fn with_inputs<I, S>(inputs: I) -> Self where I: IntoIterator<Item = S>, S: Into<String>;
+    pub fn next_input(&self) -> Result<String, EndOfInput>;
+    pub fn rendered(&self) -> Vec<String>;
+    pub fn prompt_count(&self) -> usize;
+    pub fn is_closed(&self) -> bool;
+}
+```
+
+### TempWorkspace — the temp-dir sandbox
+
+`TempWorkspace` (`src/workspace.rs`) is the `tempfile::TempDir`-backed throwaway
+directory the deck (`checkpoint`, `read-edit-gate`), session-persist, settings, and
+`@file`-attachment suites seed files into. Each test gets its own, removed on drop,
+so runs are isolated and parallel-safe:
+
+```rust
+// crates/induscode-testkit/src/workspace.rs
+impl TempWorkspace {
+    pub fn new() -> Self;
+    pub fn root(&self) -> &Path;
+    pub fn path(&self, rel: impl AsRef<Path>) -> PathBuf;
+    pub fn write_file(&self, rel: impl AsRef<Path>, contents: impl AsRef<[u8]>) -> PathBuf;
+    pub fn read_file(&self, rel: impl AsRef<Path>) -> String;
+}
+```
+
+### The agent-local golden loader
+
+`fixture.rs` resolves `tests/fixtures/` under **this** workspace root (the agent
+goldens — `export_html.json`, `sgr_corpus.json`, `system_prompt.json`,
+`wire_ndjson.json`, `slash_catalog.json`, … — dumped from the TS agent, never
+hand-edited). It is anchored to `CARGO_MANIFEST_DIR` walked up two levels, so it
+resolves identically no matter which test invoked it. The framework's own loader
+resolves under the *framework* root and cannot reach the agent corpus, so this thin
+mirror exists:
+
+```rust
+// crates/induscode-testkit/src/fixture.rs
+pub fn fixtures_dir() -> PathBuf;          // <agent-workspace>/tests/fixtures
+pub fn fixture_path(name: &str) -> PathBuf;
+pub fn load_text(name: &str) -> String;    // panics loudly on a missing fixture
+pub fn load_json<T: DeserializeOwned>(name: &str) -> T;
+```
+
+## Snapshot tests for the TUI
+
+The console renderer is pinned by **15 `insta` snapshot baselines** under
+`src/console/**/snapshots/`. Each snapshot test draws a component into a fixed-size
+`TestBackend`, flattens the buffer to a string, and calls `insta::assert_snapshot!`.
+`insta` is a `[dev-dependencies]` of `induscode` alongside `induscode-testkit`,
+`proptest`, `tempfile`, `assert_cmd`, `predicates`, and `ratatui`.
+
+A representative test — the model picker overlay:
+
+```rust
+// crates/induscode/src/console/overlays/models.rs
+#[test]
+fn draw_models_snapshot() {
+    let theme = theme();
+    let mut terminal = Terminal::new(TestBackend::new(64, 20)).expect("terminal");
+    terminal
+        .draw(|f| draw_models(f, f.area(), &theme, sample(), 0))
+        .expect("draw");
+    let buf = terminal.backend().buffer().clone();
+    let mut out = String::new();
+    for y in 0..20u16 {
+        for x in 0..64u16 {
+            out.push_str(buf[(x, y)].symbol());
+        }
+        out.push('\n');
+    }
+    insta::assert_snapshot!(out);
+}
+```
+
+A `.snap` baseline is a YAML header (`source:` + `expression:`) followed by the
+literal rendered cells. For example the approval-dialog baseline
+(`induscode__console__overlays__approval__tests__render_snapshot.snap`) records the
+full bordered box:
+
+```
+---
+source: crates/induscode-console/src/overlays/approval.rs
+expression: "render_to_string(&dialog(), 70, 16)"
+---
+╭────────────────────────────────────────────────────────────────────╮
+│ Permission                                                         │
+│ Allow Bash to run?                                                 │
+│ npm run test                                                       │
+│ Allow-always remembers: Bash(npm run test:*)                       │
+│ > Allow once  —  run this one call                                 │
+│   Allow always  —  run it and remember the tool for this session   │
+│   Deny  —  block this call                                         │
+│ Up/Down to move, Enter selects, Esc denies                         │
+╰────────────────────────────────────────────────────────────────────╯
+```
+
+The 15 baselines, by area:
+
+| Snapshot file (stem) | Area | What it pins |
+|----------------------|------|--------------|
+| `overlays__approval__tests__render_snapshot` | [Dialogs](/rust-cli/console/dialogs) | The permission approval dialog box. |
+| `overlays__models__tests__draw_models_snapshot` | Dialogs | The model picker list. |
+| `overlays__scoped_models__tests__draw_scoped_models_snapshot` | Dialogs | The per-scope model routing editor. |
+| `overlays__oauth__tests__draw_oauth_snapshot` | Dialogs | The OAuth device-flow prompt. |
+| `overlays__signin__tests__draw_signin_snapshot` | Dialogs | The provider sign-in overlay. |
+| `overlays__signout__tests__draw_signout_snapshot` | Dialogs | The sign-out overlay. |
+| `overlays__sessions__tests__draw_sessions_snapshot` | Dialogs | The session resume picker. |
+| `overlays__settings__tests__draw_settings_snapshot` | Dialogs | The settings overlay. |
+| `overlays__theme__tests__draw_theme_snapshot` | Dialogs | The theme picker. |
+| `overlays__tree__tests__draw_tree_snapshot` | Dialogs | The transcript-tree navigator. |
+| `overlays__user_turns__tests__draw_user_turns_snapshot` | Dialogs | The user-turns history view. |
+| `overlays__plugin__tests__render_snapshot` | Dialogs | The plugin/MCP overlay. |
+| `console__slash__tests__catalog_listing_snapshot` | [Slash commands](/rust-cli/console/slash-commands) | The full slash catalog listing (static + dynamic splice + collision guard). |
+| `view__chrome__tests__footer_stats_threshold_snapshot` | [Console](/rust-cli/console/overview) | The footer stats line at the visibility threshold. |
+| `view__chrome__tests__live_theme_switch_snapshot` | [Theming](/rust-cli/console/theming) | The same chrome rendered under `midnight` then `daylight`. |
+
+Snapshot tests assert **glyph layout**; cell-level style (the live theme switch, gutter
+highlight) is checked by sibling assertion tests that read `buf[(x, y)]` directly —
+e.g. `approval.rs::render_shows_header_args_suggestion_and_choices` asserts the
+`> Allow once` selection gutter on the highlighted row.
+
+## Unit and integration layout
+
+There is no parallel `tests/` integration tree in the product crate — every test
+is an inline `#[cfg(test)] mod tests` block, so unit and integration tests sit in
+the file that owns the code. The module tree under `crates/induscode/src/` mirrors
+the subsystem layout (see [Architecture](/rust-cli/architecture)). Inline test
+attributes (`#[test]` / `#[tokio::test]` / `#[should_panic]`) break down roughly:
+
+| Module path | Tests (≈) | Covers |
+|-------------|----------:|--------|
+| `console/` | 355 | Reducer, input/intents/chords, theme, banner + chrome, the overlay router, the slash handler — plus the 15 snapshot tests. See [Console overview](/rust-cli/console/overview). |
+| `conductor/` | 237 | Catalog gate, model matcher, transcript-tree append/branch/fork, NDJSON serialize round-trip, submit/resume, queue + fork, contract + signal hub. See [Conductor](/rust-cli/subsystems/conductor). |
+| `launch/` | 111 | The flag table, invocation parser, usage renderer, package command. See [Launch](/rust-cli/subsystems/launch). |
+| `deck/` | 98 | Card catalog, builtin cards, provisioning, the contract + bridge ledger. See [Capability Deck](/rust-cli/subsystems/capability-deck). |
+| `briefing/` | 83 | System-prompt composition. See [Briefing](/rust-cli/subsystems/briefing). |
+| `boot/` | 82 | Tokenize → mode mapping, workspace resolution, `run_stages`, runner selection. See [Boot](/rust-cli/subsystems/boot). |
+| `core/` | 71 | Brand identity, guardrails, workspace layout, `sessions`, `settings`, the kit helpers. See [Settings](/rust-cli/configuration/settings) / [Sessions](/rust-cli/subsystems/sessions). |
+| `addons/` | 71 | The addon host pipeline. See [Addons](/rust-cli/subsystems/addons). |
+| `insight/` | 51 | The tracing wrapper over the framework. See [Insight](/rust-cli/subsystems/insight). |
+| `window_budget/` | 48 | Context-window budgeting + condense scope. See [Window Budget](/rust-cli/subsystems/window-budget). |
+| `transcript_export/` | 36 | Markdown/HTML transcript export. See [Transcript Export](/rust-cli/subsystems/transcript-export). |
+| `channels/` | 30 | The non-interactive print/JSON channels. See [Channels](/rust-cli/subsystems/channels). |
+| `runtime_bridge/` | 27 | External-runtime provider routing. See [Runtime Bridge](/rust-cli/subsystems/runtime-bridge). |
+
+The three layers of fidelity:
+
+1. **Pure-data unit tests** over dependency-free reducers, folds, and matchers
+   (e.g. the console reducer, the conductor model matcher, the diff renderer).
+2. **Seam / protocol tests** over injected doubles — `ScriptedModel` for the
+   model, `FakeAgent` for the `Agent` trait, `TranscriptServer` for the wire,
+   `CaptureView` for the interactive view, `TempWorkspace` for real-fs tools.
+3. **Snapshot tests** drawing real components into a `TestBackend`.
+
+## Hermetic discipline
+
+The whole suite is sealed against the outside world:
+
+- **No model call.** `ScriptedModel` replays recorded `Vec<Emission>` turns; its
+  `calls()` cursor doubles as a runaway-loop guard that panics past the script.
+- **No real provider.** The 11 wire connectors replay recorded SSE/NDJSON bodies
+  through the real framer/decoder over a localhost `TranscriptServer`. The
+  HTTP-status → error-kind table is driven by `serve_status`.
+- **No real home.** Real-fs tests run under `TempWorkspace`; the goldens load from
+  the agent-local `tests/fixtures/` via the `fixture` loader.
+- **No PTY.** TUI tests draw into a ratatui `TestBackend` and assert against the
+  in-memory `Buffer` — the snapshot suite runs in CI on all three OSes with no
+  terminal device.
+
+## The behavior-trace parity unit
+
+`BehaviorTrace` (`src/trace.rs`) is the comparison unit for the behavioral-parity
+harness, which runs the real TS agent and the Rust agent on the same scripted
+scenario and asserts the observable behavior is identical. It is a normalized,
+order-preserving record of *what the agent decided* — not *how it painted* (that is
+covered by snapshots and goldens):
+
+```rust
+// crates/induscode-testkit/src/trace.rs
+pub struct ToolCall { pub name: String, pub args: String, pub is_error: bool }
+
+pub struct BehaviorTrace {
+    pub tool_calls: Vec<ToolCall>,
+    pub final_text: String,
+    pub settle_phase: String,
+    pub session_node_count: usize,
+}
+
+impl BehaviorTrace {
+    pub fn normalize(self) -> Self;   // strips timestamps/ULIDs/abs temp paths → placeholders
+}
+```
+
+It derives `PartialEq + Eq + Serialize + Deserialize`, so a parity scenario
+reduces to `assert_eq!(rust_trace.normalize(), ts_trace.normalize())` and round-trips
+through JSON. For the milestone-by-milestone parity ledger this encodes, see the
+crate's `PARITY_REPORT.md` and the [TS](/cli) / [Python](/python-cli) editions.
+
+## Green test count
+
+The inline test attributes discoverable in source total **1,344**:
+**~1,324** `#[test]` / `#[tokio::test]` / `#[should_panic]` attributes in the
+`induscode` product crate (including the 15 TUI snapshot tests) plus **20**
+self-tests in `induscode-testkit`. The framework underneath (`indusagi-rust`)
+carries its own separately-counted suite — see
+[the framework testing page](/rust/reference/testing). All milestones (M0 →
+M-final) are declared GREEN with zero failures, flake-free across repeated runs,
+and `clippy -D warnings` clean.
+
+```bash
+# reproduce the inline-test attribute count yourself
+grep -rE '^\s*#\[(tokio::)?test' crates/induscode/src     | wc -l   # ≈ 1324
+grep -rE '^\s*#\[(tokio::)?test' crates/induscode-testkit/src | wc -l   # 20
+```
+
+## Relationship to the framework suite
+
+The agent suite imports both from the crate under test and from the published
+`indusagi` framework it builds on. `ScriptedModel` implements the framework's
+`indusagi::runtime::contract::ModelInvoker`; the chrome snapshot tests use
+`indusagi::tui_render::bridge::AgentMessage`,
+`indusagi::tui_render::theme_adapter::create_theme_adapter`, and
+`indusagi::tui_render::types::{SessionStats, StatsTokens, StatusKind}`. That makes
+the suite an integration boundary: a framework change can move these tests even
+with no `induscode` change. The framework has its own
+[test suite](/rust/reference/testing); this one sits on top of it, resolving a
+single published `indusagi` crate (the reason the framework testkit seams are
+[vendored rather than re-imported](#why-the-seams-are-vendored-not-re-imported)).
+
+See also: [Architecture](/rust-cli/architecture) for the module map,
+[Console overview](/rust-cli/console/overview) for the rendered surface the
+snapshots pin, and [Conductor](/rust-cli/subsystems/conductor) for the drive loop
+`ScriptedModel` and `FakeAgent` exercise.

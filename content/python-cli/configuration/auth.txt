@@ -1,0 +1,281 @@
+# Authentication
+
+> How `induscode` resolves a provider key — environment variables for the quick path, and the `pindus signin` / `pindus signout` commands for stored credentials (api-key entry or browser sign-in / OAuth). The command lives in `induscode.launch.credentials`; the OAuth adapter in `induscode.launch.oauth`; the disk vault in `induscode.boot.auth_vault` writing to `~/.pindusagi/auth.json`.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [The fastest path: environment variables](#the-fastest-path-environment-variables)
+- [pindus signin](#pindus-signin)
+- [pindus signin --list](#pindus-signin---list)
+- [pindus signout](#pindus-signout)
+- [Provider directory](#provider-directory)
+- [Browser sign-in (OAuth)](#browser-sign-in-oauth)
+- [Where credentials live](#where-credentials-live)
+- [Typed faults](#typed-faults)
+- [Programmatic surface](#programmatic-surface)
+- [Notes](#notes)
+
+## Overview
+
+A run needs exactly one thing from this subsystem: a usable api-key string for
+the provider that backs the model you are running. There are three ways to
+supply it, in increasing order of persistence:
+
+1. **Environment variable** — export `ANTHROPIC_API_KEY` (or the provider's
+   own key) and you are done; nothing is stored on disk.
+2. **`pindus signin` with an api key** — paste a key once; it is validated and
+   written to the vault under a named account.
+3. **`pindus signin` with browser sign-in (OAuth)** — for the providers that
+   support it, complete a PKCE consent flow (or, for GitHub Copilot, a device
+   grant) and store the resulting tokens; the vault refreshes an expired token
+   on read.
+
+The `signin` / `signout` (and the `login` / `logout` aliases) commands own the
+first positional token: [boot](/python-cli/subsystems/boot) dispatches to
+`run_credential_command` before any flag parsing, and the command returns
+`handled=False` only when the leading token is not a credential verb, so a
+normal prompt falls straight through. See
+[Launch](/python-cli/subsystems/launch) for the dispatch order and
+[Settings](/python-cli/configuration/settings) for where the profile directory
+is resolved.
+
+## The fastest path: environment variables
+
+Every provider in the directory has a conventional environment variable. Set
+it and the provider is authenticated for the process — no `signin` required:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."
+pindus -p "explain this repo"
+```
+
+The env var is read through the framework's `indusagi.ai.get_env_api_key`. The
+api-key `signin` flow consults the same source *first*: if your key is already
+exported it offers to store that value rather than asking you to re-type it.
+
+| Provider | Environment variable |
+|----------|----------------------|
+| `anthropic` | `ANTHROPIC_API_KEY` |
+| `openai` | `OPENAI_API_KEY` |
+| `google` | `GEMINI_API_KEY` |
+| `xai` | `XAI_API_KEY` |
+| `groq` | `GROQ_API_KEY` |
+| `cerebras` | `CEREBRAS_API_KEY` |
+| `mistral` | `MISTRAL_API_KEY` |
+| `openrouter` | `OPENROUTER_API_KEY` |
+| `minimax` | `MINIMAX_API_KEY` |
+| `kimi` | `MOONSHOT_API_KEY` |
+| `sarvam` | `SARVAM_API_KEY` |
+| `krutrim` | `KRUTRIM_API_KEY` |
+| `nvidia` | `NVIDIA_API_KEY` |
+| `zai` | `ZAI_API_KEY` |
+
+## pindus signin
+
+`signin` resolves a provider, then either runs a browser sign-in or stores an
+api key. Naming a provider is optional — omit `--provider` and the command
+prints the merged sign-in directory and asks you to pick by number.
+
+```bash
+pindus signin                                   # interactive: pick from the menu
+pindus signin --provider anthropic              # browser sign-in preferred when capable
+pindus signin --provider openai --method api-key
+pindus signin --provider anthropic --account work   # name the stored account
+pindus login anthropic                          # `login` is an alias for `signin`
+```
+
+When a provider supports browser sign-in and you do not request a method, the
+browser path is preferred. Pass `--method` (or its shorthands) to force one:
+
+| Flag | Effect |
+|------|--------|
+| `--provider <id>` | Provider to sign in to (also accepted as a bare positional) |
+| `--account <name>` | Account label to store under (default: `default`) |
+| `--method oauth` / `--oauth` | Force browser sign-in |
+| `--method api-key` / `--api-key` | Force api-key entry |
+| `--list` / `--ls` | List stored accounts read-only (see below) |
+
+The first account stored for a provider becomes its default. Storing a key
+under a name that already exists is a `name-collision` fault — pick a different
+`--account` or `signout` first. Keys are validated before they are written:
+they must be non-empty, at least 20 characters, and free of placeholder markers
+(`your-api-key`, `xxxx`, `<...>`, etc.). Account names must be at most 50
+characters of letters, digits, dashes, and underscores.
+
+## pindus signin --list
+
+`--list` is a read-only switch on `signin`: it walks the merged sign-in
+directory, queries the vault for each provider, and prints one line per stored
+account — tagging the provider default and whether the credential is a
+`[browser]` (OAuth) or `[api key]` record. It writes nothing.
+
+```bash
+pindus signin --list
+```
+
+```
+Saved accounts:
+  Anthropic (Claude) (anthropic):
+    - default (default) [browser]
+  OpenAI (openai):
+    - work [api key]
+```
+
+When no provider holds a saved account it prints a single `(none)` line.
+
+## pindus signout
+
+`signout` (alias `logout`) removes stored credentials. Name an `--account` to
+remove one, or omit it to remove every account for the provider:
+
+```bash
+pindus signout --provider anthropic --account work   # remove one account
+pindus signout --provider anthropic                  # remove all anthropic credentials
+pindus logout openai                                 # `logout` is an alias
+```
+
+Removing a provider/account that holds nothing is a `not-found` fault.
+
+## Provider directory
+
+`PROVIDER_DIRECTORY` is the 14-provider api-key directory — every provider the
+sign-in surface can store a key for. Each entry carries an `id`, a human label,
+its `env_key` (the variable above), and a `docs_url` the api-key flow prints so
+you know where to obtain a key. `find_provider(id)` is the case-insensitive
+lookup. The api-key directory and the OAuth registry are merged by
+`list_login_providers()` into the menu `signin` shows, browser-sign-in
+providers first.
+
+## Browser sign-in (OAuth)
+
+The browser path is a re-choreographed `provider.login(callbacks)` flow built
+over the [framework LLM gateway](/python/subsystems/llm-gateway) OAuth and PKCE
+primitives. There is no local callback HTTP server anywhere in this build — the
+flow is paste-based:
+
+1. mint a PKCE pair and a CSRF `state`;
+2. build the authorization URL and open it in your default browser
+   (`open_login_url`, which accepts only `http(s)` URLs);
+3. read the pasted authorization code (the bare code, a `code#state` fragment,
+   or the whole redirect URL — the `code` query param is extracted);
+4. exchange the code for tokens;
+5. persist them through the vault.
+
+The registry must be primed **explicitly** — there are no import-time side
+effects. `register_built_in_oauth_providers()` registers the two
+authorization-code providers from the framework `OAUTH_PROVIDERS` table
+(`anthropic`, `openai`) plus the app-side **GitHub Copilot** adapter, which uses
+the OAuth device-authorization grant (RFC 8628) the framework has no primitive
+for. [boot](/python-cli/subsystems/boot) runs the prime as a startup stage.
+
+```bash
+pindus signin --provider anthropic        # PKCE auth-code flow, then paste the code
+pindus signin --provider github-copilot   # device grant: enter the shown code at github.com
+```
+
+The GitHub Copilot flow prompts for an optional Enterprise host (blank →
+`github.com`), shows a verification URL and a short user code, polls GitHub
+until you approve, then trades the GitHub token for a short-lived Copilot
+bearer. The Copilot client id can be overridden with
+`INDUSAGI_GITHUB_COPILOT_CLIENT_ID`.
+
+## Where credentials live
+
+Stored credentials persist to `auth.json` under this build's profile
+directory — the flat `~/.pindusagi/` root. The vault keys records by provider →
+account, where each record is either an api-key record (`{"kind": "apiKey",
+...}`) or a browser-sign-in record (`{"kind": "oauth", access, refresh,
+expires, ...}`). On read, `read_usable_key` yields an api key verbatim and
+refreshes an expired browser token (persisting any rotated refresh token)
+before returning a usable key.
+
+The profile root is resolved by precedence (see
+[Settings](/python-cli/configuration/settings)):
+
+| Variable | Role |
+|----------|------|
+| `INDUSAGI_CODING_AGENT_DIR` | Agent-specific profile-directory override (highest precedence) |
+| `INDUSAGI_HOME` | Framework state-directory override |
+| *(default)* | `~/.pindusagi` |
+
+## Typed faults
+
+Every failure is a typed `CredentialFault`, never a string sentinel or a bare
+`sys.exit`. `format_credential_fault(fault)` renders the single human-facing
+message (and its optional hint) the caller prints before exiting non-zero. The
+seven kinds:
+
+| Kind | Meaning |
+|------|---------|
+| `unknown-provider` | A named provider is not in the directory / registry |
+| `invalid-key` | The api key is empty, too short, or a placeholder |
+| `invalid-account` | The account name is empty, too long, or malformed |
+| `name-collision` | An account by that name already exists for the provider |
+| `not-found` | `signout` found nothing to remove |
+| `vault` | The credential store (or browser sign-in) failed |
+| `aborted` | The interactive provider pick was cancelled |
+
+## Programmatic surface
+
+The whole flow is `async` and its I/O is injectable (`CredentialIo`), so it can
+be driven over an in-memory stand-in with no real terminal.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `run_credential_command` | async function | `launch/credentials.py` | The `signin`/`signout` command; returns `CredentialResult` with `handled`/`fault` |
+| `PROVIDER_DIRECTORY` | const | `launch/credentials.py` | The 14-provider api-key directory |
+| `find_provider` | function | `launch/credentials.py` | Case-insensitive provider lookup by id |
+| `validate_api_key` / `validate_account_name` | function | `launch/credentials.py` | Format validators returning a typed fault or `None` |
+| `format_credential_fault` | function | `launch/credentials.py` | Render a `CredentialFault` as one human-facing message |
+| `register_built_in_oauth_providers` | function | `launch/oauth.py` | Explicit registry prime (anthropic, openai, github-copilot) |
+| `start_oauth_login` | async function | `launch/oauth.py` | Drive a browser sign-in and persist through the vault |
+| `refresh_oauth_credentials` | async function | `launch/oauth.py` | Refresh seam the disk vault calls on an expired token |
+| `list_login_providers` | function | `launch/oauth.py` | The merged sign-in directory, tagged by auth kind |
+| `AuthVault` | protocol | `launch/contract.py` | Vault surface (`list_accounts`, `put_api_key`, `put_oauth`, `read_usable_key`, `remove`, …) |
+| `CredentialFault` / `credential_fault` | dataclass | `launch/contract.py` | Typed failure record (7 kinds) and its builder |
+| `OAuthCredentials` | dataclass | `launch/contract.py` | Vault-stored browser-sign-in tokens (`access`/`refresh`/`expires`) |
+
+```python
+import asyncio
+from induscode.launch import (
+    register_built_in_oauth_providers,
+    run_credential_command,
+    format_credential_fault,
+)
+
+async def main(vault):
+    register_built_in_oauth_providers()   # explicit prime: anthropic, openai, github-copilot
+    result = await run_credential_command(
+        ["signin", "--provider", "openai", "--method", "api-key"],
+        vault=vault,
+        profile_dir="/home/u/.pindusagi",
+    )
+    if result.fault is not None:
+        print(format_credential_fault(result.fault))
+
+asyncio.run(main(my_vault))
+```
+
+A non-verb leading token short-circuits cleanly:
+
+```python
+res = await run_credential_command(["explain", "this"], vault=v, profile_dir=".")
+assert res.handled is False     # the orchestrator falls through to a normal run
+```
+
+## Notes
+
+- `signin` / `signout` accept `login` / `logout` as natural-language aliases.
+- The env var is consulted before prompting for an api key, so an already-set
+  `ANTHROPIC_API_KEY` can be stored without re-typing it.
+- `--list` is honoured on `signin` only; it is meaningless for `signout`, which
+  already names what to remove.
+- Browser sign-in is paste-based: there is no local callback server. Approve in
+  the browser, then paste the code (or the full redirect URL) back.
+- GitHub Copilot is registered app-side because its device grant (RFC 8628) has
+  no framework config; override its client id with
+  `INDUSAGI_GITHUB_COPILOT_CLIENT_ID`.
+- For picking a model once you are authenticated, see
+  [Models](/python-cli/configuration/models); for the underlying provider
+  abstraction, see the [framework AI facade](/python/facades/ai).

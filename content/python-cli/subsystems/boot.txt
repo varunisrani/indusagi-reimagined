@@ -1,0 +1,421 @@
+# Boot & Runners
+
+> The bootstrap layer that turns a sliced `argv` into a running coding agent. The
+> `pindus` (or `induscode`) entry point calls `await boot(argv)`; everything from
+> here — credential and package short-circuits, the immutable stage pipeline, and
+> dispatch to one of three runners — lives under `induscode.boot`.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [The boot orchestrator](#the-boot-orchestrator)
+- [The BootContext contract](#the-bootcontext-contract)
+- [The stage pipeline](#the-stage-pipeline)
+- [Invocation projection](#invocation-projection)
+- [Runner dispatch](#runner-dispatch)
+- [The three runners](#the-three-runners)
+- [Shared conductor assembly](#shared-conductor-assembly)
+- [The credential vault](#the-credential-vault)
+- [Profile upgrades](#profile-upgrades)
+- [Public exports](#public-exports)
+- [Examples](#examples)
+- [Key concepts](#key-concepts)
+
+## Overview
+
+`induscode.boot` is the top-of-stack assembly layer: it wires every other
+subsystem together at startup. The design stance is **pipeline as data, not
+control flow** — stages and runners are frozen dataclass rows whose
+`apply` / `accepts` / `run` are plain callable fields, and dispatch is a table
+lookup rather than an `if`/`else` ladder.
+
+The barrel is also a one-stop import site. It re-exports the frozen contract
+types, the orchestrator, the stage pipeline, the invocation projection, the
+runner registry, the disk credential vault, the upgrade driver, and the
+[workspace](/python-cli/configuration/settings) surface (`BRAND`, `Workspace`,
+`create_workspace`, `ensure_dirs`).
+
+Boot consumes the [launch](/python-cli/subsystems/launch) flag grammar and
+subcommands, the [conductor](/python-cli/subsystems/conductor) for the session
+engine, [sessions](/python-cli/subsystems/sessions), the
+[capability deck](/python-cli/subsystems/capability-deck),
+[briefing](/python-cli/subsystems/briefing),
+[window budget](/python-cli/subsystems/window-budget), and
+[channels](/python-cli/subsystems/channels). It mounts the
+[console](/python-cli/console/overview) only lazily, so headless paths never pay
+the Textual import cost. Against the framework it types its resolved-resource
+graph against `indusagi.ai.ThinkingLevel`, `indusagi.shell_app.Settings`, and
+the [framework MCP](/python/facades/mcp) pool.
+
+## The boot orchestrator
+
+`boot(argv)` is the single async function the OS entry point calls. It owns the
+whole launch arc, routes a fixed set of short-circuits, runs the stage pipeline,
+dispatches to a runner, drains teardown callbacks, and returns the process exit
+code. It never raises for an expected failure — problems map to a non-zero exit
+code so the entry point can simply adopt it.
+
+```python
+import asyncio, sys
+from induscode.boot import boot
+
+sys.exit(asyncio.run(boot(sys.argv[1:])))  # already-sliced argv (no interpreter/script)
+```
+
+The routing order is fixed (each short-circuit touches no directories):
+
+1. **Credential command** — when `argv[0]` is `signin` / `signout` / `login` /
+   `logout`, prime the OAuth provider registry and hand the raw argv to
+   `run_credential_command` over a `DiskAuthVault`. A handled command exits;
+   `None` falls through.
+2. **Package command** — when `argv[0]` is `install` / `remove` / `update` /
+   `list` / `config`, hand the raw argv to `run_package_command` over a
+   `PreferenceStore.from_workspace(...)`.
+3. **Meta requests** — `wants_help` renders usage (from the one declarative flag
+   table), `wants_version` prints `BRAND.name VERSION`, and `--list-models`
+   prints the model catalog through `print_model_catalog(...)`.
+
+Only when none fire does the orchestrator run `run_stages(seeded)`, then
+`select_runner(ctx.invocation)`, then `await runner.run(ctx)`. A `finally` block
+calls `_drain_closables`, which runs every teardown callback **latest-registered
+first**, swallowing individual failures so one bad closer cannot mask the exit
+code or strand the rest.
+
+A seed context is built up front by `_seed_context`: it resolves the workspace
+(pure path computation — directories are materialised later), sets `BRAND`, and
+parses the invocation once so the meta short-circuits can run before any stage.
+
+## The BootContext contract
+
+`boot/contract.py` declares the frozen type surface — shapes only, no behavior,
+no I/O. Every other boot module is written against the names declared here.
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `BootContext` | dataclass | The immutable value threaded through the pipeline: `argv`, `workspace`, `brand`, `invocation`, `resources` (None until resolved), and the deliberately shared-mutable `closables` list |
+| `Invocation` | dataclass | The thin routing projection of the parsed command line (see [below](#invocation-projection)) |
+| `Stage` | dataclass | One named step: `name` plus an `apply(BootContext) -> BootContext \| Awaitable[BootContext]` callable field |
+| `Runner` | dataclass | A terminal execution strategy: `id` (`RunnerId`), an `accepts(Invocation) -> bool` predicate, and `run(BootContext) -> Awaitable[int]` |
+| `RunnerId` | type | `Literal['repl', 'oneshot', 'link']` — the three top-level execution modes |
+| `StartupResources` | dataclass | Resolved settings/auth/model graph: framework `Settings` (degrades to `{}`), a `CredentialGraph` placeholder bag, and a conductor `ModelCatalog` |
+| `Closable` | type | A teardown callback (sync or async) drained on shutdown |
+| `CredentialGraph` | type | `Mapping[str, object]` placeholder for the resolved per-account graph |
+| `ThinkingLevel` | type | Re-exported from `indusagi.ai` |
+
+Each `Stage` returns a successor via `dataclasses.replace` and never mutates in
+place. `closables` is the one intentional exception — it stays a shared mutable
+list across context successors, because accumulation is its purpose.
+
+## The stage pipeline
+
+`run_stages` folds an ordered list of `Stage` transforms over an immutable
+`BootContext`, awaiting each result so async ordering is deterministic. The input
+is never mutated.
+
+`STAGES` lists the pipeline in execution order:
+
+| Stage | `name` | Effect |
+|-------|--------|--------|
+| `locate_workspace` | `locate-workspace` | `ensure_dirs(ws)` — `mkdir`s the resolved directories (path computation already happened) |
+| `upgrade_stage` | `apply-upgrades` | `apply_upgrades(ws)` — non-fatal; a failed step is retried next launch |
+| `build_invocation` | `build-invocation` | Re-parse `argv` into the typed `Invocation` |
+| `resolve_resources` | `resolve-resources` | Best-effort `StartupResources` graph (degrade-to-empty settings + `ModelCatalog`) |
+| `select_runner_stage` | `select-runner` | Tracing no-op; the real dispatch happens in `boot()` so the runner can own the exit code |
+
+> **Port note.** The TS `upgrade` stage is exported as `upgrade_stage` in Python
+> so it does not shadow the `induscode.boot.upgrade` subpackage attribute.
+
+Note the deliberate double-parse: `_seed_context` parses the invocation once up
+front for the meta short-circuits, and `build_invocation` re-parses the same
+`argv` inside the pipeline. Both share the one launch parser, so help, parsing,
+and routing can never drift.
+
+## Invocation projection
+
+`boot/invocation.py` drives the full declarative launch flag grammar
+(`read_invocation`) and projects the rich result down onto the thin boot
+`Invocation` the runner pipeline routes on. The parse is total and never raises —
+unknown `--flags` survive as switches in the loose `flags` bag.
+
+`to_runner_id` maps the launch `OutputMode` onto `RunnerId` one-to-one:
+
+| `OutputMode` | `RunnerId` | Meaning |
+|--------------|-----------|---------|
+| `text` | `repl` | Interactive terminal session |
+| `json` | `oneshot` | Single non-interactive request to stdout |
+| `rpc` | `link` | Headless JSON-RPC link for a driving parent |
+
+`wants_help` and `wants_version` read the loose flag bag (`flags.get("help")` /
+`flags.get("version")`) for the meta short-circuits.
+
+The projected `Invocation` carries the routing-relevant fields the boot layer
+reads: `mode`, `prompt`, `model_id`, `cwd`, `account`, `thinking`, `system`,
+`append_system`, `tools`, `no_tools`, `mcp`, `resume`, `continue_latest`,
+`list_models` (+ `list_models_filter`), plus `flags` and `rest`.
+
+## Runner dispatch
+
+`boot/runners/registry.py` is the table-driven replacement for a mode `if`/`else`
+ladder. `RUNNERS` lists every runner in match-priority order, and `select_runner`
+returns the first whose `accepts` predicate matches — falling back to
+`repl_runner` so dispatch is total.
+
+```python
+RUNNERS = (repl_runner, oneshot_runner, link_runner)
+
+def select_runner(inv: Invocation) -> Runner:
+    for runner in RUNNERS:
+        if runner.accepts(inv):
+            return runner
+    return repl_runner   # the interactive REPL is both first and the default
+```
+
+The interactive REPL leads the table and is the guaranteed fallback, so a bare
+command line lands in the interactive session. Adding or reordering a mode is a
+one-line edit to the table.
+
+## The three runners
+
+Each runner's `accepts` checks `inv.mode`; each `run` first calls the shared
+`build_session_conductor(ctx)` (see [below](#shared-conductor-assembly)) and then
+drives its surface to an exit code.
+
+### `repl_runner` — interactive Textual console
+
+Matches `mode == "repl"`. It assembles the conductor, honours `--resume` /
+`--continue` **before** mounting (so the console renders the restored transcript
+from its first frame), assembles the `ReplServices` overlay bundle, and hands
+everything to the injectable console mount.
+
+`ReplServices` is the overlay service bundle handed to the console: the live
+`conductor`, the two-tier `PreferenceStore`, a cwd-scoped `SessionLibrary`, the
+sign-in directory lister, the OAuth login flow, the browser launcher, and the
+`AuthVault`.
+
+`--resume` / `--continue` resume by bare session **id** (never a path):
+`--continue` takes the newest row from the cwd-scoped library; `--resume` runs
+the launch `pick_resume_target` picker over the same rows and maps the chosen
+file path back to its id. A resume failure — load, picker mount, or a `faulted`
+phase after `conductor.resume` — degrades to the fresh session with a one-line
+stderr notice rather than crashing.
+
+The mount seam is injectable: `ConsoleMount` is a module-held callable
+`(conductor, services, initial_input) -> Awaitable[int]`, swapped via
+`set_console_mount`. It defaults to the lazily-imported Textual console (so boot
+stays headless-cheap), and tests can stub it. `set_resume_deps` similarly swaps
+the `ResumeDeps` factory for the `--resume` picker.
+
+### `oneshot_runner` — single request to stdout
+
+Matches `mode == "oneshot"`. It builds a `ChannelContext` over a flushed stdout
+sink and runs every prompt to settlement via
+[`run_oneshot`](/python-cli/subsystems/channels). The output shape is NDJSON when
+the invocation carries a `json` flag, otherwise clean text. With no request text
+it writes a short notice and exits with code `2` rather than mounting an empty
+run.
+
+### `link_runner` — headless JSON-RPC link
+
+Matches `mode == "link"`. It serves the declarative `SESSION_OPS` registry over
+the process stdio pair via `create_link_server`, reading framed requests from
+stdin and writing framed replies to stdout, and resolves exit code `0` once the
+inbound stream ends. Blocking stdin reads are pushed onto the default executor so
+the event loop keeps running between frames.
+
+## Shared conductor assembly
+
+`boot/runners/session.py` is the agent-assembly choreography all three runners
+share, so none re-derives the model id, key resolver, or session options.
+`build_session_conductor(ctx)` runs these steps:
+
+1. **OAuth + env priming** — `register_built_in_oauth_providers()` (explicit,
+   never at import time) and `prime_provider_env(ctx)`.
+2. **Model resolution** — `resolve_model_id`: an explicit `--model` wins; else
+   the first authenticated provider's preferred current model
+   (`PREFERRED_DEFAULT`); else the catalog default.
+3. **Key resolver** — `build_key_resolver` returns a per-call async resolver
+   injected into the framework agent: it tries the requested `--account`, then
+   the default account, then the first stored account, with on-read OAuth
+   refresh inside the vault. Returning `None` lets the framework fall back to its
+   own env lookup; it never raises.
+4. **Tool + MCP selection** — `select_tools` provisions
+   `provision_deck("all")` filtered by `--tools` (allow-list, case-insensitive
+   with `_`/`-` stripped) or emptied by `--no-tools`; `load_mcp_tools` attaches
+   `--mcp` servers via the framework MCP pool, with stdout/stderr/logging silenced
+   for the duration (scope-redirected, not monkey-patched; a set `INDUSAGI_DEBUG`
+   keeps it visible).
+5. **System prompt** — `compose_system`: `--system` replaces the tool-aware
+   [briefing](/python-cli/subsystems/briefing), `--append-system` appends; both
+   resolve a value file-or-literal.
+6. **Session scoping** — `session_scope_dir(sessions_root, cwd)` partitions
+   sessions per working directory (cwd slugged, wrapped in `--…--` markers).
+7. **Condense hook** — the conductor is built with `condense_transcript` as the
+   `/compact` and auto-compaction hook.
+
+`condense_transcript` is network-free: it folds older turns into a deterministic
+local digest and keeps recent turns verbatim. Manual (`force=True`, from
+`/compact`) folds everything before the last user turn; auto is budget-gated by
+`AUTO_CONDENSE_POLICY` (`trigger_ratio=0.75`, `keep_recent=6000`,
+`reserve_tokens=2048`) via the [window budget](/python-cli/subsystems/window-budget)
+planner. The conductor builds its framework agent lazily, so no model client
+exists until the first turn.
+
+> Credentials follow a **two-path** design. `build_key_resolver` is the *primary*
+> path (per-call resolver, OAuth refresh, the only path for OAuth-only providers).
+> `prime_provider_env` is the *secondary* belt: a best-effort export of vault keys
+> into the framework's `PROVIDER_ENV` variables (e.g. `ANTHROPIC_API_KEY`), never
+> overriding an env var already set in the shell.
+
+## The credential vault
+
+`boot/auth_vault.py` implements the launch `AuthVault` Protocol over a single
+`0600` `auth.json` keyed provider → account → record. `create_auth_vault(path)`
+builds a `DiskAuthVault`. Each record is a discriminated union:
+
+- `{"kind": "apiKey", "key": ..., "isDefault": bool}`
+- `{"kind": "oauth", "isDefault": bool, "access": ..., "refresh": ..., "expires": ...}`
+
+A legacy pre-discriminant `{"apiKey": ..., "isDefault": ...}` record is tolerated
+on read; an entry that cannot be understood is dropped. The vault reads and
+rewrites the whole file each time, re-applying `0600` on every write.
+
+`read_usable_key(provider, account)` resolves a record to a live api-key string:
+an api-key record yields its key verbatim; a browser-sign-in record yields its
+access token, **refreshing first** (and persisting the rotated credentials,
+preserving the default flag) when the recorded `expires` deadline is within a
+one-minute margin of now. It resolves `None` when nothing usable is stored or no
+OAuth adapter is registered for the provider. See
+[Auth](/python-cli/configuration/auth) for the credential model.
+
+## Profile upgrades
+
+`boot/upgrade/` is the idempotent profile-upgrade subsystem. `apply_upgrades(ws)`
+folds the ordered `UPGRADES` registry over the workspace using a
+`.upgrade-state.json` marker file (`{"appliedIds": [...]}`) under the profile
+directory.
+
+Each step is skipped if its id is already in the marker; otherwise it is applied
+and, **on success**, its id is appended and the marker rewritten (so partial
+progress survives a crash). A step that raises is *not* recorded — it is retried
+next launch and reported as a non-fatal warning in the `UpgradeReport`, never
+aborting the remaining steps.
+
+The four registered migrations (`fold-credentials-into-secure-auth-file`,
+`reshelve-loose-transcripts-into-sessions-dir`,
+`relocate-managed-helper-binaries-to-bin`, `rename-legacy-commands-dir-to-prompts`)
+are **documented no-ops** on the fresh `~/.pindusagi` root: that root never
+carried a legacy layout, so there is nothing to migrate. Their ids are preserved
+verbatim to stay reserved, while the migration mechanism stays fully exercisable.
+Append real steps to the end of `UPGRADES` — never reorder or rename an existing
+id.
+
+## Public exports
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `boot` | async function | `boot/boot.py` | The orchestrator the entry point calls |
+| `BootContext` / `Invocation` / `Stage` / `Runner` | dataclass | `boot/contract.py` | The frozen pipeline contract |
+| `RunnerId` / `StartupResources` / `Closable` / `CredentialGraph` / `ThinkingLevel` | type/dataclass | `boot/contract.py` | Mode literal, resolved graph, teardown + placeholder types |
+| `run_stages` / `STAGES` | function/const | `boot/stages.py` | The fold and the ordered pipeline |
+| `locate_workspace` / `upgrade_stage` / `build_invocation` / `resolve_resources` / `select_runner_stage` | const | `boot/stages.py` | The five `Stage` rows |
+| `tokenize_invocation` / `to_runner_id` / `wants_help` / `wants_version` | function | `boot/invocation.py` | Invocation reader and projections |
+| `select_runner` / `RUNNERS` | function/const | `boot/runners/registry.py` | Table-driven dispatch |
+| `repl_runner` / `oneshot_runner` / `link_runner` | const | `boot/runners/` | The three `Runner` rows |
+| `ReplServices` / `ConsoleMount` / `set_console_mount` / `set_resume_deps` | dataclass/type/function | `boot/runners/repl_runner.py` | Overlay bundle and console/resume seams |
+| `build_session_conductor` | async function | `boot/runners/session.py` | The shared conductor-assembly choreography |
+| `resolve_model_id` / `build_key_resolver` / `prime_provider_env` / `condense_transcript` / `session_scope_dir` / `oneshot_prompts` | function | `boot/runners/session.py` | Session-assembly helpers (`PREFERRED_DEFAULT`, `PROVIDER_ENV` tables too) |
+| `create_auth_vault` / `DiskAuthVault` | function/class | `boot/auth_vault.py` | The disk credential vault |
+| `apply_upgrades` / `UPGRADES` / `Upgrade` / `UpgradeReport` | function/const/dataclass | `boot/upgrade/` | The upgrade driver and registry |
+| `BRAND` / `Brand` / `Workspace` / `WorkspaceOverrides` / `create_workspace` / `ensure_dirs` | const/class/function | `induscode.workspace` (re-exported) | One-stop boot import site |
+
+## Examples
+
+Interactive REPL (the default / fallback runner):
+
+```bash
+# bare command line -> select_runner returns repl_runner
+pindus
+# resume the newest session in this cwd before the console mounts
+pindus --continue
+# open the resume picker (Textual) before mounting
+pindus --resume
+```
+
+Oneshot — text or NDJSON to stdout:
+
+```bash
+# clean text to stdout
+pindus "summarize the build script"
+# streamed NDJSON event log (oneshot_runner sees the json flag)
+pindus --json "list the failing tests"
+```
+
+Meta short-circuits and headless link mode:
+
+```bash
+pindus --help                    # render_usage() from the one declarative flag table
+pindus --version                 # BRAND.name + VERSION
+pindus --list-models anthropic   # print_model_catalog(CatalogFilter(search='anthropic'))
+pindus --rpc                     # link_runner: JSON-RPC SESSION_OPS over stdin/stdout
+```
+
+Flags reaching the conductor:
+
+```bash
+pindus --model anthropic/claude-sonnet-4-5 --thinking high \
+       --tools read,write,bash --append-system ./extra-prompt.md \
+       --mcp ./mcp.json "refactor this module"
+# resolve_model_id picks the explicit --model; select_tools allow-lists by
+# canonical name; load_mcp_tools attaches ./mcp.json; compose_system appends
+# the file; the raw --thinking is narrowed to a ThinkingLevel.
+```
+
+Testing seam — swap the console mount (no real Textual):
+
+```python
+from induscode.boot import set_console_mount
+
+async def fake_mount(conductor, services, initial_input):
+    assert services.conductor is conductor
+    return 0
+
+set_console_mount(fake_mount)   # pass None to restore the real Textual console
+```
+
+Programmatic credential vault use:
+
+```python
+from induscode.boot import create_auth_vault
+from induscode.launch import OAuthCredentials
+
+vault = create_auth_vault("/Users/me/.pindusagi/auth.json")
+await vault.put_api_key("anthropic", "work", "sk-...", make_default=True)
+key = await vault.read_usable_key("anthropic", "work")   # verbatim key, or refreshed oauth token
+```
+
+## Key concepts
+
+- **Immutable stage pipeline** — `STAGES` is a tuple of frozen `Stage` rows;
+  `run_stages` folds a `BootContext` through them, each returning a successor via
+  `dataclasses.replace`. Pipeline is data, not control flow.
+- **Table-driven runner dispatch** — `RUNNERS` is a priority-ordered tuple;
+  `select_runner` returns the first match, with `repl_runner` as the guaranteed
+  total fallback. Adding a mode is a one-line table edit.
+- **Console mount seam** — `ConsoleMount` is an injectable module-held callable
+  (set via `set_console_mount`) defaulting to the lazily-imported Textual console,
+  so boot stays headless-cheap and tests can stub the interactive surface.
+- **Shared conductor assembly** — `build_session_conductor` centralises the
+  model/key/tools/system/sessions choreography all three runners share; the
+  conductor builds its framework agent lazily, so no model client exists until the
+  first turn.
+- **Idempotent profile upgrades** — `apply_upgrades` folds the ordered `UPGRADES`
+  registry using a `.upgrade-state.json` marker; each step runs at most once,
+  failures are non-fatal warnings retried next launch.
+- **Two-path credentials** — primary `build_key_resolver` (per-call async resolver
+  with on-read OAuth refresh) plus secondary `prime_provider_env` (best-effort
+  export into `PROVIDER_ENV` vars, never overriding an existing env var).
+
+See [Launch](/python-cli/subsystems/launch) for the flag grammar and subcommands,
+[Conductor](/python-cli/subsystems/conductor) for the session engine,
+[Channels](/python-cli/subsystems/channels) for the oneshot/link transports, and
+the [CLI reference](/python-cli/reference/cli) for the complete flag table.

@@ -1,0 +1,283 @@
+# Architecture
+
+> `induscode` is the 100% Rust terminal-first AI coding-agent CLI, layered entirely on top of the [indusagi framework](/rust). The OS launches it through the `indusr` / `indusagir` bins (both compiled from `src/bin/main.rs`); embedders link the same subsystems as `induscode::<module>`. This page maps how the agent's layers stack — `bin/main` → launch (flag parse) → boot (pipeline + runner registry) → console / conductor → runtime — and catalogs every module with its role and a link to its doc.
+>
+> Unlike the TS and Python editions, the Rust edition is **one merged product crate**: the thirteen former `induscode-*` library crates are now plain modules under `src/`, and the framework is the single published `indusagi` umbrella crate (replacing the deleted `indusagi-*` path deps). `lib.rs` is the library surface; `bin/main.rs` is the terminal binary; everything else is `pub mod`.
+
+## Table of Contents
+
+- [The Layer Stack](#the-layer-stack)
+- [The Two Faces: lib and bin](#the-two-faces-lib-and-bin)
+- [Request Flow: bin/main to runtime](#request-flow-binmain-to-runtime)
+- [The Launch Layer: flag parse](#the-launch-layer-flag-parse)
+- [The Boot Pipeline](#the-boot-pipeline)
+- [Runner Dispatch](#runner-dispatch)
+- [How a Session Is Assembled](#how-a-session-is-assembled)
+- [Module Map](#module-map)
+- [Where the Framework Begins](#where-the-framework-begins)
+
+## The Layer Stack
+
+A turn flows down through induscode's own modules and lands on the framework runtime. Reading top to bottom, the UI/output sits at the edge, the conductor is the product core, and the framework agent loop produces the actual assistant message.
+
+| Layer | Module | Role | Built on |
+|-------|--------|------|----------|
+| Process entry | `src/bin/main.rs` | The `indusr` / `indusagir` shim: brands off `argv[0]`, installs the `[MCP]` noise filter, owns the no-session verbs (`auth`, `signin`/`signout`, package verbs, `--list-models`, `--help`/`--version`), and hands every real run to `boot_run`. | tokio, stdlib |
+| Launch | [`induscode::launch`](/rust-cli/subsystems/launch) | The typed command line: one declarative `FLAG_SPECS` table read by both the parser and the usage renderer, the `@file` attachment inliner, the model catalog printer, the multi-account credential vault, the three OAuth flows, the picker data. | framework AI + PKCE/transport |
+| Boot | [`induscode::boot`](/rust-cli/subsystems/boot) | The launch orchestrator: seeds an immutable `BootContext`, folds it through the five-stage pipeline, dispatches the resolved `Runner`, drains closables in reverse. | `induscode::core`, all subsystems |
+| Conductor | [`induscode::conductor`](/rust-cli/subsystems/conductor) | The session core: wraps exactly one framework agent loop as a `Conductor`, projects loop events into a stable `SessionSignal` stream, persists a branchable transcript, retries faults, condenses on overflow. | [framework runtime](/rust/subsystems/runtime) |
+| Capabilities | [`induscode::deck`](/rust-cli/subsystems/capability-deck) | The tooling layer: `provision_deck` assembles the `ToolBox` the conductor consumes; a `Capability` projects into a runtime tool. | [framework capabilities](/rust/subsystems/capabilities) |
+| Console (UI) | [`induscode::console`](/rust-cli/console/overview) | The interactive ratatui product shell: pure reducer, intent table, theme engine, overlays, slash catalog, mounted via `mount_console`. | [framework tui](/rust/ui) |
+| Channels (output) | [`induscode::channels`](/rust-cli/subsystems/channels) | The non-interactive surfaces: the one-shot text/NDJSON channel (`run_oneshot`) and the framed JSON-RPC link protocol (`session_ops` + `dispatch`). | conductor signals |
+| Runtime | [`indusagi::runtime`](/rust/subsystems/runtime) / [`indusagi::llmgateway`](/rust/subsystems) | The raw LLM conversation loop, model client, and content/message types the conductor drives. | [framework runtime](/rust/subsystems/runtime) |
+
+The conductor is the pivot: everything above it (console, channels) is a *consumer* of its signal stream and `submit`/`snapshot`/`resume` surface; everything below it (deck, framework agent) is *assembled into* it at startup by the boot layer's `build_conductor`.
+
+## The Two Faces: lib and bin
+
+induscode has two faces, both at the root of `src/`:
+
+| File | Role |
+|------|------|
+| `lib.rs` | The **library surface** — `pub mod` declarations for the thirteen subsystems (`addons`, `boot`, `briefing`, `channels`, `conductor`, `console`, `core`, `deck`, `insight`, `launch`, `runtime_bridge`, `transcript_export`, `window_budget`). Embedders reach everything as `induscode::<module>`. |
+| `bin/main.rs` | The **terminal binary** — two `[[bin]]` targets (`indusr`, `indusagir`) share one `async fn main() -> ExitCode`, the Rust analogue of the TS `{"indus": …, "indusagi": …}` two-names-one-entry bin block. |
+
+`bin/main.rs` does the work a session does not need before handing off:
+
+1. **Brand off `argv[0]`** — `resolve_brand` takes the basename, strips a trailing `.exe`, and matches it against `BIN_NAMES` (`["indus", "indusagi"]`), falling back to the primary `BIN_NAMES[0]`.
+2. **Install the `[MCP]` noise filter** — `install_mcp_noise_filter` records a single idempotent install; it is a no-op when the brand debug env var (`INDUSAGI_DEBUG`, derived via `indusagi::core::env_name("debug")`) is set, so diagnostics are never hidden.
+3. **Route the argv tail** — `route` owns the no-session verbs and the meta short-circuits, then hands every real run to `boot_run`.
+
+`async fn main() -> ExitCode` is the **only** place an exit code reaches the OS. Returning `ExitCode` (rather than calling `process::exit`) lets the tokio runtime drain and destructors run, so a mid-TUI exit restores the terminal's raw/alt-screen mode cleanly.
+
+```rust
+// src/bin/main.rs (shape)
+#[tokio::main]
+async fn main() -> ExitCode {
+    let mut args = std::env::args();
+    let argv0 = args.next();
+    let brand = resolve_brand(argv0.as_deref());
+    install_mcp_noise_filter();
+    let rest: Vec<String> = args.collect();
+    route(brand, rest).await
+}
+```
+
+`route` runs these checks in verbatim order before the boot handoff (each short-circuits to its own `ExitCode` *without* touching boot, because boot would drop them into the REPL):
+
+| Order | Check | Handler | Notes |
+|-------|-------|---------|-------|
+| 1 | `auth` leading verb | `run_auth_subcommand` | `login`/`refresh`/`status`/`help` → framework `run_auth_command`; `logout` → agent `signout`; `status` → agent vault reader (reconciles both vault shapes). Intercepted *before* the global `--help` so `auth --help` renders auth help. |
+| 2 | `--help` / `-h` | `render_usage` + `render_commands_section` | Banner generated from the single `FLAG_SPECS` table, plus a `Commands:` footer for the verbs that are not flags. |
+| 3 | `--version` / `-v` | print `BRAND.app_name VERSION` | `VERSION` is `env!("CARGO_PKG_VERSION")` — single-sourced. |
+| 4 | unknown leading flag | `eprintln!` + exit `EXIT_USAGE` (`2`) | `unknown_leading_flag` checks the leading `-…` token against `launch::flags::token_index`. |
+| 5 | `signin` / `signout` | `run_agent_credential` | The multi-account credential command over `DiskAuthVault`; `signin` defaults to `--method api-key` past the inert OAuth sentinel. |
+| 6 | `install`/`remove`/`update`/`list`/`config` | `run_package` | Extension-package surface over the two-tier `PreferenceStore`. |
+| 7 | `--list-models [filter]` | `print_model_catalog` | The launch catalog projection over the live `indusagi::llmgateway` cards. |
+| 8 | everything else | `boot_run(rest, production_io())` | A bare prompt, `-p`, `--json`, `--interactive` — the session-bound launch. |
+
+`production_io()` pairs a `StdioSink` (user text to stdout, diagnostics to stderr, each flushed, broken-pipe swallowed) with a `StdinSource` (one blocking stdin read per `next_line`, on a blocking thread so the runtime is not stalled).
+
+## Request Flow: bin/main to runtime
+
+```
+indusr "refactor the auth module"
+  │
+  ▼
+main() ──► resolve_brand(argv0) ──► install_mcp_noise_filter() ──► route(brand, rest)
+  │
+  ▼
+route(brand, rest)                                 src/bin/main.rs
+  ├─ auth verb?       run_auth_subcommand(...)      (exit; framework or agent vault)
+  ├─ --help/-h?       render_usage + commands       (exit)
+  ├─ --version/-v?    BRAND.app_name + VERSION       (exit)
+  ├─ unknown -flag?   exit 2 (EXIT_USAGE)
+  ├─ signin/signout?  run_agent_credential(...)      (exit)
+  ├─ package verb?    run_package(...)               (exit)
+  ├─ --list-models?   print_model_catalog(...)       (exit)
+  └─ else             boot_run(rest, production_io())
+       │
+       ▼
+boot_run(argv, io)                                 src/boot/mod.rs
+  ├─ seed_context(argv, io)  → BootContext { workspace, brand, invocation, io, closables }
+  ├─ pipeline::stages().run(seed)
+  │     locate-workspace → apply-upgrades → build-invocation → resolve-resources → select-runner
+  ├─ runners::registry().select(&ctx.invocation).run(&ctx)   → i32 exit code
+  └─ drain_closables(&ctx)   (reverse, always)
+       │
+       ▼
+  ReplRunner / OneShotRunner / LinkRunner            src/boot/runners.rs
+       └─ build_conductor(ctx)                        src/boot/runners.rs
+            ├─ resolve_model_id(--model ▸ saved ▸ authed ▸ catalog)
+            ├─ build_session_tools (deck + MCP graft + addons)
+            ├─ compose_session_briefing (--system / --append-system)
+            ├─ resolve_permission_policy + GatedToolBox
+            ├─ build_key_resolver (--account, on-read vault)
+            └─ Conductor::new(config, LoopDeps { store, plans_dir, fallback_model_id, diagnostics, … })
+                 │  per turn
+                 └─ Conductor drives ONE framework agent loop, re-emits SessionSignal
+```
+
+The console (interactive) or a channel (one-shot / link) subscribes to the conductor's signal stream and renders or serializes it. The framework agent loop produces the assistant message; the conductor re-emits a distinct, stable product signal stream so the app surface evolves independently of the framework's event loop.
+
+## The Launch Layer: flag parse
+
+The launch crate owns the *application* command line, distinct from the framework's *boot-routing* parser. Its load-bearing decision: a **single declarative table** drives both the parser and the usage renderer so the help text and the parser can never disagree.
+
+```rust
+// src/launch/flags.rs
+pub fn flag_specs() -> &'static [FlagSpec];   // 18 rows, 5 groups
+pub fn token_index() -> &'static HashMap<&'static str, usize>;
+```
+
+The 18 flags, in declaration order (the `FLAG_SPECS` table is the single source of truth):
+
+| Flag | Aliases | Kind | Group | Purpose |
+|------|---------|------|-------|---------|
+| `--print` | `-p` | Boolean | Output | Run a single request, print only the result, and exit. |
+| `--json` | `--rpc` | Boolean | Output | Speak the headless line protocol for a driving parent process. |
+| `--interactive` | `-i` | Boolean | Output | Force the interactive session even when a prompt is supplied. |
+| `--model` | `-m` | String | Model | Select the model, provider-qualified or bare (e.g. `provider/name`). |
+| `--fallback-model` | — | String | Model | Model to switch to mid-turn when the selected model is overloaded (HTTP 529). |
+| `--account` | — | String | Model | Authenticate the run with a named stored credential account. |
+| `--thinking` | — | String | Model | Set the reasoning effort (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`). |
+| `--list-models` | — | String | Model | List the available models (optionally filtered by a substring) and exit. |
+| `--cwd` | — | String | Context | Scope the run to a working directory (default: the current directory). |
+| `--system` | — | String | Context | Replace the built-in system prompt with the given text. |
+| `--append-system` | — | String | Context | Append extra text after the system prompt. |
+| `--resume` | `-r` | Boolean | Context | Pick a previous session to resume. |
+| `--continue` | `-c` | Boolean | Context | Continue the most recent session in this directory. |
+| `--tools` | — | List | Tools | Allow only the named built-in tools (comma-separated or repeated). |
+| `--no-tools` | — | Boolean | Tools | Disable every built-in tool for this run. |
+| `--mcp` | — | List | Tools | Attach an external MCP server endpoint (comma-separated or repeated). |
+| `--help` | `-h` | Boolean | Meta | Show this usage and exit. |
+| `--version` | `-v` | Boolean | Meta | Show the version and exit. |
+
+`parser::read_invocation(&argv)` is *tolerant* of unknown flags (the extension-flag escape hatch), so the unknown-leading-flag check lives in `bin/main.rs`, not the parser. It produces the launch `Invocation` whose `mode: OutputMode` is `derive_mode`d: `--json`/`--rpc` → `Rpc`; `--print && !--interactive` → `Json`; else `Text`. See the full [Launch](/rust-cli/subsystems/launch) subsystem for the parser internals, attachments, and the [auth](/rust-cli/configuration/auth) flows.
+
+## The Boot Pipeline
+
+`boot::boot_run(argv, io)` (in `boot/mod.rs`) owns the headless launch arc. By the time argv reaches it, the no-session verbs and meta short-circuits have already been handled by `bin/main.rs`, so `boot_run` is the single *session* entry. It seeds a `BootContext`, folds it through the pipeline, dispatches a runner, and **always** drains closables on the way out — the only place a code reaches the OS being the `ExitCode` it returns.
+
+```rust
+// src/boot/mod.rs (shape)
+pub async fn boot_run(argv: Vec<String>, io: BootIo) -> ExitCode {
+    let seeded = seed_context(argv, io);
+    let pipeline = pipeline::stages();
+    let ctx = pipeline.run(seeded).await;          // immutable fold
+    let registry = runners::registry();
+    let code = registry.select(&ctx.invocation).run(&ctx).await;
+    drain_closables(&ctx).await;                    // reverse, always
+    ExitCode::from(code as u8)
+}
+```
+
+`pipeline::stages()` builds a `BootPipeline` over five `Stage`s. The fold is data, not control flow: each `Stage::apply(ctx) -> BootContext` returns a *fresh* successor (struct-update), never mutating in place. Adding a stage is a one-line edit in `stages()`.
+
+| Stage | Name | What it does |
+|-------|------|--------------|
+| 1 | `locate-workspace` | `ensure_dirs(&ctx.workspace)` materialises the profile directory layout on disk (a failed `mkdir` is non-fatal, reported and continued). |
+| 2 | `apply-upgrades` | Fold the idempotent `apply_upgrades` registry over the workspace — `fold-credentials-into-secure-auth-file`, `reshelve-loose-transcripts-into-sessions-dir`, `relocate-managed-helper-binaries-to-bin`, `rename-legacy-commands-dir-to-prompts`, each marker-gated and retried next launch on failure. |
+| 3 | `build-invocation` | `read_invocation(&ctx.argv)` then `map_invocation` projects the rich launch `Invocation` onto the boot-routing `Invocation` the registry keys off. |
+| 4 | `resolve-resources` | `resolve_startup_resources(&ctx)` best-effort assembles the settings/auth/model graph (degrades to `None` on any framework gap). |
+| 5 | `select-runner` | A marker/tracing no-op — the real dispatch happens in `boot_run` after the pipeline so the runner owns the exit code. |
+
+`map_invocation` is where the launch `OutputMode` becomes the boot `RunnerId`: `Rpc → Link`, `Json → Oneshot`, `Text → Repl`. It also threads `--resume`/`--continue`/`--model`/`--cwd`/`--account`/`--thinking`/`--system`/`--append-system`/`--tools`/`--no-tools`/`--mcp` and the `--list-models` filter onto the routing shape.
+
+A `finally`-equivalent — the unconditional `drain_closables(&ctx)` — runs every teardown callback latest-registered first, swallowing individual failures so one bad closer cannot mask the exit code or strand the rest. `BootContext::closables` is a `Mutex<Vec<Closable>>` (interior mutability) so a runner holding a shared `&BootContext` can still register teardowns.
+
+## Runner Dispatch
+
+The pipeline hands the resolved `Invocation` to exactly one `Runner`. Dispatch is a table lookup, not an `if/else` ladder: `registry()` lists every runner in priority order and `RunnerRegistry::select` returns the first whose `accepts` predicate matches `inv.mode`.
+
+```rust
+// src/boot/runners.rs
+pub fn registry() -> RunnerRegistry {
+    RunnerRegistry::new(vec![
+        Box::new(ReplRunner),
+        Box::new(OneShotRunner),
+        Box::new(LinkRunner),
+    ])
+}
+```
+
+The registry is **total**: unlike the framework's fallible `indusagi::shell_app::select_runner` (which returns `Result<_, NoRunnerError>` for output-only help/version modes), the agent's `select` falls back to the **first** runner (`ReplRunner`) so a bare command line always lands interactive — correct because `boot_run` never sees help/version/list-models (those exit in `bin/main.rs`).
+
+| Runner | `id()` | Behaviour |
+|--------|--------|-----------|
+| `ReplRunner` | `RunnerId::Repl` | Builds the session conductor, honours `--resume` / `--continue` via `apply_resume`, then `mount_console(conductor, opts)` behind the `tui` feature for the live [ratatui session](/rust-cli/console/overview). On a `--no-default-features` headless build it reports that the interactive surface needs the `tui` build and exits non-zero. |
+| `OneShotRunner` | `RunnerId::Oneshot` | One non-interactive run to stdout via `run_oneshot` over a `ChannelContext` — clean text, or NDJSON when the shape is set; no request text exits `EXIT_NO_INPUT` (`2`). See [Channels](/rust-cli/subsystems/channels). |
+| `LinkRunner` | `RunnerId::Link` | Reads framed JSON-RPC request lines from the boot `InputSource`, dispatches each through the declarative `session_ops` registry via `dispatch`, and frames one correlated `Reply` back through NDJSON `encode_line`. EOF exits `0`; blank/malformed lines tolerated. |
+
+Each runner's `accepts` keys solely off `inv.mode`, and the trait's `run` is `async (?Send)` — it borrows the (intentionally non-`Sync`) `BootContext` and resolves the exit code *by value*, never calling `process::exit`, so `boot_run` stays in control of teardown.
+
+## How a Session Is Assembled
+
+All three runners call the shared `build_conductor(ctx)` in `boot/runners.rs` — the Rust analogue of the TS `buildSessionConductor`. It threads the invocation's flags into one framework agent loop through the `Conductor`:
+
+```bash
+indusr --model anthropic/claude-sonnet-4-5 --thinking high \
+       --tools read,write,bash --append-system ./extra-prompt.md \
+       --mcp ./mcp.json "refactor this module"
+```
+
+1. **Model** — `resolve_model_id(inv.model_id, saved_default_model(ctx), authenticated_providers(...))` resolves explicit `--model` ▸ saved `settings.default_model` ▸ an authenticated provider's current model ▸ the catalog fallback, then seeds `AgentConfig::new(model_id)`. The thinking level threads through `resolve_thinking` (the TS aliases `minimal`/`xhigh` fold onto framework `Low`/`Max`).
+2. **Tools** — `build_session_tools(inv, cwd)` calls `provision_deck(Profile::All, ctx)` from the [capability deck](/rust-cli/subsystems/capability-deck), honours the `--tools` allow-list (case-insensitive, `_`/`-`-stripped via `canon_tool_name`) and `--no-tools`, then `graft`s in the `--mcp` (or auto-discovered) server tools and the local `<cwd>/.indus/addons` contributed tools + interceptor chain. Per-session read-state and checkpoint stores are minted onto `DeckFramework` so write/edit gate on read-before-edit and snapshot for rewind.
+3. **System prompt** — `compose_session_briefing(inv, cwd, descriptors)` builds the tool-aware [briefing](/rust-cli/subsystems/briefing); `--system` replaces it, `--append-system` appends a trailing block.
+4. **Permissions** — `resolve_permission_policy(ctx, cwd)` reads the project-then-global `PreferenceStore` tiers into ordered deny/ask/allow `PermissionRule`s + an opening `PermissionMode`; when there is anything to enforce (rules, a non-allow-all mode, or plan-mode reachable in the REPL), the deck is wrapped in a `GatedToolBox` and re-seated.
+5. **Credentials** — `build_key_resolver(ctx)` builds an `--account`-scoped `KeyResolver` over the on-disk vault (requested account ▸ default ▸ first), stamping the resolved key onto each request's `StreamOptions::api_key` — no `unsafe` env mutation (`#![forbid(unsafe_code)]`).
+6. **The conductor** — `Conductor::new(config, LoopDeps { permission_mode, store: SessionStore::new(sessions_dir), key_resolver, fallback_model_id, plans_dir, workspace, diagnostics, .. })` wraps exactly one framework agent loop. The cwd-scoped `sessions_dir` (`session_scope_dir_for`) is the SAME directory the resume flow reads and the overlays list, so writer and reader agree on the `.jsonl` transcript tree.
+
+The runner then mounts the console over the conductor (`ReplRunner`) or drives it through a channel (`OneShotRunner` / `LinkRunner`).
+
+## Module Map
+
+Each subsystem is a `pub mod` in `lib.rs`, reached as `induscode::<module>`. The framework is reached as `indusagi::<module>`. The table groups the thirteen modules by concern.
+
+### Launch & lifecycle
+
+| Module | Responsibility |
+|--------|----------------|
+| [`launch`](/rust-cli/subsystems/launch) | The CLI front door: the single `FLAG_SPECS` table + `read_invocation` parser + `render_usage`, the `@file` `gather_attachments` inliner, the multi-account `DiskAuthVault` + `run_credential_command`, the three OAuth flows (Anthropic / OpenAI Codex / GitHub Copilot), the `ModelRegistry` catalog over `ModelCard`, and the picker data. |
+| [`boot`](/rust-cli/subsystems/boot) | The launch orchestrator: `boot_run`, the five-stage `BootPipeline`, the idempotent `apply_upgrades` registry, the total `RunnerRegistry` (`registry`/`select`), the `build_conductor` session factory, `resolve_startup_resources`, addon wiring, and `drain_closables`. |
+| `core` | The framework-agnostic leaf: the `BRAND` record (`app_name` `indusagi`, bins `["indus", "indusagi"]`, env prefix `INDUSAGI`, profile dir `.indusagi`, `env_profile_dir` `INDUSAGI_CODING_AGENT_DIR`), `VERSION` (compile-time), the pure `create_workspace`/`ensure_dirs` locator, the two-tier `PreferenceStore`, the `SessionLibrary`, the boot value contracts, and stdlib kit helpers. |
+
+### The session core
+
+| Module | Responsibility |
+|--------|----------------|
+| [`conductor`](/rust-cli/subsystems/conductor) | The `Conductor` over one framework agent loop. Owns the product `SessionSignal` stream, the persistent branchable transcript store, the model catalog/matcher, the permission gate (`create_permission_gate`, `GatedToolBox`), `PermissionMode` cycling, the post-edit `DiagnosticsEngine`, plan-mode, and `submit`/`snapshot`/`resume`. |
+| [`deck`](/rust-cli/subsystems/capability-deck) | The tooling layer: the `Capability` catalog, the `provision_deck(Profile, DeckContext)` assembler, the app-novel cards `app_novel_cards()` appends after the framework built-ins (todo / bg-process / task / saas / memory / the two plan-mode markers `enter_plan_mode`+`exit_plan_mode`), the `CheckpointingCard` write/edit wrapper, `DeckFramework` (read-state + checkpoint stores), and the event-sourced MCP bridge ledger (`load_mcp_config`, `attach_bridge_capabilities`). |
+| [`window_budget`](/rust-cli/subsystems/window-budget) | Context-window budgeting: token measurement, slice planning, and the conductor-consumable transcript condense engine that feeds `/compact` and auto-compaction. |
+| [`briefing`](/rust-cli/subsystems/briefing) | The declarative system-prompt pipeline (`compose_briefing_with_options` over `BriefingInput`/`ComposeOptions`/`ToolDoc`), the macro model, and the Agent-Skills card loader. |
+
+### Surfaces & I/O
+
+| Module | Responsibility |
+|--------|----------------|
+| [`console`](/rust-cli/console/overview) | The interactive ratatui shell: the pure console reducer, the [theme engine](/rust-cli/console/theming), the data-driven [slash-command catalog](/rust-cli/console/slash-commands), the input/intent/completion modules, the [overlay dialogs](/rust-cli/console/dialogs) (`/model`, `/resume`, `/login`, `/settings`, …), and `mount_console(conductor, MountConsoleOptions)`. |
+| [`channels`](/rust-cli/subsystems/channels) | The non-interactive channels: the `ChannelContext`/`LineSink`/`OneshotRequest`/`OneshotShape` carrier, `run_oneshot`, the declarative `session_ops` JSON-RPC registry + `dispatch`, the NDJSON `encode_line` framer, and the inert dialog. |
+| [`transcript_export`](/rust-cli/subsystems/transcript-export) | The HTML transcript publisher: the SGR-to-HTML painter, the WCAG-luminance theme bridge (pulldown-cmark + syntect), the page-shell template, and `publish_transcript`. |
+
+### Integrations & extension
+
+| Module | Responsibility |
+|--------|----------------|
+| [`runtime_bridge`](/rust-cli/subsystems/runtime-bridge) | Provider routing for external runtimes: the `bridge:<adapter>` endpoint convention, the provider-neutral normalized event union, the child-transport boundary, and the broker/route surface. |
+| [`addons`](/rust-cli/subsystems/addons) | The third-party customization contract: the addon manifest/surface, the colon-named hook taxonomy + dispatcher, the `ToolInterceptor` chain, addon-contributed tools (`AddonCommand`) and commands, and the module loader (wired into the deck by `boot::addon_wiring`). |
+| [`insight`](/rust-cli/subsystems/insight) | The observability plane: a thin wrapper over [framework tracing](/rust/subsystems) plus an in-memory collector sink and NDJSON replay readers. |
+
+The repl runner mounts the console behind the `tui` feature (on by default — `default = ["rustls", "mcp", "tui", "oauth"]`). The `console` and `addons` modules always compile (they are plain `pub mod`s in `lib.rs` with no `#[cfg]` gate); the `tui` feature does not strip them — it only forwards to the framework `indusagi/tui` render layer. What the feature gates is the `mount_repl` body: with `tui` it hands the conductor to `mount_console`'s live ratatui loop, and on a `--no-default-features` build it short-circuits to `EXIT_REPL_UNAVAILABLE` (`1`), so interactive runs need the `tui` build while one-shot/link still work. Three optional off-by-default features tune the build: `mimalloc` (global allocator), `swarm` (the boot delegate-runner stage bridging addon subagent profiles onto the deck delegate handle), and `composio` (the SaaS-action backend behind the `saas` card).
+
+## Where the Framework Begins
+
+induscode is built **on top of** the [indusagi framework](/rust) and links its published types rather than re-deriving them. The boundary is sharp and deliberate:
+
+- The **conductor** drives one framework agent loop (`indusagi::runtime`) and consumes its event stream internally; it re-emits a distinct product `SessionSignal` stream and never re-declares the framework's message/usage shapes. It also threads `indusagi::runtime::store::SessionStore` for persistence.
+- The **deck** projects `Capability` into the framework `indusagi::runtime::ToolBox` from [capabilities](/rust/subsystems/capabilities), so contributed tools feed the agent directly. MCP mounting goes through the framework client pool.
+- The **console** renders over the framework's [tui](/rust/ui) primitives — induscode contributes only the reducer, intent routing, autocomplete, overlay flows, and `mount_console`.
+- The **launch** layer builds on the framework gateway's PKCE/transport credential primitives (`indusagi::llmgateway::{build_auth_url, exchange_code, refresh_token, create_pkce_pair, …}`) and `indusagi::shell_app::auth_cli::{run_auth_command, CredentialStore}`; the model catalog reads `indusagi::llmgateway` `ModelCard`s.
+- The **boot** pipeline ports the framework template `indusagi::shell_app::boot::{Stage, run_stages, BootIo}` and `indusagi::shell_app::runners::{Runner, select_runner}`.
+- **State** lives under `~/.indusagi/` (resolved by `core::create_workspace`, honouring `INDUSAGI_CODING_AGENT_DIR`), sharing the framework's flat profile-dir convention.
+
+For the framework's own internal architecture — the LLM gateway, runtime, capabilities, and shell-app layers induscode sits above — see the [framework overview](/rust). For the other editions of the same agent, see the [Python CLI](/python-cli/architecture) and the [TypeScript CLI](/cli).

@@ -1,0 +1,257 @@
+# Testing
+
+> The `tests/` tree is the framework's full pytest suite — **1,349 collected
+> tests**, strictly network-free and credential-free. Run it from the package
+> root with `pytest`; configuration lives in `pyproject.toml`
+> (`asyncio_mode = "auto"`, `testpaths = ["tests"]`).
+
+The suite layout deliberately mirrors the package layout under `indusagi/`:
+one test subdirectory per subsystem (`agent`, `ai`, `capabilities`,
+`connectors`, `interop`, `llmgateway`, `mcp`, `react_ink`, `runtime`,
+`shell_app`, `smithy`, `swarm`, `tracing`, `tui`, `ui_bridge`), plus two
+root-level guards. Because of this, the test tree doubles as a map of the
+package's public surface — each directory imports only its sibling
+subpackage's public API.
+
+## Table of Contents
+
+- [Running the tests](#running-the-tests)
+- [Collection model](#collection-model)
+- [Coverage map](#coverage-map)
+- [Test-double strategy](#test-double-strategy)
+- [Root-level guards](#root-level-guards)
+- [Key concepts](#key-concepts)
+- [Why 1,349?](#why-1349)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Running the tests
+
+Install the package with its dev extras, then invoke `pytest` from the
+package root. `asyncio_mode = "auto"` means every `async def test_*` runs
+without an explicit `@pytest.mark.asyncio` decorator.
+
+```python
+# from the package root (pyproject.toml supplies testpaths + asyncio mode)
+# pytest                                     # all 1,349 tests
+# pytest tests/llmgateway                    # one subsystem (101 collected)
+# pytest tests/tui/test_keys.py              # one file
+# pytest --collect-only -q tests | tail -1   # -> "1349 tests collected"
+# pytest tests/ui_bridge -q                  # the Textual Pilot integration tests
+```
+
+No environment variables or API keys are required. Tests that exercise key
+resolution monkeypatch `os.environ` and never read real credentials; tests
+that exercise sessions open on-disk fixtures strictly read-only.
+
+## Collection model
+
+A few structural facts shape how collection works:
+
+- **No top-level `conftest.py`** and **no `__init__.py`** anywhere under
+  `tests/`. pytest uses rootdir-relative `sys.path` insertion, which is why
+  `tests/agent/` imports the sibling module `agent_suite_helpers` by bare
+  name (`from agent_suite_helpers import make_agent`).
+- **`asyncio_mode = "auto"`** — async tests need no marker.
+- The only per-directory `conftest.py` is `tests/mcp/conftest.py`, which
+  installs the in-memory MCP transport fixture.
+
+The **physical** test-function count is only ~470 (`def test_*` /
+`async def test_*`), but pytest **collects 1,349** because of heavy
+parametrization (see [Why 1,349?](#why-1349)).
+
+## Coverage map
+
+Per-directory collected counts (verified via `pytest --collect-only`):
+
+| Directory | Collected | Holds |
+|-----------|-----------|-------|
+| `tests/tui` | 444 | Pure-logic TUI modules: fuzzy scorer, terminal-key decoder, width/wrap/slice. Heavily parametrized over escape-sequence and grapheme corpora. |
+| `tests/llmgateway` | 101 | Catalog `get_card` + `estimate_cost`, full-catalog fallback + third-party routing, gateway dispatch over the mock, SSE/NDJSON streaming framer corpus (respx). |
+| `tests/ai` | 68 | `complete()`, stream event framing, `EventStream` multi-cursor replay, `ModelRegistry`, env API-key resolution. |
+| `tests/mcp` | 43 | `MCPClient` and `MCPClientPool` over in-memory transport + `memory` phantom-module parity. Owns the only `conftest.py`. |
+| `tests/agent` | 34 | `Agent.prompt`/`steer`, abort-salvage, stream framing, `create_*_tool` factories, `SessionManager` JSONL. Shares `agent_suite_helpers.py`. |
+| `tests/capabilities` | 28 | Tools over a real `tmp_path` sandbox + `make_local_context`, offline web-tool `is_error` contract, coding-collection membership, runner dispatch. |
+| `tests/shell_app` | 27 | Auth CLI (API-key-first), boot-pipeline flag consumption (`--system`/`--no-tools`/`--mcp`), assembled shell (tokenize, `Locator`, settings, `OneShotRunner`, `WireRunner`). |
+| `tests/smithy` | 23 | Agent-builder: `FlagReader`/`SmithyConfig`, `define_agent`, `build_interactive` over scripted `ask()`, `build_from_config`, `load_knowledge`. |
+| `tests/runtime` | 15 | Pure cadence FSM + `create_agent` with a scripted `ModelInvoker` (tool loop, abort, branch/resume, compaction). |
+| `tests/react_ink` | 12 | Diff renderer: line classification, gutter, context window, word-span pairing, theme-role paints (`theme_adapter` via `importorskip`). |
+| `tests/ui_bridge` | 10 | Textual TUI integration: `exit_transcript` renderer + `mount_interactive`, and end-to-end `InteractiveApp` Pilot tests over real `create_agent` + mock connector. |
+| `tests/connectors` | 8 | SaaS connector bridge over an in-memory mock `SaasBackend` (no vendor SDK/network). |
+| `tests/swarm` | 8 | Coordination kernel over `tmp_path`: `JsonCell` concurrency, `TicketBoard` deps/cycles, `Channel` cursors; scripted fake teammate `Agent`s. |
+| `tests/tracing` | 7 | Recorder -> channel -> sink flow, `RatioStrategy` sampling, `SecretScrubber` redaction, `trace_agent_run`; `FileSink` under `tmp_path`. |
+| `tests/interop` | 5 | Protocol bridge in-memory round-trip: `create_provider_host` + `create_server_endpoint` + `mount_protocol_bridge`. |
+| `tests/test_public_api.py` | 507 | Import-audit guard (see below). |
+| `tests/test_scaffold.py` | 9 | M0 smoke checks. |
+| `tests/fixtures/` | — | Single data fixture `ts_session_v3.jsonl` (no Python code). |
+
+Each subsystem directory maps to a documented page:
+[AI](/python/facades/ai), [Agent](/python/facades/agent),
+[MCP](/python/facades/mcp), [Memory](/python/facades/memory),
+[LLM Gateway](/python/subsystems/llm-gateway),
+[Runtime](/python/subsystems/runtime),
+[Capabilities](/python/subsystems/capabilities),
+[Interop](/python/subsystems/interop),
+[Connectors](/python/subsystems/connectors),
+[Swarm](/python/subsystems/swarm), [Smithy](/python/subsystems/smithy),
+[Tracing](/python/subsystems/tracing),
+[Shell App](/python/subsystems/shell-app), [TUI](/python/ui/tui),
+[react-ink](/python/ui/react-ink), [UI Bridge](/python/ui/ui-bridge).
+
+## Test-double strategy
+
+The double strategy is uniform and network-free across the whole suite.
+Three seam patterns recur.
+
+### The deterministic `mock` connector
+
+`agent`, `ai`, `llmgateway`, and `ui_bridge` bind to the catalog card
+**`mock-1`** (`indusagi.llmgateway.connectors.mock.MockConnector`) so that
+`gateway_stream` routes locally. The mock streams fixed text
+(`"Hello world"`, usage 8 in / 5 out) and a scripted echo tool call, making
+those runs fully deterministic without any network.
+
+### Scripted gateway / `ModelInvoker`
+
+When a test needs to drive the model's output, it replaces the live model
+with a pre-recorded list of `Emission`s replayed as a `Channel`:
+
+- `tests/agent` uses `agent_suite_helpers.GatewayScript`, which monkeypatches
+  the module-level `indusagi.agent.agent.gateway_stream` seam.
+- `tests/runtime` and `tests/shell_app` inject a scripted `ModelInvoker`
+  replayed as a `Channel` of `Emission`s.
+
+```python
+# pattern used across tests/agent via agent_suite_helpers.GatewayScript
+from agent_suite_helpers import make_agent, GatewayScript, done_reply, events_named
+
+
+async def test_prompt_runs_clean(monkeypatch):
+    script = GatewayScript([done_reply("pong")])
+    monkeypatch.setattr("indusagi.agent.agent.gateway_stream", script)
+    agent = make_agent()
+    await agent.prompt("ping")
+    assert events_named(agent, "message_end")
+```
+
+### In-memory MCP transport
+
+`tests/mcp` and `tests/interop` stand up a `create_provider_host` server half
+over the MCP SDK's `create_client_server_memory_streams` and reach it through
+`create_server_endpoint`. `tests/mcp/conftest.py` monkeypatches
+`indusagi.mcp.client.create_server_endpoint` to inject an in-memory session
+factory per server name.
+
+```python
+# tests/mcp use the conftest fixture to route a facade client onto an in-memory host
+from indusagi.mcp import MCPClient
+# conftest provides: install_transport, ping_tool, echo_tool, boom_tool, sleep_tool
+
+
+async def test_call_tool(install_transport):
+    install_transport({"srv": memory_session_factory([ping_tool()])})  # noqa: F821
+    client = MCPClient(...)
+    await client.connect()
+    result = await client.call_tool("ping", {})
+    assert any(b.get("text") == "pong" for b in result.content)
+```
+
+### HTTP, filesystem, and Textual
+
+- **HTTP wire tests** (`llmgateway` streaming/gateway/catalog-fallback) use
+  `respx` to mock `httpx`, exercising real SSE/NDJSON framing across chunk
+  boundaries, CRLF/LF/CR, and multibyte UTF-8 without a server.
+- **Filesystem suites** (`capabilities`, `swarm`, `smithy`, `tracing`) write
+  under pytest's `tmp_path` against the real local fs/shell backends rather
+  than stubs — genuine I/O paths, no network.
+- **Textual TUI tests** (`ui_bridge`) drive the real `InteractiveApp`
+  headless via `App.run_test()` / `Pilot`.
+- `react_ink/test_diff.py` guards an optional sibling with
+  `pytest.importorskip("indusagi.react_ink.theme_adapter")`.
+
+## Root-level guards
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `test_public_api.py` | guard | `tests/test_public_api.py` | Import-audit: parametrized `test_module_imports` over ~279 `pkgutil.walk_packages` modules, `test_every_all_name_resolves` over every `__all__` barrel, `test_public_barrels_declare_all` over a fixed `PUBLIC_BARRELS` list, `test_root_lazy_subsystem_aliases` (PEP 562 `indusagi._SUBSYSTEMS`), `test_connectors_import_without_composio`, and `test_user_journey_import` over 14 README/example import lines. |
+| `test_scaffold.py` | guard | `tests/test_scaffold.py` | M0 smoke: `indusagi.__version__`/`VERSION` exposed, `CancelToken`/`CancelledByToken` conventions, `_internal.env` helpers (`env_name`, `indusagi_home`). |
+| `agent_suite_helpers.py` | module | `tests/agent/agent_suite_helpers.py` | Shared agent harness: `make_agent`, `GatewayScript`, `done_reply`, `events_named`, `event_types`, `message_text`, `now_ms`. |
+| `conftest.py` | module | `tests/mcp/conftest.py` | MCP in-memory plumbing fixture `install_transport`; tool builders `ping_tool`/`echo_tool`/`boom_tool`/`sleep_tool`, `box_of`, `inert_context`, `texts()`. |
+| `ts_session_v3.jsonl` | fixture | `tests/fixtures/ts_session_v3.jsonl` | The only data fixture: an anonymized minimal session record set consumed by `agent/test_session_manager.py`. |
+
+`test_public_api.py` is the single guard that the whole tree imports cleanly
+and every barrel's `__all__` is honest. Its `PUBLIC_BARRELS` list and
+`USER_JOURNEY_IMPORTS` lines enumerate the canonical entry points for each
+subsystem, so it doubles as a living checklist of the
+[package exports](/python/reference/package-exports).
+
+```python
+import importlib
+import pkgutil
+import indusagi
+
+modules = {"indusagi"} | {
+    info.name
+    for info in pkgutil.walk_packages(indusagi.__path__, prefix="indusagi.")
+}
+for name in sorted(modules):
+    importlib.import_module(name)  # every module must import
+
+from indusagi.agent import Agent, create_coding_tools  # a USER_JOURNEY_IMPORTS line
+from indusagi.mcp import MCPClient, MCPClientPool       # another
+```
+
+## Key concepts
+
+| Term | Meaning |
+|------|---------|
+| **mock connector / `mock-1` card** | A deterministic in-process connector (`indusagi.llmgateway.connectors.mock`) bound to catalog card `mock-1`; streams fixed text and a scripted echo tool call. Makes `agent`/`ai`/`llmgateway`/`ui_bridge` runs network-free. |
+| **`gateway_stream` seam** | The module-level `from indusagi.llmgateway import stream as gateway_stream` in `indusagi.agent.agent` that agent tests monkeypatch (via `GatewayScript`) or route to the mock — the single injection point for scripting the model in the facade. |
+| **Scripted `ModelInvoker` / Channel of Emissions** | `runtime`/`shell_app`/`ui_bridge` replace the live model with a pre-recorded list of `Emission`s replayed as a `Channel`, so the conductor loop is fully deterministic. |
+| **In-memory MCP transport** | `create_client_server_memory_streams` links a `create_provider_host` server half to a `create_server_endpoint` client half in-process; `mcp/conftest.py` injects this per server name. |
+| **Import-audit guard** | `test_public_api.py`'s three guarantees: every `walk_packages` module imports, every `__all__` name resolves via `getattr`, and the exact README/example import lines keep working. |
+| **`tmp_path` golden tests** | `capabilities`/`swarm`/`smithy`/`tracing` run against a real on-disk sandbox and the genuine local fs/shell backends instead of stubs. |
+
+## Why 1,349?
+
+File size does not equal test count — equating the two is a trap. Two
+parametrization sources account for nearly the entire gap between ~470
+physical functions and 1,349 collected:
+
+1. **`test_public_api.py` (507 collected)** — `test_module_imports`
+   parametrizes over every module `pkgutil.walk_packages` discovers under
+   `indusagi` (~279 modules; the file's own tripwire asserts `>= 200`), plus
+   `test_every_all_name_resolves` over every barrel declaring `__all__` and 14
+   `USER_JOURNEY_IMPORTS`.
+2. **`tests/tui` (444 collected)** — `test_keys.py` (14 parametrize blocks)
+   and `test_text_width.py` (9 blocks) fan a small number of functions into
+   hundreds of cases over terminal escape-sequence and grapheme-width corpora.
+
+The suite is strictly **offline / no-credential**: env-key tests monkeypatch
+`os.environ` (never read real keys), and session tests open the smallest real
+on-disk session strictly read-only (never via `SessionManager.open`, which
+would rewrite a pre-v3 file).
+
+## Relationship to neighbors
+
+Cross-subsystem coupling shows up entirely in the harnesses:
+
+- `agent`, `ai`, and `llmgateway` share the deterministic `mock`/`mock-1`
+  connector card.
+- `mcp` and `interop` share the same MCP-SDK in-memory transport pattern;
+  `mcp/conftest.py` explicitly reuses interop's `create_provider_host`
+  approach.
+- `runtime`, `shell_app`, `agent`, and `ui_bridge` all script the model via a
+  Channel of `Emission`s / `ModelInvoker`, so the conductor loop runs
+  deterministically.
+- `ui_bridge` composes `runtime.create_agent` + the `llmgateway` mock + the
+  Textual app, making its tests the broadest integration tests in the suite.
+
+Several suites pin deliberate Python-side behaviors that are documented as
+intentional, not bugs: `shell_app/test_boot_flags.py` asserts that
+`--system`/`--no-tools`/`--mcp` actually take effect and that faulted MCP
+servers print to stderr; `shell_app/test_auth_cli.py` pins the API-key-first
+login path. For the full TS-vs-Python coverage story and the per-file
+"ported 1:1" vs "authored" provenance, see
+[Parity](/python/reference/parity). For the entry points enumerated by
+`PUBLIC_BARRELS`, see [Package exports](/python/reference/package-exports);
+for the high-level layering, see [Architecture](/python/architecture).

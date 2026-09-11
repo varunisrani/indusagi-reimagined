@@ -1,0 +1,511 @@
+# Settings
+
+> The 24-key user-preference surface an interactive `induscode` session reads at
+> startup and mutates while it runs — colour scheme, image/reasoning rendering,
+> default provider/model/thinking level, steering and follow-up delivery, the
+> double-escape action, extension packages, and the tool-permission policy. They
+> live in a two-tier JSON store (`induscode::core::settings::PreferenceStore`): a
+> per-checkout `.indusagi/settings.json` layered over the machine-wide
+> `~/.indusagi/agent/settings.json`, with the frozen `default_preferences()`
+> underneath. Locations come from the [workspace](/rust-cli/subsystems/boot)
+> layer and relocate with `INDUSAGI_CODING_AGENT_DIR`.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Module layout](#module-layout)
+- [Three-layer merge](#three-layer-merge)
+- [State locations](#state-locations)
+- [Environment overrides](#environment-overrides)
+- [The Preferences record](#the-preferences-record)
+- [Setting catalog](#setting-catalog)
+- [Narrow vocabularies](#narrow-vocabularies)
+- [The permission policy](#the-permission-policy)
+- [The PreferenceStore API](#the-preferencestore-api)
+- [On-disk format and tolerant loading](#on-disk-format-and-tolerant-loading)
+- [Reading and writing programmatically](#reading-and-writing-programmatically)
+- [Design notes](#design-notes)
+- [Where to go next](#where-to-go-next)
+
+## Overview
+
+`induscode::core::settings` is the single place every preference is named, typed,
+given a frozen default, and tied to its on-disk JSON spelling. It is part of the
+merged `induscode` product crate — folded into `induscode-core` (the `src/core/`
+tree) rather than kept as a standalone crate — and it builds on the framework's
+tolerant-load + 3-layer-merge *pattern*
+([`indusagi::shell_app::config`](/rust/subsystems/shell-app)'s
+`read_settings_file` / `normalize_settings` / `merge_layer`), but with the agent's
+own 24-key record and a writer the framework loader lacks. The reasoning-effort
+vocabulary `default_thinking_level` carries is reused directly from the framework:
+[`indusagi::llmgateway::contract::ThinkingLevel`](/rust).
+
+Every console surface and boot stage reads a guaranteed concrete value through the
+store rather than reaching into files directly. The store is constructed during
+[boot](/rust-cli/subsystems/boot) and threaded through to the
+[console](/rust-cli/console/overview) as a service, where overlay pickers (the
+`/settings` dialog) read and write it live.
+
+This is parity with the [TypeScript](/cli) `src/settings` subsystem (it ports
+`contract.ts` and `manager.ts`) and the [Python](/python-cli/configuration/settings)
+`induscode.settings` subpackage — the on-disk JSON is byte-compatible, but the
+Rust edition adds the 24th key (`permissions`) that the legacy 23-key Python doc
+predates.
+
+## Module layout
+
+The subsystem is two source files behind one barrel (`core/settings/mod.rs`):
+
+| Module | Path | Responsibility |
+|--------|------|----------------|
+| `contract` | `core/settings/contract.rs` | Pure shapes and defaults — the `Preferences` struct, `PermissionSettings`, the narrow vocab enums (`EscapeAction`, `DeliveryMode`, `PermissionMode`) with their alias folding, `default_preferences()`, and the `SETTING_KEYS` slice. No I/O. |
+| `store` | `core/settings/store.rs` | Filesystem — `PreferenceStore`, the two-tier reader/writer, `PreferenceLocations`, and the tolerant `load_tier` / `write_tier` / `overlay` helpers. |
+
+The barrel re-exports the runtime surface:
+
+```rust
+pub use contract::{
+    DeliveryMode, EscapeAction, PermissionMode, PermissionSettings, Preferences,
+    default_preferences,
+};
+pub use store::{PreferenceLocations, PreferenceStore};
+```
+
+## Three-layer merge
+
+A read resolves across three layers, **per key**, with the first tier that
+supplies a non-`None` value winning:
+
+1. **Project tier** — `<cwd>/.indusagi/settings.json` beside the working tree (one per checkout).
+2. **Global tier** — `<workspace.settings_path>`, normally `~/.indusagi/agent/settings.json` (one per machine).
+3. **Frozen defaults** — `default_preferences()`, where every one of the 24 keys carries a concrete `Some(..)` value.
+
+`PreferenceStore::resolved()` materializes the merge into a fully-populated
+`Preferences` (every field `Some`); `PreferenceStore::snapshot()` is its alias. The
+merge is performed by the private `overlay(base, higher)` helper, which copies each
+`Some` field of `higher` over `base` and leaves `base` showing through where
+`higher` is `None`:
+
+```rust
+pub fn resolved(&self) -> Preferences {
+    let mut out = default_preferences();
+    overlay(&mut out, &self.global_tier);
+    overlay(&mut out, &self.project_tier);
+    out
+}
+```
+
+The merge is **idempotent**: feeding a resolved snapshot back through a tier and
+re-merging is a no-op (every key is already present), which is the property the
+Verify golden test pins. A write through `stage(..)` + `save()` lands in the
+**project tier only** — the global file is read but never rewritten, so a
+per-checkout change can never leak machine-wide. Because the defaults are fully
+populated, a caller of `snapshot()` always receives a concrete value and never
+branches on `None`.
+
+## State locations
+
+The two file paths come from the [workspace](/rust-cli/subsystems/boot) locator
+(`induscode::core::workspace::create_workspace`), which folds a data-defined layout
+onto a resolved profile root. The coding agent nests its state **one level deeper**
+than the framework `Locator`: the profile root is `<home>/.indusagi/agent` (from
+`BRAND.profile_dir_name = ".indusagi"` + `BRAND.state_dir_name = "agent"`), so with
+no overrides the global tier is `~/.indusagi/agent/settings.json`. Other per-user
+state shares the same root:
+
+| `Workspace` field | Default location | Holds |
+|-------------------|------------------|-------|
+| `profile_dir` | `~/.indusagi/agent/` | The root of all per-user agent state |
+| `settings_path` | `~/.indusagi/agent/settings.json` | The global preference tier |
+| `auth_path` | `~/.indusagi/agent/auth.json` | Stored credentials |
+| `sessions_dir` | `~/.indusagi/agent/sessions/` | Persisted transcripts |
+| `models_path` | `~/.indusagi/agent/models.json` | Custom model-catalog overrides |
+| `mcp_config_path` | `~/.indusagi/agent/mcp-servers.json` | External MCP servers |
+| `themes_dir` | `~/.indusagi/agent/themes/` | User-installed colour themes |
+| `prompts_dir` | `~/.indusagi/agent/prompts/` | User-authored prompt/command templates |
+| `memory_db_path` | `~/.indusagi/agent/memory.db` | On-disk memory database |
+
+The project tier is always `<cwd>/.indusagi/settings.json` — note it sits directly
+under `.indusagi` (no `agent/` segment) because `PreferenceStore::from_workspace`
+joins `BRAND.profile_dir_name` only:
+
+```rust
+pub fn from_workspace(workspace: &Workspace, cwd: &Path) -> Self {
+    Self::at_paths(PreferenceLocations {
+        global: workspace.settings_path.clone(),
+        project: cwd.join(BRAND.profile_dir_name).join("settings.json"),
+    })
+}
+```
+
+The project tier is **not** relocated by the environment overrides below, which only
+move the profile root (the global tier and the rest of the state directory).
+
+## Environment overrides
+
+The profile root resolves by a fixed precedence ladder in
+`workspace::resolve_profile_root`, pure (no filesystem access at resolution time):
+
+| Variable | Effect | Precedence |
+|----------|--------|------------|
+| `INDUSAGI_CODING_AGENT_DIR` | Agent-specific override; its value **is** the profile dir | Highest |
+| _(unset)_ | `<home>/.indusagi/agent` | Default |
+
+The override env var name is single-sourced from `BRAND.env_profile_dir`. Its value
+is `~`-expanded (`~` → home, `~/...` → home-relative) and, when relative, resolved
+against the working directory; an absolute path passes through. A blank /
+whitespace-only value is treated as absent (matching the TS `?.trim()` gate).
+
+```bash
+# Relocate all per-user agent state (settings, auth, sessions, …) for one shell
+export INDUSAGI_CODING_AGENT_DIR=/srv/induscode-state
+indusr --version
+
+# A tilde override is home-anchored
+export INDUSAGI_CODING_AGENT_DIR=~/work/induscode-home
+indusagir
+```
+
+Unlike the framework `Locator` (which honours `INDUSAGI_HOME`), the coding agent
+reads only `INDUSAGI_CODING_AGENT_DIR` for its profile root. The bins are `indusr`
+and `indusagir`; the live brand is whichever name the OS launched under.
+
+## The Preferences record
+
+`Preferences` is a flat struct of 24 fully-optional fields, `#[serde(rename_all =
+"camelCase")]` with `#[serde(skip_serializing_if = "Option::is_none")]` on every
+field. `None` plays the "key not present" role, so the empty record, a sparse
+project override, and a fully-populated global file are all legal values — a `None`
+is omitted from the JSON rather than written as `null`.
+
+```rust
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub colour_scheme: Option<String>,
+    // … 22 more fields …
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<PermissionSettings>,
+}
+```
+
+The fallback for every key comes from `default_preferences() -> Preferences` (a
+function, not a `const`, because it owns heap data — `Vec`s and a nested struct).
+Every field is `Some(..)`, which is what lets `snapshot()` resolve a guaranteed
+result.
+
+## Setting catalog
+
+All 24 keys, with their Rust field name, the camelCase JSON spelling
+(`SETTING_KEYS`), the field type, the `default_preferences()` value, and what each
+controls:
+
+| Field (snake_case) | JSON key (camelCase) | Type | Default | Controls |
+|--------------------|----------------------|------|---------|----------|
+| `colour_scheme` | `colourScheme` | `Option<String>` | `"default"` | Named [colour scheme](/rust-cli/console/theming) the console renders with |
+| `show_images` | `showImages` | `Option<bool>` | `true` | Whether inline image content is rendered in the transcript |
+| `show_reasoning` | `showReasoning` | `Option<bool>` | `true` | Whether the model's reasoning text is shown as it streams |
+| `hide_thinking` | `hideThinking` | `Option<bool>` | `false` | When true, the reasoning block is folded away even if the model emits one |
+| `image_auto_resize` | `imageAutoResize` | `Option<bool>` | `true` | Whether oversized images are shrunk to fit before being handed to a provider |
+| `block_images` | `blockImages` | `Option<bool>` | `false` | When true, image content is withheld from providers entirely |
+| `enable_skill_commands` | `enableSkillCommands` | `Option<bool>` | `true` | Whether discovered skills are surfaced as their own slash commands |
+| `steering_mode` | `steeringMode` | `Option<DeliveryMode>` | `DeliveryMode::All` | How queued steering corrections are released back into the run |
+| `follow_up_mode` | `followUpMode` | `Option<DeliveryMode>` | `DeliveryMode::All` | How queued follow-up prompts are released back into the run |
+| `collapse_changelog` | `collapseChangelog` | `Option<bool>` | `false` | Prefer a condensed changelog after the console updates itself |
+| `show_hardware_cursor` | `showHardwareCursor` | `Option<bool>` | `false` | Reveal the terminal's own cursor instead of the software-drawn caret |
+| `editor_padding_x` | `editorPaddingX` | `Option<i64>` | `1` | Horizontal padding, in columns, around the prompt editor |
+| `enabled_models` | `enabledModels` | `Option<Vec<String>>` | `[]` | Glob / id patterns selecting which models appear in the picker; empty means all |
+| `default_provider` | `defaultProvider` | `Option<String>` | `"anthropic"` | Provider id the session defaults to when none is named |
+| `default_model` | `defaultModel` | `Option<String>` | `""` | Model id the session opens with under `default_provider` |
+| `default_thinking_level` | `defaultThinkingLevel` | `Option<ThinkingLevel>` | `ThinkingLevel::Medium` | Reasoning effort the session requests by default |
+| `quiet_startup` | `quietStartup` | `Option<bool>` | `false` | Suppress the banner / tips shown on a normal interactive launch |
+| `last_seen_version` | `lastSeenVersion` | `Option<String>` | `""` | The last product version whose full masthead the user has already seen |
+| `logo_sweep` | `logoSweep` | `Option<bool>` | `false` | Opt-in static colour-sweep flourish tinting the startup wordmark / emblem |
+| `reduced_motion` | `reducedMotion` | `Option<bool>` | `false` | When set, motion-flavoured flourishes are suppressed |
+| `auto_compact` | `autoCompact` | `Option<bool>` | `true` | Whether the [window-budget](/rust-cli/subsystems/window-budget) manager compacts the transcript automatically |
+| `double_escape_action` | `doubleEscapeAction` | `Option<EscapeAction>` | `EscapeAction::Clear` | What a double-tap of the escape key does in the console |
+| `extension_packages` | `extensionPackages` | `Option<Vec<String>>` | `[]` | Extension-package sources the [launcher](/rust-cli/subsystems/launch) installs and loads |
+| `permissions` | `permissions` | `Option<PermissionSettings>` | empty allow-all policy | The declarative tool-permission policy (see below) |
+
+A few semantic notes: `enabled_models` is a set of glob/id patterns selecting which
+models the picker shows (empty means all); `auto_compact` governs whether the
+window-budget manager compacts the transcript automatically; `last_seen_version`
+auto-condenses the startup banner once it equals the running version (which is
+`env!("CARGO_PKG_VERSION")`, single-sourced through `workspace::VERSION`).
+
+The frozen `SETTING_KEYS` slice is the iteration/validation surface — the same 24
+camelCase spellings, in declaration order — and a unit test asserts that serializing
+`default_preferences()` emits exactly these keys with none skipped.
+
+## Narrow vocabularies
+
+Three small enums pin the values a few keys may hold. Each derives `Serialize` /
+`Deserialize`, exposes an `as_str()` (the on-disk spelling) and a `parse(raw: &str)`
+guard, and carries a frozen slice of the canonical variants for menus. Two of them
+also fold legacy aliases.
+
+### `EscapeAction` — the double-escape action
+
+```rust
+#[serde(rename_all = "lowercase")]
+pub enum EscapeAction { Tree, Fork, Clear, Rewind, Branch }
+```
+
+| Variant | JSON | Effect |
+|---------|------|--------|
+| `Tree` | `"tree"` | Open the turn history as a navigable tree of branches |
+| `Fork` | `"fork"` | Open the prior-turn picker to branch off an earlier turn |
+| `Clear` | `"clear"` | Wipe the composer buffer (the default) |
+| `Rewind` | `"rewind"` | Legacy alias — `fold()` maps it to `Fork` |
+| `Branch` | `"branch"` | Legacy alias — `fold()` maps it to `Tree` |
+
+`ESCAPE_ACTIONS` is the canonical menu slice `&[Tree, Fork, Clear]` — the two legacy
+aliases are accepted on read and round-trip byte-for-byte, but are never offered.
+`EscapeAction::fold()` collapses a stored alias onto its canonical action
+(`Rewind → Fork`, `Branch → Tree`) before a console surface acts on it.
+
+### `DeliveryMode` — pending-turn draining
+
+```rust
+#[serde(rename_all = "lowercase")]
+pub enum DeliveryMode { All, #[serde(rename = "one-at-a-time")] OneAtATime }
+```
+
+| Variant | JSON | Effect |
+|---------|------|--------|
+| `All` | `"all"` | Release every queued turn at once on the next handoff |
+| `OneAtATime` | `"one-at-a-time"` | Release a single queued turn per handoff |
+
+`DELIVERY_MODES` is the slice `&[All, OneAtATime]`. Both `steering_mode` and
+`follow_up_mode` use this vocabulary.
+
+### `ThinkingLevel` — reasoning effort
+
+`default_thinking_level` is typed by `indusagi::llmgateway::contract::ThinkingLevel`,
+re-exported from the [framework LLM gateway](/rust) rather than re-declared, so the
+agent and the UI speak the same words. The default is `ThinkingLevel::Medium`.
+
+## The permission policy
+
+The 24th key, `permissions`, is the declarative tool-permission policy a session
+reads at startup. It is additive and backward-compatible: an install with no
+`permissions` block resolves to the empty allow-all baseline and behaves exactly as
+it did before the gate existed.
+
+```rust
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ask: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deny: Option<Vec<String>>,
+    #[serde(rename = "defaultMode", skip_serializing_if = "Option::is_none")]
+    pub default_mode: Option<PermissionMode>,
+}
+```
+
+| Field | JSON | Meaning |
+|-------|------|---------|
+| `allow` | `allow` | Rule strings that auto-allow a matching tool call (lowest precedence) |
+| `ask` | `ask` | Rule strings that force a matching tool call to prompt for approval |
+| `deny` | `deny` | Rule strings that hard-block a matching tool call (highest precedence) |
+| `default_mode` | `defaultMode` | The `PermissionMode` the session opens in when no flag overrides it |
+
+Across tiers the rule lists are concatenated and resolved `deny > ask > allow`. The
+raw-tier accessors (`global_defaults()`, `project_overrides()`) expose each tier's
+`permissions` separately so a consumer can do the cross-tier concat itself rather
+than reading only the merged value.
+
+`PermissionMode` enumerates how aggressively the gate auto-allows:
+
+```rust
+pub enum PermissionMode {
+    #[serde(rename = "default")]      Default,
+    #[serde(rename = "acceptEdits")]  AcceptEdits,
+    #[serde(rename = "bypass")]       Bypass,
+    #[serde(rename = "plan")]         Plan,
+    #[serde(rename = "bypassPermissions")] BypassPermissions,
+}
+```
+
+| Variant | JSON | Effect |
+|---------|------|--------|
+| `Default` | `"default"` | Consult the allow/ask/deny rules; read-only tools auto-allow (the default mode) |
+| `AcceptEdits` | `"acceptEdits"` | Additionally auto-allow filesystem edits/writes |
+| `Bypass` | `"bypass"` | Allow every tool with no prompt (the unsafe "trust all" mode) |
+| `Plan` | `"plan"` | Deny every mutating tool outright (read-only research only) |
+| `BypassPermissions` | `"bypassPermissions"` | Legacy alias — `fold()` maps it to `Bypass` |
+
+`PERMISSION_MODES` is the canonical menu slice `&[Default, AcceptEdits, Bypass,
+Plan]`; the `bypassPermissions` alias is accepted on read, round-trips byte-for-byte,
+and `PermissionMode::fold()` collapses it onto `Bypass`. The baseline
+`default_preferences()` policy is `{ allow: [], ask: [], deny: [], defaultMode:
+"default" }`.
+
+## The PreferenceStore API
+
+`PreferenceStore` holds both tiers in memory. Construct it via `at_paths` (pin both
+files, as tests do) or `from_workspace` (the runtime path boot uses).
+
+```rust
+pub struct PreferenceStore {
+    locations: PreferenceLocations,
+    global_tier: Preferences,
+    project_tier: Preferences,
+}
+```
+
+| Method | Signature | Purpose |
+|--------|-----------|---------|
+| `at_paths` | `fn at_paths(locations: PreferenceLocations) -> Self` | Pin both tier files to explicit absolute paths; neither need exist yet. Loads both tiers immediately. |
+| `from_workspace` | `fn from_workspace(workspace: &Workspace, cwd: &Path) -> Self` | Resolve the global tier from `workspace.settings_path` and the project tier from `<cwd>/.indusagi/settings.json` |
+| `paths` | `fn paths(&self) -> PreferenceLocations` | The two resolved file locations the store reads and writes |
+| `reload` | `fn reload(&mut self)` | Re-read both tiers from disk, discarding any unsaved staged change |
+| `resolved` | `fn resolved(&self) -> Preferences` | The fully-resolved record (default ← global ← project), every field `Some` |
+| `snapshot` | `fn snapshot(&self) -> Preferences` | Alias for `resolved`, matching the TS `snapshot` name |
+| `project_overrides` | `fn project_overrides(&self) -> &Preferences` | The raw in-memory project tier (the keys a checkout overrides) |
+| `global_defaults` | `fn global_defaults(&self) -> &Preferences` | The raw in-memory global tier (machine-wide keys) |
+| `stage` | `fn stage(&mut self, mutate: impl FnOnce(&mut Preferences))` | Mutate the in-memory **project** tier in a closure; set a field to `Some(..)` to override or `None` to clear. Does not touch disk. |
+| `save` | `fn save(&self) -> std::io::Result<()>` | Persist the staged project tier to its file as pretty JSON; the global file is never rewritten |
+
+`PreferenceLocations` is the resolved pair of absolute paths:
+
+```rust
+pub struct PreferenceLocations {
+    pub global: PathBuf,    // machine-wide tier
+    pub project: PathBuf,   // per-checkout tier
+}
+```
+
+Unlike the TS/Python store, the Rust writer is a **closure-based `stage`**: instead
+of a `set(key, value)` string API there is a typed mutator over the project tier, so
+a typo is a compile error rather than a runtime `KeyError`.
+
+## On-disk format and tolerant loading
+
+The store holds both tiers in memory as `Preferences` and serializes the project
+tier with `serde_json::to_string_pretty`, appending a trailing newline. A saved file
+is plain pretty JSON keyed by the camelCase wire names:
+
+```json
+{
+  "colourScheme": "midnight",
+  "showReasoning": false,
+  "editorPaddingX": 2,
+  "enabledModels": ["claude-*", "gpt-4o"]
+}
+```
+
+`write_tier` creates the parent directory (`create_dir_all`) before writing, so a
+first-ever `save()` into a fresh `.indusagi/` works. Loading is deliberately
+tolerant — `load_tier` degrades to `Preferences::default()` (the empty record) on
+every failure rather than erroring, so one mangled settings file never blocks
+startup:
+
+```rust
+fn load_tier(file_path: &Path) -> Preferences {
+    let Ok(raw) = std::fs::read_to_string(file_path) else {
+        return Preferences::default();
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Preferences::default();
+    };
+    if !value.is_object() {
+        return Preferences::default();
+    }
+    serde_json::from_value::<Preferences>(value).unwrap_or_default()
+}
+```
+
+The four degradation paths are: a missing/unreadable file, JSON that fails to parse,
+a JSON value that is not an object (array, number, `null`), and a parse into
+`Preferences` that fails. Unknown keys are tolerated and dropped (there is no
+`#[serde(deny_unknown_fields)]`). A JSON `null` for a field deserializes to `None`
+(treated as "key not present"). Note the empty-record fallback uses
+`Preferences::default()`, **not** `default_preferences()` — a degraded tier supplies
+*nothing* and lets the lower tier (or the populated default) show through.
+
+## Reading and writing programmatically
+
+Build the store the way boot does — from the resolved workspace and cwd:
+
+```rust
+use induscode::core::settings::PreferenceStore;
+use induscode::core::workspace::{create_workspace, WorkspaceOverrides};
+use std::path::Path;
+
+let ws = create_workspace(WorkspaceOverrides::default()); // resolves ~/.indusagi/agent
+let store = PreferenceStore::from_workspace(&ws, Path::new("."));
+// global tier  = ws.settings_path             (~/.indusagi/agent/settings.json)
+// project tier = ./.indusagi/settings.json
+
+let snap = store.snapshot();
+let scheme = snap.colour_scheme.unwrap();          // "default" if neither tier sets it
+let level = snap.default_thinking_level.unwrap();  // ThinkingLevel::Medium fallback
+```
+
+A console overlay (the `/settings` dialog) stages and persists live; `stage` mutates
+the project tier in a closure, and `save` flushes **only** `./.indusagi/settings.json`:
+
+```rust
+let mut store = PreferenceStore::from_workspace(&ws, Path::new("."));
+store.stage(|p| {
+    p.colour_scheme = Some("midnight".to_string());
+    p.editor_padding_x = Some(2);
+    p.enabled_models = Some(vec!["claude-*".to_string()]);
+});
+store.save()?;   // writes the project tier only; global is never touched
+```
+
+Clearing an override stages it back to `None`, falling through the tiers, and
+`reload` discards an unsaved staged change:
+
+```rust
+use induscode::core::settings::{PreferenceLocations, PreferenceStore};
+use std::path::PathBuf;
+
+let mut store = PreferenceStore::at_paths(PreferenceLocations {
+    global: PathBuf::from("/tmp/global.json"),
+    project: PathBuf::from("/tmp/proj.json"),
+});
+store.stage(|p| p.show_reasoning = Some(false)); // stages into the project tier
+store.save()?;                                    // writes {"showReasoning": false}
+store.stage(|p| p.show_reasoning = None);         // clears the override → back to default true
+assert_eq!(store.snapshot().show_reasoning, Some(true));
+```
+
+## Design notes
+
+- **`None`-clears semantics.** Setting a project-tier field to `None` via `stage`
+  clears the override so the value falls back to global/default on the next read; a
+  `None` is omitted from the JSON (`skip_serializing_if`) rather than written as
+  `null`.
+- **Project-only writes.** `save()` flushes the project tier exclusively. The global
+  file is read but never rewritten by the store, so a checkout cannot mutate
+  machine-wide preferences. A unit test asserts the global path is never even created
+  by a project-tier `save`.
+- **Typed mutator, not a string setter.** The Rust edition replaces the TS/Python
+  `set(key, value)` dual-spelling string API with a closure over `Preferences`, so an
+  unknown key is impossible — the compiler is the validator.
+- **Fully-populated default.** `default_preferences()` carries a concrete `Some(..)`
+  for all 24 keys (a unit test serializes it and asserts it emits exactly
+  `SETTING_KEYS`), which is what lets `snapshot()` always resolve a guaranteed value.
+- **Idempotent merge.** Re-feeding a resolved snapshot through any tier and
+  re-merging is a no-op — the Verify golden property; the heap-owning default is a
+  `fn` not a `const` because it owns `Vec`s and a nested `PermissionSettings`.
+- **Alias byte-fidelity.** Stored legacy aliases (`"rewind"`, `"branch"`,
+  `"bypassPermissions"`) round-trip byte-for-byte through serde and are folded to
+  their canonical variant only at the point of use via `fold()`, never on disk.
+
+## Where to go next
+
+- [Console Overview](/rust-cli/console/overview) — the surfaces that toggle these preferences live
+- [Theming](/rust-cli/console/theming) — what `colour_scheme` selects
+- [Boot](/rust-cli/subsystems/boot) — where the store is constructed and threaded through
+- [Window Budget](/rust-cli/subsystems/window-budget) — the engine `auto_compact` governs
+- [Launch](/rust-cli/subsystems/launch) — the launcher that installs `extension_packages`
+- [Framework shell-app config](/rust/subsystems/shell-app) — the tolerant-load + merge pattern this builds on
+- [Python edition](/python-cli/configuration/settings) and [TS edition](/cli) — the 23-key lineage this ports from (Rust adds the 24th `permissions` key)

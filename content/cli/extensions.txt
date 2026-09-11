@@ -1,0 +1,397 @@
+> indusagi can create addons. Ask it to build one for your use case.
+
+# Extensions (Addons)
+
+Addons are locally-authored TypeScript modules that graft custom tools, slash
+commands, lifecycle observers, and tool-boundary interceptors onto a running
+session. They are the single typed seam between the coding agent and code that
+does not ship with it.
+
+The implementation lives in `indus-code-rebuild/src/addons`, which is the
+`indusagi-coding-agent` package. The coding-agent package exposes each subsystem as
+a namespace from its root barrel (`src/index.ts`), so addon types and the host are
+imported as `addons.*` from `indusagi-coding-agent`:
+
+```typescript
+import { addons } from "indusagi-coding-agent";
+// addons.AddonManifest, addons.AddonSurface, addons.createAddonHost, …
+```
+
+> **Packaging note:** the namespace barrel is `src/index.ts` (the package's
+> `types` entry, `dist/types/index.d.ts`), so the `addons.*` / `capabilityDeck.*`
+> names type-check exactly as shown. The package ships no `exports` map and its
+> runtime `main` is the CLI entry (`dist/entry.js`), which does not re-export the
+> library surface — to *run* these snippets against the barrel at runtime, import
+> the built barrel directly (`indusagi-coding-agent/dist/index.js`).
+
+(The `BUNDLED_NAMESPACES` an addon may `import` — `indusagi/agent`, `indusagi/ai`,
+`indusagi/tui`, `@sinclair/typebox` — are subpaths of the separate `indusagi`
+*framework* package; see [Available Imports](#available-imports).) Every type and
+function named below is defined in `src/addons/contract.ts` and the behavior modules
+beside it.
+
+> **Status:** The addon *engine* is fully implemented and unit-tested
+> (`src/addons/addons.test.ts`), but it is **not yet wired into the boot/conductor
+> flow** — `createAddonHost` is exported but never called by the CLI runner. There
+> is currently no `--extension`/`-e` flag and no auto-discovery at launch. Treat
+> this page as the API reference for the addon contract; see
+> [loading-extensions](loading-extensions.md) for the wiring status and
+> `FEATURE_GAP_ROADMAP.md` for the broader gap analysis.
+
+**Key capabilities:**
+- **Custom tools** — register an LLM-callable `AddonTool` via `surface.addTool()`
+- **Slash commands** — register a `/name` command via `surface.addCommand()`
+- **Lifecycle hooks** — subscribe `observe` / `transform` / `gate` middleware to
+  colon-named events via `surface.on()`
+- **Tool-boundary interception** — rewrite a tool's args or result, or block the
+  call, via `surface.interceptTool()`
+
+## Table of Contents
+
+- [Design Stance](#design-stance)
+- [Addon Module Shape](#addon-module-shape)
+- [Available Imports](#available-imports)
+- [The Registration Surface](#the-registration-surface)
+- [Contributing Tools](#contributing-tools)
+- [Contributing Commands](#contributing-commands)
+- [Hooks: the Event Taxonomy](#hooks-the-event-taxonomy)
+- [Tool Interceptors](#tool-interceptors)
+- [Loading and Folding](#loading-and-folding)
+- [Faults](#faults)
+- [Exports Reference](#exports-reference)
+
+## Design Stance
+
+The addon contract makes three deliberate choices, documented in
+`src/addons/contract.ts`:
+
+1. **Return-a-manifest registration.** An addon's `register` is handed an
+   `AddonSurface` and *records* its intent — it does not mutate any global runtime.
+   The host reads the recorded `RegisteredManifest` back out and folds it into one
+   shared registry. Registration is a pure description of capability.
+2. **One unified event model.** Lifecycle observation, payload transformation, and
+   veto are a single `EventDispatcher` of colon-named `HookEvent`s. Each handler is
+   one of three middleware kinds — `observe`, `transform`, or `gate`. There is no
+   second parallel "hooks" system.
+3. **A tool-boundary pipeline.** The per-tool interception path is an ordered
+   `InterceptorChain` of `ToolInterceptor` stages with `enter`/`exit` hooks, applied
+   as a reduce (enter forward, exit reverse) — not a nested-if tool wrapper.
+
+## Addon Module Shape
+
+An addon is a plain object (its `default` export, or the module namespace itself)
+that exposes a single `register` entry point, matching the `AddonManifest`
+interface:
+
+```typescript
+import type { addons } from "indusagi-coding-agent";
+
+const addon: addons.AddonManifest = {
+  id: "my-addon",          // optional; the host derives one from the path if absent
+  version: "1.0.0",        // optional; surfaced in diagnostics
+
+  register(surface: addons.AddonSurface): void | Promise<void> {
+    // record contributions onto `surface` here
+  },
+};
+
+export default addon;
+```
+
+The module loader (`src/addons/sandbox.ts`) accepts the module when it (or its
+`default` export) is an object with a callable `register`; `id` and `version` are
+copied through only when they are strings. Throwing inside `register` is captured
+as an `AddonFault` and never crashes the host.
+
+## Available Imports
+
+In a compiled single-file binary an addon cannot resolve `import "indusagi/agent"`
+against `node_modules`. The sandbox bridges a fixed set of framework specifiers —
+the `BUNDLED_NAMESPACES` — into the addon's module graph, so the addon shares the
+host's exact module instances (via jiti's `virtualModules` in a binary, or
+resolved `alias` paths under Node):
+
+```typescript
+export const BUNDLED_NAMESPACES = [
+  "indusagi/agent",
+  "indusagi/ai",
+  "indusagi/tui",
+  "@sinclair/typebox",
+] as const;
+```
+
+These four specifiers are the imports an addon may rely on being resolvable.
+Importing anything else falls back to normal jiti module resolution.
+
+## The Registration Surface
+
+`register` receives an `AddonSurface` scoped to the addon. Every method *records*
+a contribution; nothing is dispatched at registration time. The surface shape
+(`src/addons/contract.ts`, realized in `src/addons/surface.ts`):
+
+```typescript
+interface AddonSurface {
+  readonly id: AddonId;
+
+  on<TPayload>(event: HookEvent, handler: HookHandler<TPayload>): void;
+
+  interceptTool(
+    name: string | "*",
+    interceptor: Omit<ToolInterceptor, "match" | "addon">,
+  ): void;
+
+  addCommand(name: string, handler: Omit<AddonCommand, "name" | "addon">): void;
+
+  addTool(card: AddonTool): void;
+
+  readonly handles: FrameworkHandles;
+
+  manifest(): RegisteredManifest;
+}
+```
+
+`surface.handles` is a `FrameworkHandles` bag of controlled callbacks the addon
+may act through instead of importing agent internals. Every handle is optional — a
+print/JSON run supplies fewer than an interactive TUI:
+
+```typescript
+interface FrameworkHandles {
+  sendMessage?: (text: string) => void | Promise<void>;
+  setModel?: (id: string) => void | Promise<void>;
+  setThinking?: (level: ThinkingLevel) => void;
+  render?: (component: Component) => void;       // absent outside interactive mode
+  exec?: (command: string) => Promise<ExecOutcome>;
+}
+```
+
+## Contributing Tools
+
+`AddonTool` is an alias of the framework `AgentTool`, so an addon *supplies* one
+rather than wrapping it. The model can then call it like any built-in tool:
+
+```typescript
+import type { addons } from "indusagi-coding-agent";
+import { Type } from "@sinclair/typebox";
+
+const addon: addons.AddonManifest = {
+  id: "greeter",
+  register(surface: addons.AddonSurface) {
+    surface.addTool({
+      name: "greet",
+      label: "Greet",
+      description: "Greet someone by name.",
+      parameters: Type.Object({
+        name: Type.String({ description: "Name to greet" }),
+      }),
+      async execute(_toolCallId, params, _signal) {
+        return {
+          content: [{ type: "text", text: `Hello, ${params.name}!` }],
+          details: {},
+        };
+      },
+    });
+  },
+};
+
+export default addon;
+```
+
+Two addons that claim the same tool `name` conflict — the first wins, the second
+is dropped as an `AddonFault` of kind `"conflict"`.
+
+## Contributing Commands
+
+A command is invoked by the user (never the model), by name without a leading
+slash. Its `run` receives a `CommandContext` (`args`, `cwd`, `handles`):
+
+```typescript
+import type { addons } from "indusagi-coding-agent";
+
+const addon: addons.AddonManifest = {
+  id: "hello-cmd",
+  register(surface) {
+    surface.addCommand("hello", {
+      summary: "Say hello",
+      async run(ctx) {
+        await ctx.handles.sendMessage?.(`Hello ${ctx.args || "world"}!`);
+      },
+    });
+  },
+};
+
+export default addon;
+```
+
+The host reserves a small set of core command names addon commands may not shadow:
+`help`, `quit`, `exit`, `clear`, `model`, `compact` (`RESERVED_ACTION_NAMES` in
+`src/addons/host.ts`). A command that collides with one of those, or with an
+earlier addon's command, is rejected as a `"conflict"` fault.
+
+## Hooks: the Event Taxonomy
+
+A single colon-named `HookEvent` vocabulary covers observation, transformation,
+and veto. The full set (`src/addons/contract.ts`):
+
+| Event | Guards a step? | Use |
+|-------|----------------|-----|
+| `session:start` / `session:end` | no | a session opened / closed |
+| `turn:start` / `turn:end` | no | an assistant turn began / settled |
+| `tool:before` | **yes** | straddle a tool execution (block the call) |
+| `tool:after` | no | observe/transform a tool result |
+| `chat:params` | no | the model request options are being built |
+| `chat:message` | no | an assistant message was assembled |
+| `shell:env` | no | the environment for a shell action is being prepared |
+| `input:submit` | **yes** | user input entering the loop (drop the turn) |
+| `context:build` | no | the message context is being assembled |
+| `compact:build` | no | the transcript condense input is being built |
+| `compact:before` | **yes** | the transcript is about to be condensed |
+
+The "guards" column is the *reserved* (gate-bearing) set. It is **data-sourced**
+from the `EVENT_TRAITS` table in `src/addons/dispatch/event-dispatcher.ts`, not a
+hand-maintained literal; `AddonEventDispatcher.reserved` exposes it.
+
+A handler picks one of three `HookKind`s:
+
+```typescript
+type HookHandler<TPayload> =
+  | { kind: "observe";   run(p: TPayload): void | Promise<void> }
+  | { kind: "transform"; run(p: TPayload): TPayload | Promise<TPayload> }
+  | { kind: "gate";      run(p: TPayload): GateDecision | void | Promise<GateDecision | void> };
+```
+
+Example — observe session start, gate a dangerous shell command:
+
+```typescript
+import type { addons } from "indusagi-coding-agent";
+
+const addon: addons.AddonManifest = {
+  id: "guard",
+  register(surface) {
+    surface.on("session:start", {
+      kind: "observe",
+      run() {
+        console.log("guard addon loaded");
+      },
+    });
+
+    surface.on<{ tool: string; args: { command?: string } }>("tool:before", {
+      kind: "gate",
+      run(payload) {
+        if (payload.tool === "bash" && payload.args.command?.includes("rm -rf")) {
+          return { stop: true, reason: "blocked rm -rf" };
+        }
+      },
+    });
+  },
+};
+
+export default addon;
+```
+
+A `gate` that returns `{ stop: true }` short-circuits the dispatch and is surfaced
+as `DispatchOutcome.gate`. A `transform` returns a replacement payload threaded
+into later handlers. Handlers run in **registration (load) order**; the first
+`gate` to stop wins. A handler that throws is isolated into an `AddonFault` and the
+run continues (a gate that throws fails *open* — no veto).
+
+## Tool Interceptors
+
+Where a `tool:before`/`tool:after` hook observes or vetoes, a `ToolInterceptor`
+sits *around* a single tool execution and can rewrite its args and result. The
+chain (`src/addons/dispatch/tool-interceptor.ts`) applies `enter` stages forward
+and `exit` stages in reverse (onion ordering):
+
+```typescript
+import type { addons } from "indusagi-coding-agent";
+
+const addon: addons.AddonManifest = {
+  id: "redactor",
+  register(surface) {
+    surface.interceptTool("bash", {
+      enter(ctx) {
+        // inspect ctx.args; return { args } to rewrite, or a GateDecision to block
+        const command = String(ctx.args.command ?? "");
+        return { args: { ...ctx.args, command: `set -e; ${command}` } };
+      },
+      exit(ctx) {
+        // ctx.result (success) or ctx.error (failure); return a replacement to rewrite
+        if (ctx.result) {
+          return { ...ctx.result, content: ctx.result.content };
+        }
+      },
+    });
+  },
+};
+
+export default addon;
+```
+
+`enter` may return nothing (continue), `{ args }` (replace args), or a
+`GateDecision` with `stop: true` (block — the tool never runs, the chain resolves
+with `blocked` set). `exit` may return nothing or a replacement `AgentToolResult`.
+Match `"*"` to apply to every tool. A stage that throws is isolated and skipped; an
+error *from the real tool* is offered to `exit` stages and re-thrown unless a stage
+returns a replacement result (a deliberate recovery).
+
+## Loading and Folding
+
+The `AddonHost` (`src/addons/host.ts`, built via `createAddonHost`) is the
+assembly point. Per discovered source it: loads the module (injectable
+`ModuleLoader`, default `createJitiLoader`), mints a fresh surface, runs
+`register`, then folds the recorded manifest into one registry — preserving load
+order for dispatch and onion ordering, and dropping name conflicts:
+
+```typescript
+import { addons } from "indusagi-coding-agent";
+
+const host = addons.createAddonHost(/* { handles, loader, ... } */);
+host.onFault((fault) => console.error(fault.kind, fault.message));
+
+const bundle = await host.loadAll("/path/to/workspace");
+// bundle: { dispatch, interceptors, commands, tools, loaded }
+```
+
+`loadAll` accepts a workspace path (scanned for `.indus/addons` entries) or a full
+`AddonDiscovery` config. See [loading-extensions](loading-extensions.md) for
+discovery details and the current wiring status.
+
+## Faults
+
+Every failure is a typed `AddonFault` routed to `onFault` listeners — a misbehaving
+addon never crashes the agent loop. The closed `AddonFaultKind` set:
+
+| Kind | Meaning |
+|------|---------|
+| `load` | resolving/importing an addon module failed |
+| `register` | an addon's `register` threw |
+| `handler` | an event handler or interceptor stage threw at runtime |
+| `command` | a slash command handler threw |
+| `conflict` | two addons claimed the same command name or tool id |
+
+Construct one with `addonFault(kind, message, { addon, cause })`.
+
+## Exports Reference
+
+From the `addons` namespace of `indusagi-coding-agent` (barrel
+`src/addons/index.ts`):
+
+- **Types:** `AddonManifest`, `RegisteredManifest`, `AddonSurface`, `AddonTool`,
+  `AddonCommand`, `CommandContext`, `FrameworkHandles`, `ExecOutcome`, `HookEvent`,
+  `HookKind`, `HookHandler`, `GateDecision`, `EventSubscription`, `EventDispatcher`,
+  `DispatchOutcome`, `ToolInterceptor`, `InterceptorChain`, `ToolEnterContext`,
+  `ToolExitContext`, `EnterOutcome`, `ExitOutcome`, `InterceptResult`, `AddonId`,
+  `AddonSource`, `AddonDiscovery`, `ModuleLoader`, `BundledNamespace`,
+  `AddonFault`, `AddonFaultKind`, `AddonFaultListener`.
+- **Values:** `createAddonHost`, `AddonHost`, `createSurface`, `createJitiLoader`,
+  `AddonEventDispatcher`, `AddonInterceptorChain`, `subscription`, `interceptor`,
+  `discoverAddons`, `discoverSources`, `addonId`, `addonFault`, `emptyManifest`,
+  `BUNDLED_NAMESPACES`, `ADDONS_DIR` (`".indus/addons"`),
+  `ADDON_MANIFEST_FIELD` (`"indusAddon"`), `expandPath`, `resolvePath`,
+  `scrubInvisible`.
+
+## See Also
+
+- [Loading Extensions](loading-extensions.md) — discovery, the loader, wiring status
+- [Hooks](hooks.md) — the event taxonomy in depth
+- [Skills](skills.md) — on-demand instruction packages
+- [Subagents](subagents.md) — the delegate/task tool

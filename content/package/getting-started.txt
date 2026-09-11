@@ -1,0 +1,110 @@
+# Getting Started
+
+> `indusagi` is the terminal-first AI coding-agent framework. It ships both a CLI binary and an
+> embeddable library surface organized by capability layer. This guide covers both.
+
+## Table of Contents
+
+- [Install](#install)
+- [Build and verify](#build-and-verify)
+- [CLI quickstart](#cli-quickstart)
+- [Embed the framework](#embed-the-framework)
+- [Notes](#notes)
+
+## Install
+
+```bash
+npm install indusagi
+```
+
+The package is ESM only (`"type": "module"`) and requires Node 20 or newer. Installing it also
+provides the `indusagi` CLI binary (mapped to `dist/cli.js`).
+
+## Build and verify
+
+When working from a checkout of the framework, the standard gates are:
+
+```bash
+npm install
+npm run typecheck     # tsc -p tsconfig.json --noEmit
+npm run test          # vitest --run
+npm run build         # node build.mjs  -> dist/
+npm run lineage-scan  # source-hygiene gate
+```
+
+## CLI quickstart
+
+Set the provider key for the model you intend to run, then invoke the CLI. The runner is selected
+from your flags: `-p` for one-shot print mode, `--json` for the wire protocol, and the bare invocation
+for the interactive REPL.
+
+```bash
+export ANTHROPIC_API_KEY="sk-..."
+
+# Show usage (derived from the flag table)
+node dist/cli.js --help
+
+# One-shot: print a single answer and exit
+node dist/cli.js -m claude-sonnet-4 -p "summarize the package.json in this repo"
+
+# Wire mode: speak the JSON line protocol over stdio (also reachable as --rpc / --wire)
+node dist/cli.js -m claude-sonnet-4 --json
+
+# Interactive REPL (the default when no print/wire flag is present)
+node dist/cli.js -m claude-sonnet-4
+```
+
+Attach external Model Context Protocol servers by repeating `--mcp`; disable all tools with
+`--no-tools`; override the system prompt with `--system`.
+
+```bash
+node dist/cli.js -m claude-sonnet-4 --mcp ./my-server --mcp ./other-server -p "what tools do you have?"
+```
+
+## Embed the framework
+
+The root entry exposes each capability layer as a namespace. A minimal agent needs two of them: the
+`runtime` (which owns `createAgent`) and the `capabilities` layer (which assembles a runnable tool
+set with `toolBox`).
+
+```ts
+import { runtime, capabilities } from "indusagi";
+
+const agent = runtime.createAgent({
+  model: "claude-sonnet-4",
+  tools: capabilities.toolBox("coding"), // "read-only" | "coding" | "all"
+});
+
+// Tap the live event stream.
+const unsubscribe = agent.subscribe((event) => {
+  console.log(event.kind);
+});
+
+// Drive one prompt to settlement; resolves the terminal RunSnapshot.
+const snapshot = await agent.submit("list the TODO comments in this repo");
+console.log(snapshot.phase);
+
+unsubscribe();
+```
+
+`createAgent` accepts an `AgentConfig`: `model` (a catalog id) is required, and `tools`, `system`,
+`maxOutputTokens`, `thinking`, `compaction`, and `maxTurns` are optional. `submit` takes a bare
+string (sugar for one user turn) or a list of `Turn`s and returns a `RunSnapshot`.
+
+### Reaching a single layer
+
+Each layer is also importable on its own subpath, which keeps a consumer's dependency graph small:
+
+```ts
+import { models, estimateCost } from "indusagi/llmgateway";
+import { createAgent } from "indusagi/runtime";
+import { toolBox } from "indusagi/capabilities";
+```
+
+For the full list of namespaces and subpaths, see [Package Exports](/docs/package-exports).
+
+## Notes
+
+- The package is ESM only (`"type": "module"`); Node 20 or newer is required.
+- The CLI binary is `indusagi` and maps to `dist/cli.js`.
+- The framework is `indusagi`; the standalone coding-agent CLI ships as `indusagi-coding-agent`.

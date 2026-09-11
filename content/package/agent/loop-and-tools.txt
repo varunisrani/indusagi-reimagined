@@ -1,0 +1,188 @@
+# Agent Loop and Tools
+
+The loop is implemented in `src/facade/bot/agent-loop.ts`. It turns messages into model calls, executes tool calls, and emits `AgentEvent` values through an `EventStream<AgentEvent, AgentMessage[]>`.
+
+Throughout the loop the conversation is carried as `AgentMessage[]`. It is flattened into the provider's `Message[]` only at the last moment, inside `streamAssistantResponse`, via `convertToLlm`.
+
+## Table of Contents
+
+- [Entry Points](#entry-points)
+- [The Run Cycle](#the-run-cycle)
+- [Streaming a Model Response](#streaming-a-model-response)
+- [Tool Execution](#tool-execution)
+- [Steering and Follow-ups](#steering-and-follow-ups)
+- [Error and Abort Handling](#error-and-abort-handling)
+- [Customization Hooks](#customization-hooks)
+- [Built-in Tools](#built-in-tools)
+
+## Entry Points
+
+- `agentLoop(prompts, context, config, signal?, streamFn?)` — appends `prompts` to the context, emits `agent_start` and `turn_start`, announces each prompt with paired `message_start`/`message_end`, then runs the cycle.
+- `agentLoopContinue(context, config, signal?, streamFn?)` — resumes from the current context. Throws if the context is empty or its last message is an assistant turn.
+
+Both return `EventStream<AgentEvent, AgentMessage[]>`, which resolves with the accumulated `AgentMessage[]` once `agent_end` is pushed.
+
+## The Run Cycle
+
+`runLoop` has an outer cycle (one pass per batch of follow-up work) and an inner cycle (keeps taking turns until the model stops requesting tools and no steering remains). Each turn:
+
+1. Emit `turn_start` (suppressed on the very first turn, which reuses the caller's `turn_start`).
+2. Ingest any pending steering/follow-up messages into the context, emitting `message_start`/`message_end` for each.
+3. Call the model via `streamAssistantResponse` and append the resulting assistant message.
+4. If the assistant `stopReason` is `error` or `aborted`, emit `turn_end` and finish the run immediately.
+5. Filter the assistant content for `toolCall` blocks. If present, run them via `executeToolCalls` and append every `ToolResultMessage`.
+6. Emit `turn_end` with the assistant message and its tool results.
+7. Decide the next `pending` batch: prefer steering captured mid-tool-batch, otherwise poll `getSteeringMessages` again.
+
+When the inner cycle drains, `getFollowUpMessages` is consulted. Returned messages start one more outer pass; otherwise the run ends with `agent_end`.
+
+## Streaming a Model Response
+
+`streamAssistantResponse`:
+
+1. Runs `transformContext(messages, signal)` if provided, otherwise uses the context messages as-is.
+2. Builds the provider `Context` with `systemPrompt`, `convertToLlm(sourceMessages)`, and `tools`.
+3. Resolves the API key from `getApiKey(model.provider)` (falling back to `config.apiKey`).
+4. Invokes `streamFn ?? streamSimple` with the model, context, and options.
+5. On the `start` event, splices a live placeholder into the context and emits `message_start`. On in-flight deltas it updates the placeholder and emits `message_update` (carrying `assistantMessageEvent`). On `done`/`error` it swaps in the resolved message and emits `message_end`.
+
+## Tool Execution
+
+`executeToolCalls` dispatches the assistant's `toolCall` blocks sequentially. For each call, `executeToolCall`:
+
+- Finds the matching `AgentTool` by `name`; a missing tool throws `No registered tool named "<name>"`.
+- Emits `tool_execution_start` with `toolCallId`, `toolName`, and `args`.
+- Validates arguments with `validateToolArguments` from `indusagi/ai`.
+- Calls `tool.execute(id, validatedArgs, signal, onUpdate)`; each `onUpdate` emits `tool_execution_update` with `partialResult`.
+- On any thrown error, builds an error result via the internal `AgentErrorHandler` and marks `isError`.
+- Emits `tool_execution_end` with the result and `isError`, then builds a `ToolResultMessage` and emits `message_start`/`message_end` for it.
+
+## Steering and Follow-ups
+
+After each tool call finishes, `executeToolCalls` polls `getSteeringMessages`. If steering input is present, it stops dispatching the remaining calls, synthesizes skipped results for them, and bubbles the steering upward. Skipped calls still produce a `ToolResultMessage` with `isError: true` and the text `Not run: a newer user message took priority.` — this keeps the call/result pairing well-formed.
+
+The `Agent` class wires these hooks to its queue policy: `steer()` enqueues steering, `followUp()` enqueues follow-ups, and `steeringMode`/`followUpMode` (`"all"` vs `"one-at-a-time"`) decide how many queued messages are released per turn.
+
+## Error and Abort Handling
+
+- An assistant turn that ends with `stopReason` `error` or `aborted` ends the whole run.
+- A tool that throws becomes a `ToolResultMessage` with `isError: true`.
+- In `Agent._runLoop`, a thrown error is turned into a placeholder assistant message via `buildErrorMessage` (zeroed usage, `stopReason` of `"aborted"` or `"error"`), appended to history, and surfaced through `agent_end`.
+
+## Customization Hooks
+
+Configure behavior through `AgentLoopConfig` (or the matching `AgentOptions`):
+
+- `convertToLlm` — map `AgentMessage[]` to the model-ready `Message[]`.
+- `transformContext` — reshape the context while it is still `AgentMessage[]` (trimming, augmentation).
+- `getApiKey` — supply a fresh per-call API key (e.g. short-lived OAuth tokens).
+- `getSteeringMessages` — yield mid-run interrupts.
+- `getFollowUpMessages` — yield work to run once the agent is otherwise idle.
+
+```typescript
+import { Agent } from "indusagi/agent";
+
+const agent = new Agent({
+  transformContext: async (messages) => messages.slice(-50),
+  getApiKey: async (provider) => process.env[`${provider.toUpperCase()}_API_KEY`],
+});
+```
+
+---
+
+# Built-in Tools
+
+The built-in tools/actions live in `src/facade/bot/actions/` and are exported from `indusagi/agent`. Every tool implements `AgentTool` and supports:
+
+- Pluggable operations — override filesystem/shell operations for remote systems.
+- Streaming updates — tools may emit partial results via the `onUpdate` callback.
+- Cancellation — execution respects the passed `AbortSignal`.
+
+## Tool Collections
+
+```typescript
+import {
+  codingTools,         // default full-access tools (uses process.cwd())
+  readOnlyTools,       // default read-only tools (uses process.cwd())
+  allTools,            // Record of every tool, keyed by name
+  createCodingTools,   // factory: full-access tools for a cwd
+  createReadOnlyTools, // factory: read-only tools for a cwd
+  createAllTools,      // factory: every tool as a Record for a cwd
+  createToolRegistry,  // factory: a populated ToolRegistry
+} from "indusagi/agent";
+```
+
+`createCodingTools(cwd, options?)` returns: `read`, `bash`, `edit`, `write`, `process`, `todoread`, `todowrite`, `websearch`, `webfetch`, and the six `composio_*` tools.
+
+`createReadOnlyTools(cwd, options?)` returns: `read`, `grep`, `find`, `ls`, `todoread`, `websearch`, `webfetch`, `composio_toolkits`, `composio_tools`, `composio_connect`, `composio_accounts`.
+
+`createAllTools(cwd, options?)` returns a `Record<ToolName, AgentTool>` containing every tool, including `grep`, `find`, `ls`, and `composio_execute`/`composio_enable`.
+
+## Tool Summary
+
+| Tool name | Label | Category | Purpose |
+|-----------|-------|----------|---------|
+| `read` | read | filesystem | Read file contents (text and images) |
+| `bash` | bash | core | Execute a bash command |
+| `edit` | edit | filesystem | Replace one exact span of text in a file |
+| `write` | write | filesystem | Create or overwrite a file |
+| `grep` | grep | search | Search file contents for a pattern |
+| `find` | find | search | Find files by glob |
+| `ls` | ls | filesystem | List directory contents |
+| `process` | process | management | Manage background processes |
+| `todoread` | todoread | management | Read the todo list |
+| `todowrite` | todowrite | management | Update the todo list |
+| `websearch` | websearch | web | Search the web |
+| `webfetch` | webfetch | web | Fetch and convert a URL |
+| `composio_toolkits` / `composio_tools` / `composio_execute` / `composio_enable` / `composio_connect` / `composio_accounts` | (same) | management | Composio SaaS integration family |
+
+Full parameter shapes, factory functions, and details types are in [Tools Reference](/docs/agent/tools-reference). The background `process` tool has its own page: [Background Process Tool](/docs/agent/bg-process).
+
+## Example
+
+```typescript
+import { Agent, createCodingTools } from "indusagi/agent";
+
+const agent = new Agent({
+  initialState: {
+    systemPrompt: "You are a helpful coding assistant.",
+    tools: createCodingTools(process.cwd()),
+  },
+});
+
+await agent.prompt("Analyze this codebase and suggest improvements");
+```
+
+## Pluggable Operations
+
+Most filesystem and shell tools accept an `operations` override for remote execution (SSH, SFTP, etc.):
+
+```typescript
+import { createReadTool, createBashTool } from "indusagi/agent";
+
+const agent = new Agent({
+  initialState: {
+    tools: [
+      createReadTool(process.cwd(), {
+        operations: {
+          readFile: async (absolutePath) => readFileViaSsh(absolutePath),
+          access: async (absolutePath) => checkAccessViaSsh(absolutePath),
+        },
+      }),
+      createBashTool(process.cwd(), {
+        operations: {
+          exec: async (command, cwd, { onData, signal, timeout, env }) =>
+            execViaSsh(command, cwd, onData, signal),
+        },
+      }),
+    ],
+  },
+});
+```
+
+## Related Documentation
+
+- [Tools Reference](/docs/agent/tools-reference) — exact parameters and details types.
+- [Background Process Tool](/docs/agent/bg-process) — background process management.
+- [Agent API Reference](/docs/agent/api-reference) — full Agent API reference.
+- [Agent Module](/docs/agent/README) — module overview.

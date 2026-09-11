@@ -1,0 +1,364 @@
+# Theming
+
+> The Rust console's colour engine: the four shipped schemes (`midnight` / `daylight` + their daltonized `-cb` variants), a deterministic pipeline from a raw 9-stop ramp (`ThemePalette`) to 25 semantic roles (`ThemeTokens`) to the framework's flat colour-key vocabulary, and a fully-built `ConsoleTheme` per scheme assembled once behind a `OnceLock`. Live `/theme` switching is a pure `SchemeSet` reducer event plus a re-resolved [`InkTheme`](/rust/ui/tui); the [theme picker overlay](#the-theme-picker-overlay) adds preview-before-commit on top. Every decision lives in pure data — the colour math, the role table, and the picker catalog are all tested without a TTY. Defined in `induscode::console::theme`; reached through the interactive `indusr` session.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [Palettes and Schemes](#palettes-and-schemes)
+- [Token Derivation](#token-derivation)
+- [The Diff-Background Colour Math](#the-diff-background-colour-math)
+- [The Framework Boundary](#the-framework-boundary)
+- [Resolving and Switching Themes](#resolving-and-switching-themes)
+- [The Theme Picker Overlay](#the-theme-picker-overlay)
+  - [Preview-before-commit](#preview-before-commit)
+- [Chrome and Live Re-theming](#chrome-and-live-re-theming)
+- [Source Files](#source-files)
+
+## Overview
+
+The console body never names a hex code or a framework colour key — it names a semantic *role* (`signal`, `frame`, `body_text`, `alarm`, …). One pipeline binds each role to a ramp stop exactly once, then projects the role set onto the framework's own colour-key vocabulary at a single boundary:
+
+```text
+ThemePalette ──derive_tokens──▶ ThemeTokens ──framework_colors──▶ framework keys
+  (9-stop ramp)                  (25 roles)         │
+                                                    └─theme_adapter─▶ InkTheme
+                                                       (create_theme_adapter)
+  └──────────────────────────────── ConsoleTheme ────────────────────────────┘
+```
+
+`induscode::console::theme` is the **single boundary** where the console's semantic render-role names become the framework's flat colour-key names (`accent`, `error`, `success`, `diffAddedBg`, …) and finally concrete `ratatui::style::Color`s. It is pure data plus one boundary call: four `const` hex ramps, one total token-derivation fn, one `HashMap` projection, and one resolver with a default fallback. There is no async, no I/O, and no ratatui draw code in the engine — it stops at the hex projection and hands a `HashMap<String, String>` to the framework's [`create_theme_adapter`](/rust/ui/tui). Because the heavy adapter construction happens once behind a `OnceLock`, the render path only ever reads an already-built theme.
+
+| Symbol | Kind | Purpose |
+|--------|------|---------|
+| `ThemePalette` | struct | The raw 9-stop accent ramp a scheme is built from (the only place hex literals live) |
+| `ThemeTokens` | struct | The 25 derived semantic roles the console renders against |
+| `ConsoleTheme` | struct | A fully-resolved scheme: `scheme` + `palette` + `tokens` + `adapter` |
+| `ThemeScheme` | enum | `Midnight` \| `Daylight` \| `MidnightCb` \| `DaylightCb` (lives in `console::state`) |
+| `palette_for` | fn | Map a `ThemeScheme` to its raw `ThemePalette` (a `match` over the four consts) |
+| `derive_tokens` | fn | Expand a `ThemePalette` into the 25 `ThemeTokens` |
+| `framework_colors` | fn | Project the tokens onto the framework's colour-key map |
+| `theme_adapter` | fn | Build the framework `InkTheme` via `create_theme_adapter` |
+| `resolve_theme` | fn | Map a scheme *name* to its built `ConsoleTheme` (falls back to default) |
+| `theme_for` | fn | Map a typed `ThemeScheme` directly to its built `ConsoleTheme` |
+| `THEME_SCHEMES` | const | The four schemes in picker order |
+
+The contract types are deliberately layered so the colour math is decoupled from the framework:
+
+```rust
+// crates/induscode/src/console/theme.rs
+pub struct ThemePalette {
+    pub primary: &'static str,
+    pub secondary: &'static str,
+    pub tertiary: &'static str,
+    pub ink: &'static str,
+    pub body: &'static str,
+    pub muted: &'static str,
+    pub affirm: &'static str,
+    pub caution: &'static str,
+    pub alarm: &'static str,
+}
+
+pub struct ConsoleTheme {
+    pub scheme: ThemeScheme,
+    pub palette: ThemePalette,
+    pub tokens: ThemeTokens,
+    pub adapter: InkTheme,   // the resolved framework theme
+}
+```
+
+`ThemePalette` fields are `&'static str` so the four ramps can be declared `const`; `ThemeTokens` fields are `String` because two of them (`diff_added_bg` / `diff_removed_bg`) are *computed* at derive time.
+
+## Palettes and Schemes
+
+A `ThemePalette` is the source nine-stop ramp a scheme is built from: three accent hues (a cool primary, a warm secondary, a muted support tertiary), a three-stop neutral text gradient (`ink` / `body` / `muted`), and the three status hues (`affirm` / `caution` / `alarm`). The four shipped schemes derive from four `const` ramps:
+
+| Scheme (`ThemeScheme`) | Literal | Palette `const` | Target | Notes |
+|---|---|---|---|---|
+| `Midnight` | `"midnight"` | `MIDNIGHT_PALETTE` | dark terminal | Cool spring-teal `primary` (`#3ad6b4`), warm amber `secondary`, soft periwinkle support; the **default** |
+| `Daylight` | `"daylight"` | `DAYLIGHT_PALETTE` | light terminal | Same role assignments re-derived deeper/saturated against a bright background; the neutral gradient inverts to dark-on-light |
+| `MidnightCb` | `"midnight-cb"` | `MIDNIGHT_CB_PALETTE` | dark, color-blind-safe | Clones midnight, re-derives only the three *status* hues so success vs failure separates off the red-green axis (`affirm → #4aa3ff`), deuteran/protan-safe |
+| `DaylightCb` | `"daylight-cb"` | `DAYLIGHT_CB_PALETTE` | light, color-blind-safe | The daylight counterpart; status hues tuned for *lightness* separation on a bright background |
+
+`ThemeScheme` itself lives in `console::state` and carries the canonical literal mapping (`Self::Midnight` is `#[default]`):
+
+```rust
+// crates/induscode/src/console/state.rs
+pub enum ThemeScheme {
+    #[default]
+    Midnight,
+    Daylight,
+    MidnightCb,
+    DaylightCb,
+}
+
+impl ThemeScheme {
+    pub fn parse(value: &str) -> Option<Self> { /* "midnight" => Midnight, … else None */ }
+    pub fn as_str(self) -> &'static str { /* the inverse */ }
+}
+```
+
+The color-blind variants only move the three *status* stops; the accent hues and the neutral gradient carry over unchanged via Rust's functional-record-update on the `Copy` struct, so the overall look stays the parent scheme:
+
+```rust
+pub const MIDNIGHT_CB_PALETTE: ThemePalette = ThemePalette {
+    affirm: "#4aa3ff",   // success → vivid blue (off the red-green axis)
+    caution: "#f2c75c",
+    alarm: "#c83232",
+    ..MIDNIGHT_PALETTE   // accent hues + neutral gradient carried over
+};
+```
+
+`palette_for(scheme: ThemeScheme) -> ThemePalette` is a `match` over the four consts (not a map), so it stays `const`-evaluable and allocation-free. A clean-room guard test asserts the ramps never reuse the forbidden upstream hexes (`#00d7ff` / `#5f87ff` / `#8abeb7`).
+
+## Token Derivation
+
+`derive_tokens(palette: &ThemePalette) -> ThemeTokens` is the one place the 25 roles are bound to ramp stops. It is pure, total, and deterministic — every `ThemeTokens` field is assigned exactly once, so the same palette always yields the same tokens. The role → stop assignments are shared by every scheme; only the ramp differs.
+
+The 13 base roles map straight onto stops (`signal ← primary`, `frame ← tertiary`, `quiet_frame ← muted`, `body_text ← body`, `ink_text ← ink`, `alarm ← alarm`, `pending ← primary`, …). The 12 markdown / diff / syntax-highlight roles are *derived* from the same nine stops so the styled transcript, coloured diffs, and fenced-code surfaces recolour with the scheme and need no extra palette stop:
+
+- `code_inline ← primary`, `heading ← primary`, `blockquote_bar ← muted`
+- `syn_keyword ← primary`, `syn_string ← affirm`, `syn_number ← caution`, `syn_comment ← muted`, `syn_type ← tertiary`
+- `diff_added_text ← affirm`, `diff_removed_text ← alarm`
+- `diff_added_bg` / `diff_removed_bg` are **computed** (see [the colour math](#the-diff-background-colour-math))
+
+```rust
+// crates/induscode/src/console/theme.rs
+pub fn derive_tokens(palette: &ThemePalette) -> ThemeTokens {
+    let anchor = background_anchor(palette);
+    ThemeTokens {
+        signal: palette.primary.into(),
+        frame: palette.tertiary.into(),
+        // … the 11 other base roles …
+        diff_added_bg: diff_background(palette.affirm, anchor),
+        diff_removed_bg: diff_background(palette.alarm, anchor),
+        syn_keyword: palette.primary.into(),
+        // … the rest of the rich roles …
+    }
+}
+```
+
+## The Diff-Background Colour Math
+
+The diff-line backgrounds are the **only genuinely net-new colour math** over the framework. The framework ships `parse_hex_color` for input but has no `to_hex` / `mix` / `luminance`, so the two derived diff-background tints are computed here from four private helpers:
+
+- `parse_rgb(hex) -> [u8; 3]` — reuses the framework's `parse_hex_color` then destructures the `Color::Rgb`.
+- `to_hex([r, g, b]) -> String` — formats a triple back to `#rrggbb`.
+- `mix_hex(a, b, t)` — a linear blend; `t` is the weight of `b`. It rounds in `f64` then clamps to `0..=255` (NOT `as u8` truncation — a golden test pins the bytes against the reference rounding).
+- `luminance(hex) -> f64` — relative luminance (0 dark → 1 light) via `0.2126·r + 0.7152·g + 0.0722·b`.
+
+`background_anchor(palette)` picks the neutral a tint is pulled toward — the scheme's implied terminal background. A light `ink` (a dark terminal) anchors to black; a dark `ink` (a light terminal) anchors to white. The threshold is inclusive (`>= 0.5`). `diff_background(hue, anchor)` then blends a status hue **78% toward the anchor**, keeping ~22% of the hue so the tint stays recognisably green/red (or blue/red on the CB schemes) without overpowering the foreground text painted on top:
+
+```rust
+fn diff_background(hue: &str, anchor: &str) -> String {
+    mix_hex(hue, anchor, 0.78)
+}
+```
+
+For midnight this yields `diff_added_bg == "#0f2c1e"` and `diff_removed_bg == "#351717"` (affirm/alarm blended 78% toward black). The framework then paints these as backgrounds via `InkTheme::role_background` (see the [framework theme adapter](/rust/ui/tui)).
+
+## The Framework Boundary
+
+`framework_colors(tokens: &ThemeTokens) -> HashMap<String, String>` is the single boundary projecting the console's semantic roles onto the framework's wire vocabulary — the keys its widgets pass to `theme.color(...)`. The rest of the console never speaks a framework key name, and the framework never sees a console role name:
+
+```text
+framework key   ← console role      framework key   ← console role
+accent          ← signal            success         ← affirm
+text            ← body_text         warning         ← caution
+dim / muted     ← muted_text        error           ← alarm
+borderMuted     ← quiet_frame       info            ← notice
+bashBorder      ← frame             highlight       ← ink_text
+customMessage   ← card_accent       diffAddedBg     ← diff_added_bg  (…and the rest)
+```
+
+One deliberate divergence: `userMessage` is projected as `""` (the empty string), matching the TS source rather than the Python port's `prompt_surface`. The framework's `create_theme_adapter` runs `parse_hex_color("") == None` and drops the entry, so the built `InkTheme.colors` ends up without a `userMessage` key (plain user turns) — absence in the built theme is the framework's job, while the console keeps the `""` so the projection is byte-for-byte the TS record.
+
+`theme_adapter(scheme_name, tokens) -> InkTheme` is the **sole** `create_theme_adapter` call site for a console theme. It passes `role_overrides = None` because the console's keys already match `ThemeRole::default_key()`, so the framework's default role → key map is correct:
+
+```rust
+// crates/induscode/src/console/theme.rs
+pub fn theme_adapter(scheme_name: &str, tokens: &ThemeTokens) -> InkTheme {
+    create_theme_adapter(scheme_name, &framework_colors(tokens), None)
+}
+```
+
+The framework `InkTheme` (`indusagi::tui_render::theme_adapter`, aliased `Theme` in `tui_render::app`) is what every console component reads. Its painter surface:
+
+```rust
+// indusagi::tui_render::theme_adapter (the framework)
+pub struct InkTheme {
+    pub name: String,
+    pub colors: HashMap<String, Color>,
+    pub roles: HashMap<ThemeRole, String>,
+    pub fallback: Color,
+}
+
+impl InkTheme {
+    pub fn color(&self, key: &str) -> Style;          // flat key → fg Style
+    pub fn role(&self, role: ThemeRole) -> Style;     // markdown/diff/syntax role
+    pub fn role_background(&self, bg: ThemeRole, fg: Option<ThemeRole>) -> Style;
+    pub fn muted(&self) -> Style;
+    pub fn dim(&self) -> Style;
+}
+```
+
+## Resolving and Switching Themes
+
+The four built-in `ConsoleTheme`s are assembled once at first access behind a `OnceLock` (the Rust analogue of TS module-load eval) — the heavy adapter construction happens once; the render path only reads:
+
+```rust
+// crates/induscode/src/console/theme.rs
+const SCHEME_ORDER: [ThemeScheme; 4] = [
+    ThemeScheme::Midnight,
+    ThemeScheme::Daylight,
+    ThemeScheme::MidnightCb,
+    ThemeScheme::DaylightCb,
+];
+
+fn assemble_theme(scheme: ThemeScheme) -> ConsoleTheme {
+    let palette = palette_for(scheme);
+    let tokens  = derive_tokens(&palette);
+    let adapter = theme_adapter(scheme.as_str(), &tokens);
+    ConsoleTheme { scheme, palette, tokens, adapter }
+}
+```
+
+Two resolvers turn a scheme into its built theme; neither ever panics:
+
+```rust
+// A raw name (settings / a /theme arg / the default). Unknown or absent → default.
+pub fn resolve_theme(scheme: Option<&str>) -> &'static ConsoleTheme;
+
+// A typed scheme the reducer / boot already holds.
+pub fn theme_for(scheme: ThemeScheme) -> &'static ConsoleTheme;
+```
+
+`resolve_theme` is the single sanctioned way the surface turns a scheme name into a built theme; an unrecognised or absent name falls back to `ThemeScheme::default()` (midnight) rather than panicking, so a corrupt preference never blanks the console. Both return a `&'static ConsoleTheme`, so the boot clones only the `InkTheme` (`resolve_theme(scheme).adapter.clone()`), not the whole table.
+
+```rust
+use induscode::console::theme::{resolve_theme, theme_for, THEME_SCHEMES};
+use induscode::console::state::ThemeScheme;
+
+let theme = resolve_theme(Some("midnight-cb"));   // color-blind-safe dark
+assert_eq!(theme.scheme, ThemeScheme::MidnightCb);
+
+let adapter = &theme.adapter;                      // framework InkTheme
+let _accent = adapter.color("accent");             // ratatui Style with the scheme's signal
+
+assert_eq!(resolve_theme(Some("solarized")).scheme, ThemeScheme::default()); // fallback
+
+assert_eq!(theme_for(ThemeScheme::Midnight).scheme, ThemeScheme::Midnight); // typed resolver
+assert_eq!(THEME_SCHEMES[0], ThemeScheme::Midnight); // picker order: midnight first
+```
+
+`THEME_SCHEMES` is the picker-order array, derived from the fixed `SCHEME_ORDER` (not from `themes().keys()`, whose `HashMap` iteration order is unstable) — a dedicated guard pins the order to `[midnight, daylight, midnight-cb, daylight-cb]`.
+
+A live switch is a single pure reducer event. `ConsoleEvent::SchemeSet(scheme)` sets `state.scheme`; the next draw re-resolves the adapter off the new scheme and the whole surface re-themes:
+
+```rust
+// crates/induscode/src/console/reducer.rs
+ConsoleEvent::SchemeSet(scheme) => {
+    state.scheme = scheme;
+    state
+}
+```
+
+Because the engine is pure, the entire hex → `Color` → `Style` path is testable headless — a unit test resolves `"midnight"` and `"daylight"`, paints an accent span into a ratatui `Buffer`, and asserts the painted foreground bytes differ between schemes.
+
+## The Theme Picker Overlay
+
+`induscode::console::overlays::theme` is the render half of the colour-scheme picker (`ModalKind::Theme`). It paints the frozen framework `ThemeDialog` (`indusagi::tui_render::components::dialogs`) as a full-screen modal layer and owns the static catalog of offered schemes (id / label / one-line description), in listing order — the two base schemes then their daltonized counterparts:
+
+| Row | id | label | description |
+|---|---|---|---|
+| 0 | `midnight` | Midnight | dark terminals |
+| 1 | `daylight` | Daylight | light terminals |
+| 2 | `midnight-cb` | Midnight (color-blind) | deuteran-safe, dark |
+| 3 | `daylight-cb` | Daylight (color-blind) | deuteran-safe, light |
+
+The module exposes the catalog as data plus the seams the host uses to open the picker on the active scheme and map a highlighted row back to a scheme for preview:
+
+```rust
+// crates/induscode/src/console/overlays/theme.rs
+pub fn theme_choices() -> Vec<ThemeDialogItem>;        // id / label / Some(description)
+pub fn theme_names() -> Vec<&'static str>;             // ["midnight", "daylight", …]
+pub fn scheme_index(scheme: ThemeScheme) -> Option<usize>;  // active scheme → row
+pub fn scheme_at(index: usize) -> Option<ThemeScheme>;      // highlighted row → scheme
+pub fn is_active(state: &ConsoleState) -> bool;        // modal.kind == ModalKind::Theme
+pub fn draw_theme(f: &mut Frame, area: Rect, theme: &Theme, selected: usize);
+```
+
+`scheme_index` / `scheme_at` are mutual inverses over the four offered schemes. `draw_theme` builds a fresh `ThemeDialog` over `theme_choices()` each draw (so the render path stays pure) and seeds its `▸` highlight onto the host's `selected` cursor, re-clamped to a valid row:
+
+```rust
+pub fn draw_theme(f: &mut Frame, area: Rect, theme: &Theme, selected: usize) {
+    let mut dialog = ThemeDialog::new(theme_choices());
+    if !dialog.themes.is_empty() {
+        dialog.selected = selected.min(dialog.themes.len() - 1);
+    }
+    use indusagi::tui_render::app::Dialog;
+    dialog.render(f, area, theme);
+}
+```
+
+### Preview-before-commit
+
+The picker has preview-before-commit semantics the generic list confirm cannot express. The wiring lives in the mount loop (`console::mount`), driven by the picker's own row data:
+
+- **Open** — when `ModalKind::Theme` is raised, the host captures `theme_revert = Some(state.scheme)` and seeds the highlight on the active scheme via `scheme_index`, so the picker opens on the row the surface currently renders.
+- **Move** — highlighting a row live-previews it by dispatching `SchemeSet` *only* (`preview_highlighted_scheme` → `scheme_at(modal_selected)`). The whole surface re-themes immediately; nothing is written.
+- **Enter** — `commit_theme_selection` re-themes (`SchemeSet`), persists `colour_scheme` through the `PreferenceStore` (a persistence fault is swallowed so a read-only settings file never crashes the overlay), clears `theme_revert`, then closes the overlay.
+- **Esc / cancel** — reverts to the captured `theme_revert` scheme (no write), then closes — so cancelling restores exactly what was on screen when the picker opened.
+
+```rust
+// crates/induscode/src/console/mount.rs  (preview / commit, abridged)
+fn preview_highlighted_scheme(state: ConsoleState) -> ConsoleState {
+    match overlays::theme::scheme_at(state.modal_selected) {
+        Some(scheme) => console_reducer(state, ConsoleEvent::SchemeSet(scheme)),
+        None => state,
+    }
+}
+
+fn commit_theme_selection(state: &mut ConsoleState, prefs: &mut Option<PreferenceStore>) {
+    if let Some(scheme) = overlays::theme::scheme_at(state.modal_selected) {
+        *state = console_reducer(std::mem::take(state), ConsoleEvent::SchemeSet(scheme));
+        if let Some(store) = prefs.as_mut() {
+            store.stage(|p| p.colour_scheme = Some(scheme.as_str().to_string()));
+            let _ = store.save();
+        }
+    }
+    *state = console_reducer(std::mem::take(state), ConsoleEvent::ModalClose);
+}
+```
+
+The same `colour_scheme` value is also reachable from the `/settings` overlay's colour-scheme row, which routes through `SchemeSet` and persists for every commit. See [Console overlays](/rust-cli/console/overlays) for the full modal stack and [Slash commands](/rust-cli/console/slash-commands) for the `/theme` entry point.
+
+## Chrome and Live Re-theming
+
+Every console component is handed the resolved `&Theme` (the framework `InkTheme`) and reads colours by key — it never touches a hex. The bottom-chrome widgets in `console::view::chrome` show how:
+
+- `WorkingIndicator` — the live "agent is working" row: a braille spinner (`SPINNER_FRAMES`), a rotating whimsical word (`WORKING_WORDS`, 30 entries) or a concrete phase label (`phase_label`: `tooling → "Running tools"`, `condensing → "Compacting context"`), an elapsed clock, and an "esc to interrupt" hint. Its lead span is `theme.color("accent")` and its tail is `theme.muted()`, so the whole row recolours with the scheme. It renders nothing when idle.
+- `StatusBar` — composes the framework `StatusLine` toast row, an optional permission-mode badge (`permission_badge`), and the framework `Footer` session/usage strip. It is purely presentational and re-themes off the same `&Theme`.
+
+The mount loop wires the live switch end-to-end. Each frame it resolves the adapter off the current scheme and threads it into every draw:
+
+```rust
+// crates/induscode/src/console/mount.rs  (per-frame)
+let scheme_adapter = theme_for(state.scheme).adapter.clone();
+// … threaded as `&scheme_adapter` into the surface draw, the chrome, and draw_theme …
+```
+
+A `SchemeSet` event (preview, commit, `/settings`, or boot from the persisted `colour_scheme`) changes `state.scheme`; the next `theme_for(state.scheme)` resolves a different `InkTheme`, and the immediate-mode redraw restyles the whole surface deterministically — proven by golden snapshots that render the same `StatusBar` under both midnight and daylight. See [Console overview](/rust-cli/console/overview) for how the surface, the reducer, and the draw path fit together.
+
+## Source Files
+
+Crate-internal source (`crates/induscode/src/console`):
+
+- `theme.rs` — the whole engine: the four `const` ramps (`MIDNIGHT_PALETTE` / `DAYLIGHT_PALETTE` / `MIDNIGHT_CB_PALETTE` / `DAYLIGHT_CB_PALETTE`), `palette_for`, the hex math (`mix_hex` / `luminance` / `background_anchor` / `diff_background`), `derive_tokens`, `framework_colors`, `theme_adapter`, the `OnceLock` `themes()` table, `resolve_theme` / `theme_for`, and `THEME_SCHEMES`.
+- `overlays/theme.rs` — the picker render half: the `CHOICES` catalog, `theme_choices` / `theme_names`, `scheme_index` / `scheme_at`, `is_active`, and `draw_theme` over the framework `ThemeDialog`.
+- `view/chrome.rs` — the themed chrome widgets (`WorkingIndicator`, `StatusBar`, `permission_badge`) that read the resolved `&Theme`.
+- `state.rs` — `ThemeScheme` (`parse` / `as_str` / `#[default]` Midnight).
+- `reducer.rs` — `ConsoleEvent::SchemeSet`, the pure live-switch path.
+- `mount.rs` — the preview/commit/revert wiring (`preview_highlighted_scheme`, `commit_theme_selection`, `theme_revert`) and the per-frame adapter resolve.
+
+The engine resolves through the framework's [`create_theme_adapter` / `InkTheme`](/rust/ui/tui) — see the [Rust framework](/rust) for the painter surface. For the matching engines in the other editions, see the [TypeScript CLI](/cli) and the [Python CLI theming page](/python-cli/console/theming) (same four schemes, same role names, same 78%-toward-anchor diff tints; the differences are idiomatic — `const` ramps + `OnceLock` here vs. module-load eval in TS and frozen dataclasses + a Pygments style in Python).

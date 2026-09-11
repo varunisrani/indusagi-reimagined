@@ -1,0 +1,200 @@
+# TUI Components Reference
+
+This document catalogs the React + Ink components exported from `indusagi/react-ink`
+(`src/react-ink/index.ts`). Every component is a function component that takes a
+`theme: InkThemeAdapter` prop (from `src/react-ink/theme-adapter.ts`); colours are
+applied as embedded chalk ANSI, not via Ink's `color` prop.
+
+```ts
+import { MessageList, Markdown, Diff, ThemeDialog } from "indusagi/react-ink";
+import { createThemeAdapter } from "indusagi/react-ink";
+import { Box } from "indusagi/react-host/ink";
+
+const theme = createThemeAdapter("default", { accent: "#7aa2f7", text: "#c0caf5" });
+```
+
+## Conversation
+
+### MessageList
+
+File: `src/react-ink/components/MessageList.tsx`
+
+Renders the conversation transcript. Props: `messages: AgentMessage[]`, `theme`,
+`showThinking`, `showImages`, `expandToolOutputs?`, `maxItems`, `displayBlocks?`.
+It groups each assistant message with the `toolResult` messages that follow it,
+merges in any `UiDisplayBlock`s, sorts by timestamp, keeps the last `maxItems`,
+and renders each entry via `MessageRow` or `DisplayBlockView`.
+
+### MessageRow
+
+File: `src/react-ink/components/MessageRow.tsx`
+
+Switches on `message.role` and delegates to the matching view: `user` →
+`UserMessageView` (with `SkillInvocationMessage` when the content is a skill
+block), `assistant` → `AssistantMessageView`, `toolResult` → `ToolResultBlock`,
+`bashExecution` → `BashMessageView`, `branchSummary` → `BranchSummaryMessageView`,
+`compactionSummary` → `CompactionMessageView`, `custom` → `CustomMessageView`.
+
+### Message views
+
+Under `src/react-ink/components/messages/`:
+
+- `AssistantMessageView` (`AssistantMessage.tsx`) — header line `Assistant
+  <provider>/<model> <time>`, the text rendered through `Markdown`, `[thinking]`
+  runs when `showThinking`, then each tool call (`ToolCallMessage`) paired with its
+  `ToolResultBlock`. Props: `message`, `showImages`, `showThinking`,
+  `expandToolOutputs?`, `theme`, `toolResults?`.
+- `UserMessageView` (`UserMessage.tsx`) — `You <time>` plus the content painted on
+  the `userMessage` background. Props: `message`, `theme`, `showImages`.
+- `BashMessageView` (`BashMessage.tsx`) — `Bash <status> <command>` where status is
+  `running`, `cancelled`, or `exit <code>`, then the output. Props: `message`, `theme`.
+- `BranchSummaryMessageView` / `CompactionMessageView` — labelled summary blocks.
+- `CustomMessageView` (`CustomMessage.tsx`) — renders a `custom` message's
+  `customType` badge and content when `message.display` is set. Props: `message`,
+  `showImages`, `theme`.
+- `SkillInvocationMessage` (`SkillInvocationMessage.tsx`) — parses a `<skill …>`
+  block and shows `Skill <name>`, its location, and any user message. Props:
+  `content`, `theme`.
+- `ToolCallMessage` (`ToolCallMessage.tsx`) — wraps `describeToolCall` output in a
+  `ToolEventBlock`. Props: `toolCall`, `theme`.
+- `ToolResultBlock` (`ToolResultBlock.tsx`) — renders a tool result card. When the
+  descriptor carries a structured `diff`, draws a `Diff` block beneath the title;
+  otherwise renders the body through `ToolEventBlock`, clamped to 10 lines unless
+  `expanded`. Props: `message`, `showImages`, `theme`, `expanded?`, `nested?`, `toolCall?`.
+
+## Tool & status surfaces
+
+### ToolEventBlock
+
+File: `src/react-ink/components/ToolEventBlock.tsx`
+
+The shared tool/event card. Props: `title`, `summary?`, `detail?`, `emptyText?`,
+`status` (`"running" | "success" | "error"`), `theme`, `indent?`, `marginBottom?`,
+`showTitle?`, `showSummaryInline?`, `maxContentLines?`, `preformatted?`. It prefixes
+the title with a status marker (`>` running, `=` success, `!` error), clamps the
+body to `maxContentLines` with a `... N more line(s)` tail, and — when
+`preformatted` — renders body lines verbatim so syntax-highlight ANSI survives
+(still measuring widths against the `stripAnsi`'d text).
+
+### TaskPanel
+
+File: `src/react-ink/components/TaskPanel.tsx`
+
+Live "Tool Activity" panel: the up-to-6 most recent `ToolExecutionState`s (running
+first), each as a `ToolEventBlock`, plus a "Queued Messages" list of pending
+steer/follow-up messages. Props: `theme`, `snapshot`, `toolExecutions`,
+`expandToolOutputs?`, `pendingMessages?`.
+
+### Footer
+
+File: `src/react-ink/components/Footer.tsx`
+
+The status footer: cwd (home-shortened) with branch and session name, token /
+cost / context-usage stats (context % is coloured warning >70%, error >90%), the
+model + thinking-level line, and any extension status lines. Props: `theme`,
+`branch`, `snapshot`, `availableProviderCount`, `extensionStatuses?`.
+
+### StatusLine
+
+File: `src/react-ink/components/StatusLine.tsx`
+
+One-line status painted by tone. Falls back to derived text — "Compacting
+conversation context...", "Running bash command...", "Agent working...", or the
+snapshot error — when no explicit `status` is passed. Props: `theme`, `status?`,
+`snapshot`.
+
+### ChangelogBlock / DisplayBlockView
+
+Files: `src/react-ink/components/ChangelogBlock.tsx`,
+`src/react-ink/components/DisplayBlockView.tsx`
+
+`ChangelogBlock` renders a changelog markdown subset (headings, bullets, rules,
+inline bold/code) inside divider rules. `DisplayBlockView` dispatches a
+`UiDisplayBlock` to the right block (currently `changelog`).
+
+## Dialogs
+
+All dialogs live under `src/react-ink/components/dialogs/` and wrap their body in
+`DialogFrame` (`DialogFrame.tsx`: round-bordered box with title/subtitle/footer).
+
+- `SelectableDialog<T>` (`SelectableDialog.tsx`) — the generic searchable/scrollable
+  list every simple picker is built on. Props: `title`, `subtitle?`, `items`,
+  `isActive?`, `searchEnabled?`, `emptyText`, `noSearchResultsText?`, `onClose`,
+  `onSelect`, `onHighlight?`, `getSearchText?`, `renderItem`. Up/Down wraps (via
+  `wrapSelectionIndex`), typing filters (via `matchesSearchQuery`), Enter selects,
+  Ctrl+U clears the search, Esc closes; `onHighlight` fires on every move for live
+  preview.
+- `ThemeDialog` (`ThemeDialog.tsx`) — scheme picker over `string | ThemeDialogItem`;
+  `onSelect(themeName)` on Enter, `onHighlight(themeName)` for live preview.
+- `ModelDialog` (`ModelDialog.tsx`) — searchable `Model<any>[]` picker matching on
+  provider, id, and name.
+- `ScopedModelsDialog` (`ScopedModelsDialog.tsx`) — multi-select of which models
+  Ctrl+P cycles; Space toggles, Ctrl+A all, Ctrl+K none, Enter saves the sorted ids.
+- `SettingsDialog` (`SettingsDialog.tsx`) — cycles each `SettingsDialogItem` through
+  its `values` with Left/Right (or Enter), calling `onChange`.
+- `LoginDialog` (`LoginDialog.tsx`) — `mode: "login"` lists `LoginProviderOption`s,
+  `mode: "logout"` lists `SavedAccountOption`s.
+- `OAuthDialog` (`OAuthDialog.tsx`) — controlled credential/OAuth input over an
+  `OAuthOverlayState`; `onChange(partial)`, `onSubmit`, `onClose`.
+- `SessionDialog` (`SessionDialog.tsx`) — session browser with scope/sort toggles,
+  rename and delete; `StartupSessionPicker` (`StartupSessionPicker.tsx`) is the
+  resume-at-launch variant.
+- `TreeDialog` (`TreeDialog.tsx`) — navigates `SessionTreeOption`s (the session
+  fork tree); `UserMessageDialog` (`UserMessageDialog.tsx`) — "Fork From Message"
+  picker over `UserMessageOption`s.
+
+## Markdown
+
+Files under `src/react-ink/markdown/`.
+
+### Markdown
+
+File: `src/react-ink/markdown/Markdown.tsx`
+
+Renders markdown source to styled terminal output. Props: `children: string`,
+`theme`, `highlightCode?` (default `true`), `dim?`. It lexes with `marked` (cached
+via `cachedLexer`), formats each token to chalk ANSI through `formatToken`, and
+emits tables as real `MarkdownTable` flexbox columns. Strikethrough is disabled so
+`~100` stays literal. Code fences are syntax-highlighted via a `CliHighlight`
+(`highlight.ts`, backed by highlight.js) unless `highlightCode` is `false`.
+
+### StreamingMarkdown
+
+File: `src/react-ink/markdown/StreamingMarkdown.tsx`
+
+Streaming-aware wrapper. Same props as `Markdown`. It splits the growing answer at
+the last completed block boundary (`lastStableBoundary`, fence-aware): the stable
+prefix is memoised so settled blocks never re-flow, and only the unstable suffix
+re-lexes per delta.
+
+### MarkdownTable
+
+File: `src/react-ink/markdown/MarkdownTable.tsx`
+
+Renders a GFM `table` token as aligned flexbox columns (bold header, dash rule,
+per-column alignment). Props: `token: Tokens.Table`, `theme`, `highlight?`.
+
+## Diff
+
+Files under `src/react-ink/diff/`.
+
+### Diff
+
+File: `src/react-ink/diff/Diff.tsx`
+
+A pure-Ink colored diff block. Props: `diff: StructuredDiff`, `theme`, `indent?`,
+`marginBottom?`. It draws a right-aligned line-number gutter, themed add/remove
+backgrounds (`diffAddedBg`/`diffRemovedBg` roles), word-level emphasis on changed
+sub-ranges, and separates hunks with a dim `...`.
+
+`buildStructuredDiff(oldStr, newStr, filePath?)` (`structured.ts`) produces the
+`StructuredDiff` using the `diff` package's `structuredPatch` with `CONTEXT_LINES`
+(3) of context, pairing removed→added runs for `wordDiffLine` (`word-diff.ts`).
+Word highlighting is suppressed above `CHANGE_THRESHOLD` (0.4 of the line changed),
+where a flat line colour reads cleaner.
+
+## Next Docs
+
+- [TUI Architecture](/docs/tui/architecture)
+- [Input, Keys, and Autocomplete](/docs/tui/input-and-keys)
+- [TUI Images](/docs/tui/images)

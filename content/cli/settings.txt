@@ -1,0 +1,129 @@
+# Settings
+
+Indusagi reads JSON settings from two tiers. A read layers the project file over the global file over the built-in defaults, so a key set in the project file wins, then the global file, then the default.
+
+| Location | Scope |
+|----------|-------|
+| `~/.indusagi/agent/settings.json` | Global (all projects) |
+| `.indusagi/settings.json` | Project (resolved against the working directory) |
+
+A write through `/settings` (or a manual edit) lands in the **project** file only; the global file is never rewritten for you. A missing or malformed file degrades to the empty record rather than failing startup. Set `INDUSAGI_CODING_AGENT_DIR` to relocate the profile directory that holds the global file.
+
+Edit the files directly, or use `/settings` in an interactive session for the common options.
+
+## All Settings
+
+Every key below is optional. The default is the value used when neither tier supplies the key.
+
+### Model & Reasoning
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `defaultProvider` | string | `"anthropic"` | Provider the session defaults to when none is named |
+| `defaultModel` | string | `""` | Model id the session opens with under `defaultProvider` |
+| `defaultThinkingLevel` | string | `"medium"` | Reasoning effort: `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"` |
+| `enabledModels` | string[] | `[]` | Glob / id patterns selecting which models appear in the picker; empty means all |
+
+```json
+{
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-sonnet-4-20250514",
+  "defaultThinkingLevel": "medium",
+  "enabledModels": ["claude-*", "gpt-4o", "gemini-2*"]
+}
+```
+
+### Reasoning Display
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `showReasoning` | boolean | `true` | Show the model's reasoning text as it streams |
+| `hideThinking` | boolean | `false` | Fold the reasoning block away even when the model emits one |
+
+### Images
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `showImages` | boolean | `true` | Render inline image content in the transcript |
+| `imageAutoResize` | boolean | `true` | Shrink oversized images to fit before sending to a provider |
+| `blockImages` | boolean | `false` | Withhold image content from providers entirely |
+
+### Console & Display
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `colourScheme` | string | `"default"` | Named colour scheme the console renders with |
+| `quietStartup` | boolean | `false` | Suppress the banner / tips on a normal interactive launch |
+| `collapseChangelog` | boolean | `false` | Prefer a condensed changelog after the console updates itself |
+| `showHardwareCursor` | boolean | `false` | Reveal the terminal's own cursor instead of the drawn caret |
+| `editorPaddingX` | number | `1` | Horizontal padding, in columns, around the prompt editor |
+| `logoSweep` | boolean | `false` | Static colour-sweep flourish tinting the startup wordmark |
+| `reducedMotion` | boolean | `false` | Suppress motion-flavoured flourishes (e.g. the logo sweep) |
+| `lastSeenVersion` | string | `""` | Last product version whose full masthead was shown; managed automatically |
+
+### Input & Steering
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `doubleEscapeAction` | string | `"clear"` | What a double-escape does: `"tree"`, `"fork"`, or `"clear"` |
+| `steeringMode` | string | `"all"` | How queued steering corrections drain: `"all"` or `"one-at-a-time"` |
+| `followUpMode` | string | `"all"` | How queued follow-up prompts drain: `"all"` or `"one-at-a-time"` |
+
+> The legacy `doubleEscapeAction` values `"rewind"` and `"branch"` are still accepted and treated as `"fork"` and `"tree"` respectively.
+
+### Context Window
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `autoCompact` | boolean | `true` | Let the window-budget manager compact the transcript automatically |
+
+See [Compaction](compaction.md).
+
+### Extensions & Skills
+
+| Setting | Type | Default | Description |
+|---------|------|---------|-------------|
+| `extensionPackages` | string[] | `[]` | Extension-package sources the launcher installs and loads (npm / git / local) |
+| `enableSkillCommands` | boolean | `true` | Surface discovered skills as their own slash commands |
+
+See [Extensions](extensions.md), [Skills](skills.md), and [Packages](packages.md).
+
+## Example
+
+```json
+{
+  "defaultProvider": "anthropic",
+  "defaultModel": "claude-sonnet-4-20250514",
+  "defaultThinkingLevel": "medium",
+  "colourScheme": "default",
+  "showReasoning": true,
+  "autoCompact": true,
+  "enabledModels": ["claude-*", "gpt-4o"],
+  "extensionPackages": ["indusagi-skills"]
+}
+```
+
+## Project Overrides
+
+Project settings (`.indusagi/settings.json`) override global settings key by key:
+
+```json
+// ~/.indusagi/agent/settings.json (global)
+{
+  "colourScheme": "default",
+  "autoCompact": true,
+  "defaultThinkingLevel": "medium"
+}
+
+// .indusagi/settings.json (project)
+{
+  "defaultThinkingLevel": "high"
+}
+
+// Effective values
+{
+  "colourScheme": "default",
+  "autoCompact": true,
+  "defaultThinkingLevel": "high"
+}
+```

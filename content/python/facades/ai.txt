@@ -1,0 +1,339 @@
+# AI Facade
+
+> `indusagi.ai` is the LLM facade in the old camelCase vocabulary — content
+> parts, message/turn shapes, a model/provider catalog, an event-stream channel,
+> and `stream()` / `complete()` entry points. Imported as `from indusagi.ai import ...`,
+> it is a thin shim that translates its facade vocabulary to and from the
+> [LLM Gateway](/python/subsystems/llm-gateway) core.
+
+`indusagi.ai` exposes the public surface a coding agent reaches for when it wants
+to talk to a model: build a `Context` of messages, hand it to `stream()`, and
+iterate an `AssistantMessageEventStream`. Rather than re-implement per-provider
+adapters, every builtin API tag is registered once as a single
+gateway-delegating backend. The facade keeps the legacy field names as its
+contract — `toolCallId`, `mimeType`, `stopReason`, `contentIndex`, `maxTokens`,
+`cacheRead`, and friends are deliberately camelCase, while functions and methods
+follow the snake_case house style.
+
+## Table of Contents
+
+- [Quick start](#quick-start)
+- [Public API](#public-api)
+- [Entry points](#entry-points)
+- [The contract vocabulary](#the-contract-vocabulary)
+- [Event streams](#event-streams)
+- [The model and provider registries](#the-model-and-provider-registries)
+- [Credential resolution](#credential-resolution)
+- [The gateway shim](#the-gateway-shim)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Quick start
+
+```python
+from indusagi.ai import Context, UserMessage, get_model, stream
+
+context = Context(messages=[UserMessage(content="hi", timestamp=0)])
+model = get_model("anthropic", "claude-sonnet-4-5")
+
+events = stream(model, context)
+async for event in events:
+    if event.type == "text_delta":
+        print(event.delta, end="")
+
+reply = await events.result()   # final AssistantMessage
+```
+
+For a one-shot call, skip the loop and await `complete()`:
+
+```python
+from indusagi.ai import Context, UserMessage, complete, get_model
+
+reply = await complete(
+    get_model("anthropic", "claude-sonnet-4-5"),
+    Context(messages=[UserMessage(content="hi", timestamp=0)]),
+)
+```
+
+Install with `pip install indusagi`; Python 3.11+ is required.
+
+## Public API
+
+Everything below is re-exported from the `indusagi.ai` barrel (`__init__.py`).
+
+### Entry points and tracing
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `stream` | function | `stream.py` | Validate model + context, resolve the backend bound to `model.api`, optionally trace, return an `AssistantMessageEventStream` (full path with tools) |
+| `complete` | async function | `stream.py` | Run `stream()` to completion and await the final `AssistantMessage` |
+| `stream_simple` | function | `stream.py` | Like `stream()` but dispatches to the backend's simple, reasoning-aware, no-tool entry point |
+| `complete_simple` | async function | `stream.py` | Await the final `AssistantMessage` from `stream_simple()` |
+| `stream_by_api` | function | `stream.py` | `stream()` guarded so `model.api` must equal the explicitly-passed `api` tag, else `ValueError` |
+| `register_builtin_api_providers` | function | `stream.py` | Register the gateway-delegating backend for every builtin `Api` tag (runs at import time) |
+| `reset_api_providers` | function | `stream.py` | Clear then re-register the builtin backends |
+| `StreamLogger` | type | `stream.py` | `runtime_checkable` Protocol with `debug(message, details=None)`; an optional trace sink passed to `stream()` / `complete()` |
+
+### Contract types
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `UserMessage` / `AssistantMessage` / `ToolResultMessage` | dataclass | `types.py` | Frozen, slots dataclasses for the three message roles; `Message` is their union, `AgentMessage` aliases `Message` |
+| `TextContent` / `ThinkingContent` / `ImageContent` / `ToolCall` | dataclass | `types.py` | Content parts discriminated by a `ClassVar` `type` literal (`text`/`thinking`/`image`/`toolCall`) |
+| `Context` | dataclass | `types.py` | Mutable request envelope: `messages` list, optional `systemPrompt`, optional `tools` |
+| `StreamOptions` / `SimpleStreamOptions` / `ProviderStreamOptions` | dataclass | `types.py` | Request options; `SimpleStreamOptions` adds `reasoning` and `thinkingBudgets` |
+| `Tool` | dataclass | `types.py` | `name` / `description` / `parameters` (`JsonSchema`) tool descriptor the model may call |
+| `Model` / `ModelCost` | dataclass | `types.py` | A single catalog model and its per-MTok cost sheet (no total field) |
+| `Usage` / `UsageCost` | dataclass | `types.py` | Token + USD accounting on an `AssistantMessage`; `UsageCost` is the per-tier breakdown with a `total` |
+| `StartEvent` … `ErrorEvent` (12) | dataclass | `types.py` | The streaming event dataclasses; `AssistantMessageEvent` is their tagged union |
+| `OpenAICompletionsCompat` / `OpenAIResponsesCompat` / `OpenRouterRouting` / `ThinkingBudgets` | dataclass | `types.py` | Per-endpoint quirk overrides and reasoning budgets |
+| `AssistantMessageEvent` / `Message` / `AgentMessage` / `StopReason` / `ThinkingLevel` / `Api` / `KnownApi` / `Provider` / `KnownProvider` / `JsonSchema` / `StreamFunction` | type | `types.py` | TypeAliases and Protocols for the union vocabulary, name unions, and entry-point shape |
+| `API_NAMES` / `PROVIDER_NAMES` / `STOP_REASONS` | const | `types.py` | Runtime tuples enumerating the known API ids, provider ids, and the 5 stop reasons |
+
+### Helpers and validators
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `is_text_content` … `is_message` (8) | function | `types.py` | `TypeGuard` structural probes that accept both dataclasses and JSON dicts (session round-trip) |
+| `validate_tool` / `validate_message` / `validate_context` | function | `types.py` | Runtime validators raising `ValueError` on malformed shapes |
+| `create_assistant_message` / `create_zero_usage` | function | `types.py` | Factories: a zero `Usage`, and a fresh `AssistantMessage` stamped with zero usage and the current epoch-ms timestamp |
+
+### Event streams
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `EventStream` | class | `events.py` | Generic `[T, R]` producer/consumer channel: `push()` / `end()` / `fail()`, multi-cursor replay async-for, awaitable `result()` / `result_with_timeout()`, `filter()` / `map()` / `get_history()` |
+| `AssistantMessageEventStream` | class | `events.py` | Specialization terminal on `done`/`error`; `result()` yields the final `AssistantMessage`. Has typed `push_start` / `push_text_delta` / `push_done` / `push_error` helpers |
+| `create_assistant_message_event_stream` | function | `events.py` | Factory returning a fresh `AssistantMessageEventStream` |
+| `EventStreamOptions` | dataclass | `events.py` | Construction options; the only field is `historyLimit` |
+
+### Registries and cost
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `get_model` / `try_get_model` | function | `registry.py` | Look up a facade `Model` by `(provider, model_id)`; `get_model` raises `LookupError`, `try_get_model` returns `None` |
+| `get_models` / `get_providers` / `find_models` | function | `registry.py` | List models for a provider, list provider names, or filter via `ModelSearchFilters` |
+| `estimate_cost` / `calculate_cost` | function | `registry.py` | Price a `CostEstimateInput` (or `Usage`) against a model's cost sheet → `UsageCost`; `calculate_cost` also writes cost back onto mutable usage |
+| `supports_xhigh` / `models_are_equal` | function | `registry.py` | `supports_xhigh`: exact-id-set lookup; `models_are_equal`: identity by `(id, provider)` |
+| `register_custom_model` / `load_custom_models` | function | `registry.py` | Add caller-supplied `Model`(s) into the global `model_registry` |
+| `register_api_provider` … `clear_api_providers` | function | `registry.py` | Manage the `ProviderRegistry`: register a backend under an `Api` tag, fetch (enabled-only), fetch with metadata, list, enable/disable, unregister by `sourceId`, clear |
+| `model_registry` / `provider_registry` | const | `registry.py` | Module-level singleton `ModelRegistry` (seeded from the unified gateway catalog) and `ProviderRegistry` |
+| `ModelRegistry` / `ProviderRegistry` | class | `registry.py` | The registry classes (provider→id→Model; Api-tag→`RegisteredApiProvider`) |
+| `ApiProvider` / `ApiProviderInternal` / `ApiProviderMetadata` / `RegisteredApiProvider` / `RegisterApiProviderOptions` / `ModelSearchFilters` / `CostEstimateInput` | dataclass | `registry.py` | Registry data shapes (TS field names kept: `sourceId`, `registeredAt`, `streamSimple`, `supportsImageInput`, `inputTokens`, …) |
+
+### Credentials
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `get_env_api_key` | function | `env_keys.py` | Resolve a provider credential from env vars; returns the raw key or `None` |
+| `resolve_env_api_key` | function | `env_keys.py` | Resolve into a structured `EnvApiKeyResolution` (provider / apiKey / marker / validity) |
+| `rotate_env_api_key` | function | `env_keys.py` | Re-read the env credential, falling back to a supplied value |
+| `is_likely_valid_api_key` | function | `env_keys.py` | Cheap structural validity check on a candidate key |
+| `EnvApiKeyResolution` | dataclass | `env_keys.py` | Carries `provider` / `apiKey` / `isAuthenticatedMarker` / `isValid` |
+
+## Entry points
+
+All five entry points share the same `(model, context, options=None, logger=None)`
+shape (`stream_by_api` prepends an `api` tag). `stream()` validates the context,
+asserts the model shape, resolves the backend bound to `model.api`, traces the
+dispatch through the optional `StreamLogger`, then hands off to the backend's full
+streaming path:
+
+```python
+def stream(model, context, options=None, logger=None) -> AssistantMessageEventStream: ...
+async def complete(model, context, options=None, logger=None) -> AssistantMessage: ...
+def stream_simple(model, context, options=None, logger=None) -> AssistantMessageEventStream: ...
+async def complete_simple(model, context, options=None, logger=None) -> AssistantMessage: ...
+def stream_by_api(api, model, context, options=None, logger=None) -> AssistantMessageEventStream: ...
+```
+
+`complete()` and `complete_simple()` simply run their `stream*` sibling to
+completion and await `result()`. They tolerate `result()` returning either an
+awaitable or a plain value, because the internal gateway stream wraps it.
+
+`stream_by_api()` is a guard: if `model.api` does not equal the explicitly-passed
+`api` tag, it raises `ValueError` before any backend is touched.
+
+Options carry the request knobs:
+
+```python
+from indusagi.ai import StreamOptions, SimpleStreamOptions
+
+opts = StreamOptions(temperature=0.2, maxTokens=4096, apiKey="sk-...")
+simple = SimpleStreamOptions(reasoning="high")  # adds reasoning + thinkingBudgets
+```
+
+`signal` accepts a `CancelToken` (the port-wide cancellation primitive). Note that
+`sessionId`, `onPayload`, `headers`, and `thinkingBudgets` are accepted but
+ignored by the shim — the core connectors expose no equivalent knobs.
+
+## The contract vocabulary
+
+The contract lives in `types.py`. Content parts and messages are **frozen, slots**
+dataclasses discriminated by a `ClassVar` `type` or `role` literal, so they pattern-match
+cleanly and serialize to JSON for session storage. `Context` and the `*StreamOptions`
+classes are **mutable** — agent code appends to `messages` between turns and the shim
+fills in defaults, exactly as legacy object-literal callers expect.
+
+```python
+from indusagi.ai import (
+    UserMessage, AssistantMessage, TextContent, ToolCall, Tool, Context,
+)
+
+tool = Tool(
+    name="read_file",
+    description="Read a file from disk",
+    parameters={"type": "object", "properties": {"path": {"type": "string"}}},
+)
+context = Context(
+    messages=[UserMessage(content="read main.py", timestamp=0)],
+    systemPrompt="You are a coding agent.",
+    tools=[tool],
+)
+```
+
+The type guards (`is_text_content`, `is_assistant_message`, …) are structural
+probes: they accept both the typed dataclasses and JSON-parsed dicts, so a message
+reloaded from a session file passes the same checks as one freshly constructed.
+The validators (`validate_tool`, `validate_message`, `validate_context`) raise
+`ValueError` on malformed shapes.
+
+## Event streams
+
+`EventStream[T, R]` is a producer/consumer channel with a never-trimmed FIFO
+buffer. Every `async for` (each `__aiter__` call) mints an independent cursor
+starting at index 0 — late iterators **replay all prior events** then follow the
+live tail. `push()` appends an event; when an event is terminal the channel closes
+and `result()` settles. `asyncio.CancelledError` is never swallowed: a cancelled
+waiter unparks and re-raises.
+
+`AssistantMessageEventStream` is the specialization the entry points return. It is
+terminal on `done`/`error` and exposes typed push helpers (`push_start`,
+`push_text_delta`, `push_tool_call_end`, `push_done`, `push_error`, …). The
+streaming union it speaks has 12 variants:
+
+```
+start
+text_start / text_delta / text_end
+thinking_start / thinking_delta / thinking_end
+toolcall_start / toolcall_delta / toolcall_end
+done / error
+```
+
+Each event carries a `partial` `AssistantMessage` accumulated so far, except `done`
+and `error`, which carry the final (or salvaged) message. Note the tool-call
+**event** tags use the run-together spelling `toolcall_*` (no underscore between
+"tool" and "call"), while the push **helper** methods are spelled
+`push_tool_call_*`.
+
+Two semantics are worth internalizing:
+
+- An **errored** `AssistantMessageEventStream` *resolves* `result()` with a salvage
+  `AssistantMessage` (with `stopReason` `aborted` or `error`) — it does **not**
+  raise. The generic `EventStream.fail()` / `error()` *does* make `result()` raise;
+  the difference is which terminal the stream uses.
+- `end()` with **no** result argument leaves `result()` awaiting forever. Only
+  `end(value)` settles it.
+
+```python
+events = stream(model, context)
+async for event in events:        # cursor replays from the start, then follows live
+    match event.type:
+        case "text_delta":   handle_text(event.delta)
+        case "toolcall_end": handle_tool(event.partial)
+        case "done":         finalize(event.message)
+
+final = await events.result()     # salvage message even on error; never raises here
+```
+
+## The model and provider registries
+
+`registry.py` holds two module-level singletons. `model_registry` is a
+`ModelRegistry` seeded (no-arg) from the **single shared** gateway catalog —
+`indusagi.llmgateway.catalog.full_catalog()` — not a second copy. It projects core
+model cards into the facade `Model` shape through the shared bridge tables, so the
+two catalogs cannot drift.
+
+```python
+from indusagi.ai import get_model, find_models, estimate_cost, ModelSearchFilters
+
+model = get_model("anthropic", "claude-sonnet-4-5")    # raises LookupError if absent
+maybe = try_get_model("openai", "gpt-5.2")             # None if absent
+
+reasoning_models = find_models(ModelSearchFilters(reasoning=True))
+
+cost = estimate_cost(model, {"inputTokens": 1000, "outputTokens": 500})
+print(cost.total)   # USD, per-MTok arithmetic
+```
+
+`supports_xhigh()` is an **exact id-set** lookup (it matches the explicit set of
+xhigh-capable ids, not a substring), and `models_are_equal()` compares identity by
+`(id, provider)`.
+
+`provider_registry` is a `ProviderRegistry` mapping each `Api` tag to a
+`RegisteredApiProvider`. `register_api_provider()` wraps a backend's `stream` and
+`streamSimple` in a guard that raises if the served model's `api` does not match
+the tag it was registered under. The lifecycle functions — `get_api_provider`,
+`get_api_providers`, `enable_api_provider`, `disable_api_provider`,
+`unregister_api_providers` (by `sourceId`), and `clear_api_providers` — manage that
+table.
+
+## Credential resolution
+
+`env_keys.py` resolves a provider credential from environment variables; every read
+goes through one internal env path. A single-var map handles the common providers,
+and custom resolvers handle the multi-source cases: anthropic (OAuth token then API
+key), GitHub Copilot (three fallbacks), Amazon Bedrock and Google Vertex (cloud-IAM
+signals yielding a `<sdk-managed-credentials>` marker), and the Kimi family.
+
+```python
+from indusagi.ai import get_env_api_key, resolve_env_api_key
+
+key = get_env_api_key("anthropic")          # raw key, or None
+res = resolve_env_api_key("amazon-bedrock") # EnvApiKeyResolution
+# res.apiKey may be the "<sdk-managed-credentials>" marker for IAM-backed providers
+```
+
+When `StreamOptions.apiKey` is absent, the shim falls back to this table to resolve
+the credential before dispatching. SDK-marker sentinels are not forwarded — the
+core's cloud-IAM resolution handles those providers itself.
+
+## The gateway shim
+
+`stream.py` is the engine. At import time `register_builtin_api_providers()` runs,
+registering one gateway-delegating backend under every builtin `Api` tag (under the
+`sourceId` `indusagi:builtins`). When you call `stream(model, context, options)` it:
+
+1. validates the context, asserts the model shape, and resolves the backend for
+   `model.api`;
+2. translates the facade vocabulary into the core: it builds a core `ModelCard`
+   (mapping facade api/provider to core via the bridge tables), a core
+   `Conversation` of user/assistant/tool turns plus tool descriptors, and core
+   stream options (`signal` → cancel token; `apiKey` or the env table → credential;
+   reasoning levels `minimal` → `low`, `xhigh` → `max`);
+3. opens the core connector channel (`connector_for_api(card.api).stream(...)`) and
+   pumps the core emission stream into the facade event framing.
+
+Core stop reasons map as: `complete` → `stop`, `max_output` → `length`,
+`tool_calls` → `toolUse`, `aborted` → `aborted`, `refusal`/`error` → `error`. A
+terminal abort or error becomes a facade `error` event whose `AssistantMessage`
+salvages the partial content streamed so far.
+
+The pump is armed lazily: if an event loop is already running it starts immediately,
+otherwise it arms on the first `__aiter__` or `result()` — keeping synchronous
+construction safe while preserving eager dispatch under a live loop.
+
+## Relationship to neighbors
+
+`indusagi.ai` sits **on top of** the [LLM Gateway](/python/subsystems/llm-gateway):
+it imports `connector_for_api` and the contract types (model cards, conversations,
+turns, blocks, tool descriptors, cost sheets, gateway errors) from there, and it
+reads the single shared model catalog rather than maintaining a duplicate.
+Cancellation comes from the runtime's cancel primitives and env reads from the
+internal env path.
+
+It is the old-vocabulary counterpart to the [UI Bridge](/python/ui/ui-bridge): its
+content/message types superset the bridge's facade types, and it uses the same
+core-to-facade stop-reason mapping. For the higher-level agent loop that consumes
+these streams, see the [Agent Facade](/python/facades/agent); for tool definitions
+shared across the stack, see [Capabilities](/python/subsystems/capabilities). The
+broader layering is covered in the [Architecture overview](/python/architecture).

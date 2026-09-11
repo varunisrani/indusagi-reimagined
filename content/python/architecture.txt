@@ -1,0 +1,153 @@
+# Architecture
+
+> `indusagi` is a terminal-first AI coding-agent framework organized as a stack of capability layers. The root package (`import indusagi`) exposes nothing eagerly except `__version__`/`VERSION`; every subsystem is a real subpackage reached either directly (`import indusagi.runtime`) or through a lazy namespace alias (`indusagi.gateway`). This page is the canonical map of how those layers fit together.
+
+The framework's public surface is grouped by capability layer. A layer is a self-contained subpackage with its own `__init__.py` barrel and an explicit `__all__`. The root `src/indusagi/__init__.py` is deliberately near-empty — it binds only the version and a PEP 562 `__getattr__` that maps friendly aliases onto the real subpackages on first access:
+
+```python
+import indusagi
+
+print(indusagi.VERSION)        # e.g. "0.1.2"
+
+gateway = indusagi.gateway     # lazily imports indusagi.llmgateway
+runtime = indusagi.runtime     # lazily imports indusagi.runtime
+saas    = indusagi.saas        # lazily imports indusagi.connectors
+shell   = indusagi.shell       # lazily imports indusagi.shell_app
+```
+
+`VERSION`/`__version__` are read at import time via `importlib.metadata.version("indusagi")` and fall back to `"0.0.0.dev0"` when running from an uninstalled source tree. Nothing else materializes on the root package until you touch its attribute — so `import indusagi` never forces a heavy subpackage (textual, the mcp SDK) into memory.
+
+## Table of Contents
+
+- [The layer table](#the-layer-table)
+- [Layered design](#layered-design)
+- [Data flow: one prompt to settlement](#data-flow-one-prompt-to-settlement)
+- [Dependency direction](#dependency-direction)
+- [The facade compatibility layer](#the-facade-compatibility-layer)
+- [The UI stack](#the-ui-stack)
+- [Subsystem pages](#subsystem-pages)
+
+## The layer table
+
+| Layer | Alias | Import path | Responsibility |
+|-------|-------|-------------|----------------|
+| L1 Foundation | `gateway` | `indusagi.llmgateway` | Zero-SDK multi-provider LLM dispatch (`stream`/`complete`), the model catalog, the connector registry, and credential/PKCE plumbing |
+| L2 Agent | — | `indusagi.runtime` | The host-facing `create_agent` factory, the pure `cadence` FSM, the content-addressed session DAG, compaction, and the run-event ledger |
+| L3 Tools | — | `indusagi.capabilities` | The built-in tools, the `ToolRegistry` kernel, the local fs/shell backends, and the `tool_box` assembler |
+| L3 External | `interop` | `indusagi.interop` | The Model Context Protocol bridge — client endpoints/fleets that graft remote tools, and a provider host that publishes our own |
+| L3 External | `saas` | `indusagi.connectors` | The `SaasGateway` façade over a `SaasBackend` port, with the Composio adapter and a fluent `ScopePlanner` |
+| L3 External | `swarm` | `indusagi.swarm` | Multi-agent crews — roster, dependency-aware ticket board, cursor mailbox, activity log, and git-worktree isolation |
+| L5 Product | `smithy` | `indusagi.smithy` | The agent-builder: blueprints, profiles, knowledge pack, and the `Forge` build session |
+| L5 Product | `shell` | `indusagi.shell_app` | The CLI: `main`/`run` entry, boot pipeline, flag parser, settings, and the print/wire/repl runners |
+| Cross-cutting | `tracing` | `indusagi.tracing` | A homegrown, OTel-free span tracer — `Segment` values, a `Recorder`, sinks, redaction, and a runtime `RunEvent` bridge |
+
+Two aliases differ from their real module names: `indusagi.saas` resolves to `indusagi.connectors`, and `indusagi.shell` resolves to `indusagi.shell_app`. Both spellings hand back the same module object.
+
+## Layered design
+
+The framework reads top-to-bottom as three tiers.
+
+**High-level facades** sit at the top. [`indusagi.agent`](/python/facades/agent) is the friendly entry point: pick a model, attach tools, `await agent.prompt(...)`. [`indusagi.ai`](/python/facades/ai) is the LLM-message facade (camelCase `Context`/`stream`/`complete`), and [`indusagi.mcp`](/python/facades/mcp) is the camelCase MCP client/server facade. These are deliberately thin shims that preserve a stable public vocabulary while delegating all real work downward — `agent` → `runtime` + `capabilities`, `ai` → `llmgateway`, `mcp` → `interop`. [`indusagi.memory`](/python/facades/memory) is an intentional empty stub kept only for layout parity.
+
+**Core subsystems** do the work. The agent loop lives in [Runtime](/python/subsystems/runtime); the model wire lives in the [LLM Gateway](/python/subsystems/llm-gateway); the tools live in [Capabilities](/python/subsystems/capabilities); external surfaces live in [Interop](/python/subsystems/interop), [SaaS Connectors](/python/subsystems/connectors), and [Swarm](/python/subsystems/swarm); the agent generator is [Smithy](/python/subsystems/smithy); observability is [Tracing](/python/subsystems/tracing); the CLI is the [Shell App](/python/subsystems/shell-app).
+
+**The UI layer** is an optional, toolkit-isolated stack the shell app plugs into. Pure terminal primitives are in [TUI](/python/ui/tui); the Textual/Rich widget library is [React-Ink](/python/ui/react-ink); the projection that turns a `RunSnapshot` into renderable messages and drives the interactive app is [UI Bridge](/python/ui/ui-bridge).
+
+A unifying convention runs through every layer: a frozen `contract` module holding immutable dataclasses and typed unions, surrounded by single-purpose driver modules, with a small public barrel. State is event-sourced — snapshots are never mutated in place — and side effects are confined to named seams (the gateway connectors, the local fs/shell backends, the MCP transports).
+
+## Data flow: one prompt to settlement
+
+A host composes a runnable agent from the runtime and tools layers:
+
+```python
+import asyncio
+from indusagi.runtime import create_agent, AgentConfig
+from indusagi.capabilities import tool_box
+
+async def main():
+    agent = create_agent(AgentConfig(
+        model="claude-sonnet-4",
+        tools=tool_box("coding", cwd="."),
+    ))
+    snapshot = await agent.submit("list the TODOs in this repo")
+    print(snapshot.phase)        # 'settled'
+
+asyncio.run(main())
+```
+
+The runtime is a **pure finite-state machine plus a stateful conductor**. `await agent.submit(input)` drives one prompt to a terminal phase (`settled` or `faulted`) and resolves the final immutable `RunSnapshot`. Under the hood the loop is an effect/signal cycle: a pure reducer (`cadence`) decides *what should happen* by returning `Effect`s, and the conductor carries them out, feeding results back as `Signal`s until the run settles.
+
+1. **Prompt → conductor.** `create_agent` binds the pure `cadence(config)` reducer and threads `Signal`s through it. A `submit` seeds a blank assistant turn and emits an `InvokeModelEffect` (phase → `invoking`). The conductor's `_drive` loop pulls one signal, `step`s the reducer, swaps in the new snapshot, and performs the requested effects.
+
+2. **Gateway invoke.** The `invoke_model` effect reaches the gateway's `stream(model_id, conversation, options)` by default — the model entrypoint is injectable as `AgentDeps.invoke_model`, so tests can script it deterministically without the network. `stream` resolves a `ModelCard` from the catalog (curated cards first, then the full-catalog fallback), picks the `Connector` for the card's `api` dialect via `connector_for_api`, and returns a re-iterable `Channel` of normalized `Emission`s — without importing any vendor SDK.
+
+3. **Reduce streamed deltas.** Each streamed `EmissionSignal` (text/thinking/tool-call/usage/stop) is folded into the open assistant turn by the reducer (phase → `streaming`), publishing `TextDeltaEvent`/`ThinkingDeltaEvent`/`ToolStartedEvent` along the way.
+
+4. **Tool calls via capabilities.** On stream end, the reducer parses buffered tool-call args and either settles (no tools → `PersistEffect` + `SettledEvent`) or dispatches (one `RunToolEffect` per call, phase → `dispatching`). The conductor batches the calls through a `Scheduler` (bounded concurrency, per-call cancel tokens) over `config.tools.runner`. The `tool_box(...)` assembler produces that `ToolBox`, backed by the real local filesystem and shell — and every tool only ever touches the abstract `Fs`/`Shell` seams, never `pathlib`/`subprocess` directly.
+
+5. **Loop until settled.** `ToolSettledSignal`s arrive in completion order; once all pending tools are done, the reducer re-invokes the model — back to step 2. Before each invocation the conductor runs a lazy compaction gate: if accumulated history crosses the configured `trigger_ratio` of the model's context window, the older prefix is distilled into one summary turn and a `compacted` signal redirects the reducer to re-invoke over shrunken history. A turn-budget guard force-faults a run that exceeds `AgentConfig.max_turns` (default 64).
+
+Throughout, each transition publishes `RunEvent`s to a `RunLedger`; `agent.subscribe(handler)` taps that live stream, and `agent.abort()` tears the run down via a cooperative `CancelToken`. `asyncio.CancelledError` is consistently re-raised and never folded into a fault.
+
+## Dependency direction
+
+Dependencies flow **strictly downward**, and the rule that prevents drift is: *each type has exactly one canonical source, and neighbors refuse to re-export each other's vocabulary.*
+
+```text
+  facades:  agent ──┐   ai ──┐    mcp ──┐    memory (empty stub)
+                    │        │          │
+  core:    runtime ─┴─► llmgateway ◄────┘   interop ◄── mcp
+            │   ▲                            ▲
+            │   └── capabilities ────────────┘
+            ▼
+        _internal (CancelToken, env/state-dir registry)
+```
+
+- `llmgateway` is the foundation and the **single source of truth** for the type contract (`ModelCard`, `Conversation`, `Turn`/`Block`, `Emission`, `Channel`, `StreamOptions`, `GatewayError`). It depends only on `httpx` and `indusagi._internal`.
+- `runtime` consumes the gateway's provider-neutral vocabulary and its `stream` function, but **deliberately does not re-export gateway types** — it imports them from `llmgateway.contract` so there is no second copy.
+- `capabilities` sits between two outward contracts it imports rather than redefines: the runtime's `ToolCall`/`ToolOutcome`/`ToolBox` and the gateway's `ToolDescriptor`/`JsonSchema`.
+- `interop`, `connectors`, and `swarm` all build on the same `ToolRegistry`/`ToolBox` abstractions — `interop` grafts remote MCP tools in and publishes local tools out; `connectors` hydrates SaaS toolkits; `swarm` runs several agents as a crew.
+- `smithy` is a downstream consumer that emits an `AgentConfig` via `to_agent_config(...)`, which instantiates through `create_agent`.
+- `tracing` projects a `RunEvent` stream onto nested spans without the runtime knowing about it — the coupling is one optional adapter module that reads the event's public shape.
+- `_internal` is the private floor: a cooperative `CancelToken` and the single env/state-dir registry (everything reads branded env vars through it, never `os.environ` directly; state lives under `~/.pindusagi`).
+
+The facades invert this: `agent`/`ai`/`mcp` sit *above* the core, importing from it but never imported by it.
+
+## The facade compatibility layer
+
+Beside the core subsystems, four thin compatibility packages expose a stable, camelCase public vocabulary. Each is a shim that delegates to a green core subsystem:
+
+| Package | Re-exports / delegates to | Role |
+|---------|---------------------------|------|
+| [`indusagi.ai`](/python/facades/ai) | `indusagi.llmgateway` | The LLM message facade: `Context`/`stream`/`complete`, the model/provider registries, the streaming-event union, and env-key resolution |
+| [`indusagi.agent`](/python/facades/agent) | `indusagi.runtime` + `indusagi.capabilities` | The high-level `Agent` (`prompt`/`steer`/`follow_up`/`abort`), `create_*_tool` factories, and JSONL `SessionManager` |
+| [`indusagi.mcp`](/python/facades/mcp) | `indusagi.interop` | The camelCase MCP client/server stack: `MCPClient`/`MCPClientPool`/`MCPServer`, schema converters, config loaders, errors |
+| [`indusagi.memory`](/python/facades/memory) | — | A phantom facade: `__all__ = []`, kept for import-path parity; real conversational memory is the runtime compaction engine |
+
+The `indusagi.interop` subsystem and the `indusagi.mcp` facade both speak MCP but are distinct: `interop` is the clean-room protocol bridge, while `mcp` re-exports a camelCase shim over it. See [Package Exports](/python/reference/package-exports) for the full mapping.
+
+## The UI stack
+
+The core layers above are toolkit-free. The terminal UI is a separate, optional stack:
+
+| Package | Role |
+|---------|------|
+| [`indusagi.tui`](/python/ui/tui) | Pure, framework-free TUI primitives: key decoding, grapheme/ANSI width math, fuzzy matching, editor keybindings, autocomplete |
+| [`indusagi.react_ink`](/python/ui/react-ink) | The Textual/Rich widget library — message rows, dialogs, streaming markdown, and structured diff renderers |
+| [`indusagi.ui_bridge`](/python/ui/ui-bridge) | The seam: `to_agent_messages(snapshot)` projects runtime state into renderable messages, and `mount_interactive(agent)` drives the interactive REPL app |
+
+`ui_bridge` keeps the pure projection importable without Textual installed (the app exports resolve lazily), so a host can compute `LiveUsage` for a status line without the rendering dependency. `react_host` rounds out the stack as a tiny structural seam (`HostUI` Protocol + `get_host`/`set_host`) for pinning one terminal backend per process.
+
+## Subsystem pages
+
+- [LLM Gateway](/python/subsystems/llm-gateway) — `indusagi.llmgateway`
+- [Runtime](/python/subsystems/runtime) — `indusagi.runtime`
+- [Capabilities](/python/subsystems/capabilities) — `indusagi.capabilities`
+- [Interop / MCP](/python/subsystems/interop) — `indusagi.interop`
+- [SaaS Connectors](/python/subsystems/connectors) — `indusagi.connectors`
+- [Swarm](/python/subsystems/swarm) — `indusagi.swarm`
+- [Smithy](/python/subsystems/smithy) — `indusagi.smithy`
+- [Tracing](/python/subsystems/tracing) — `indusagi.tracing`
+- [Shell App](/python/subsystems/shell-app) — `indusagi.shell_app`
+
+For the friendly entry points, start with [`indusagi.agent`](/python/facades/agent) and [Getting Started](/python/getting-started).

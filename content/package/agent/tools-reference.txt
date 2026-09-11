@@ -1,0 +1,445 @@
+# Tools Reference
+
+Reference for the built-in tools/actions of `indusagi/agent`, implemented in `src/facade/bot/actions/`. Every tool is an `AgentTool` and resolves through the `ToolRegistry` in `src/facade/bot/actions/registry.ts`.
+
+## Table of Contents
+
+- [Quick Reference](#quick-reference)
+- [Importing Tools](#importing-tools)
+- [Tool Collections](#tool-collections)
+- [read](#1-read)
+- [bash](#2-bash)
+- [edit](#3-edit)
+- [write](#4-write)
+- [grep](#5-grep)
+- [find](#6-find)
+- [ls](#7-ls)
+- [todo](#8-todo)
+- [websearch](#9-websearch)
+- [webfetch](#10-webfetch)
+- [process](#11-process)
+- [composio](#12-composio)
+- [Common Types](#common-types)
+
+## Quick Reference
+
+| Tool | Name | Description |
+|------|------|-------------|
+| read | `read` | Read files (text and images) with line/byte truncation |
+| bash | `bash` | Run a shell command with optional timeout and streaming |
+| edit | `edit` | Replace one exact span of text in a file |
+| write | `write` | Create or overwrite a file, creating parent dirs |
+| grep | `grep` | Search file contents with regex/literal and context |
+| find | `find` | Find files by glob pattern |
+| ls | `ls` | List directory contents |
+| todoread / todowrite | `todoread`, `todowrite` | Read and update the todo list |
+| websearch | `websearch` | Search the web |
+| webfetch | `webfetch` | Fetch a URL and convert to text/markdown/html |
+| process | `process` | Manage background processes (see [Background Process Tool](/docs/agent/bg-process)) |
+| composio_* | `composio_toolkits`, `composio_tools`, `composio_execute`, `composio_enable`, `composio_connect`, `composio_accounts` | Composio SaaS integration family |
+
+Default output caps come from `truncate.ts`: `DEFAULT_MAX_LINES = 2500` and `DEFAULT_MAX_BYTES = 64KB`.
+
+## Importing Tools
+
+```typescript
+import {
+  createReadTool,
+  createBashTool,
+  createEditTool,
+  createWriteTool,
+  createGrepTool,
+  createFindTool,
+  createLsTool,
+  createTodoReadTool,
+  createTodoWriteTool,
+  createWebSearchTool,
+  createWebFetchTool,
+  createProcessTool,
+  // collections and registry
+  codingTools,
+  readOnlyTools,
+  allTools,
+  createCodingTools,
+  createReadOnlyTools,
+  createAllTools,
+  createToolRegistry,
+  TOOL_METADATA,
+  // details types
+  type ReadToolDetails,
+  type BashToolDetails,
+  type EditToolDetails,
+  type GrepToolDetails,
+  type FindToolDetails,
+  type LsToolDetails,
+  type TodoToolDetails,
+  type WebSearchToolDetails,
+  type WebFetchToolDetails,
+} from "indusagi/agent";
+```
+
+## Tool Collections
+
+```typescript
+import { createCodingTools, createReadOnlyTools } from "indusagi/agent";
+
+// Full access: read, bash, edit, write, process, todoread, todowrite,
+// websearch, webfetch, composio_toolkits, composio_tools, composio_execute,
+// composio_enable, composio_connect, composio_accounts.
+const tools = createCodingTools(process.cwd(), {
+  read: { autoResizeImages: false },
+  bash: { commandPrefix: "set -e\n" },
+  websearch: { apiKey: "your-api-key" },
+  webfetch: { defaultTimeout: 60000 },
+});
+
+// Read-only: read, grep, find, ls, todoread, websearch, webfetch,
+// composio_toolkits, composio_tools, composio_connect, composio_accounts.
+const readOnly = createReadOnlyTools(process.cwd());
+```
+
+`ToolsOptions` accepts `read`, `bash`, `process`, `grep`, `find`, `ls`, `websearch`, `webfetch`, and `composio` option blocks. The pre-built `codingTools`, `readOnlyTools`, and `allTools` use `process.cwd()`.
+
+---
+
+## 1. read
+
+Open a file and return its contents. Both text and images (jpg, png, gif, webp) work; images come back as attachments. Text output is capped at 2500 lines or 64KB, whichever comes first.
+
+**Factory:** `createReadTool(cwd, options?)`
+
+```typescript
+interface ReadToolOptions {
+  autoResizeImages?: boolean;   // default true; resizes large images to fit 2000x2000
+  operations?: ReadOperations;  // custom readFile / access / detectImageMimeType
+}
+
+interface ReadParams {
+  path: string;     // relative or absolute
+  offset?: number;  // first line, 1-indexed
+  limit?: number;   // max lines
+}
+
+interface ReadToolDetails {
+  truncation?: TruncationResult;
+}
+```
+
+Output: `AgentToolResult<ReadToolDetails | undefined>` whose `content` is `(TextContent | ImageContent)[]`.
+
+---
+
+## 2. bash
+
+Execute a bash command in the working directory and return merged stdout/stderr. At most the final 2500 lines or 64KB are returned; once that cap is hit the full output is written to a temp file (`indusvx-bash-*.log` under the OS temp dir).
+
+**Factory:** `createBashTool(cwd, options?)`
+
+```typescript
+interface BashToolOptions {
+  operations?: BashOperations;     // custom exec backend (SSH, etc.)
+  commandPrefix?: string;          // glued to the front of every command
+  security?: BashSecurityConfig;   // { blockedPatterns?: RegExp[] }
+  commandHistory?: string[];       // optional log of issued commands
+}
+
+interface BashParams {
+  command: string;
+  timeout?: number;  // seconds; no limit when omitted
+}
+
+interface BashToolDetails {
+  truncation?: TruncationResult;
+  fullOutputPath?: string;  // temp file path when output was truncated
+}
+```
+
+`BashOperations.exec(command, cwd, { onData, signal, timeout, env })` returns `{ exitCode: number | null }`.
+
+---
+
+## 3. edit
+
+Make a targeted change by swapping one exact span of text for another. `oldText` must reproduce the existing content character for character (whitespace included) and must match exactly once. Supports fuzzy matching for Unicode quotes, dashes, and spaces.
+
+**Factory:** `createEditTool(cwd, options?)`
+
+```typescript
+interface EditToolOptions {
+  operations?: EditOperations;  // custom readFile / writeFile / access
+}
+
+interface EditParams {
+  path: string;
+  oldText: string;
+  newText: string;
+}
+
+interface EditToolDetails {
+  diff: string;
+  firstChangedLine?: number;
+}
+```
+
+Diff utilities `computeEditDiff` and `generateDiffString` are also exported (from `edit-diff.ts`). Note: there is no separate `edit-diff` tool — these are helpers used by `edit`.
+
+---
+
+## 4. write
+
+Save text to a file. A missing file is created, an existing one is replaced in full, and missing parent directories are created.
+
+**Factory:** `createWriteTool(cwd, options?)`
+
+```typescript
+interface WriteToolOptions {
+  operations?: WriteOperations;  // custom writeFile / mkdir
+  createBackup?: boolean;
+}
+
+interface WriteParams {
+  path: string;
+  content: string;
+}
+```
+
+Output: `AgentToolResult<undefined>`; the text confirms how many bytes were saved.
+
+---
+
+## 5. grep
+
+Search file contents for a pattern, returning each hit with its path and line number. Halts at 128 hits or 64KB of output; lines over the grep line limit are shortened.
+
+**Factory:** `createGrepTool(cwd, options?)`
+
+```typescript
+interface GrepParams {
+  pattern: string;
+  path?: string;       // file or directory; defaults to the working directory
+  ignoreCase?: boolean; // default false
+  literal?: boolean;    // treat pattern as exact text; default false (regex)
+  context?: number;     // neighboring lines above/below; default 0
+  limit?: number;       // max hits; default 128
+}
+
+interface GrepToolDetails {
+  truncation?: TruncationResult;
+  matchLimitReached?: number;
+  linesTruncated?: boolean;
+}
+```
+
+---
+
+## 6. find
+
+Find files whose names match a glob (e.g. `*.ts`, `**/*.json`, `lib/**/*.test.ts`). Halts at 1024 paths or 64KB of output.
+
+**Factory:** `createFindTool(cwd, options?)`
+
+```typescript
+interface FindParams {
+  pattern: string;
+  path?: string;   // directory tree; defaults to the working directory
+  limit?: number;  // max paths; default 1024
+}
+
+interface FindToolDetails {
+  truncation?: TruncationResult;
+  resultLimitReached?: number;
+}
+```
+
+---
+
+## 7. ls
+
+List a directory. Names are sorted alphabetically with dotfiles kept; subdirectories carry a trailing `/`. Halts at 512 entries or 64KB.
+
+**Factory:** `createLsTool(cwd, options?)`
+
+```typescript
+interface LsParams {
+  path?: string;   // defaults to the working directory
+  limit?: number;  // max entries; default 512
+}
+
+interface LsToolDetails {
+  truncation?: TruncationResult;
+  entryLimitReached?: number;
+}
+```
+
+---
+
+## 8. todo
+
+Manage a todo list backed by a `TodoStore`. Two tools: `todoread` and `todowrite`.
+
+**Factories:** `createTodoReadTool(store)` and `createTodoWriteTool(store)`.
+
+```typescript
+import { createTodoReadTool, createTodoWriteTool, TodoStore } from "indusagi/agent";
+
+const store = new TodoStore();
+const read = createTodoReadTool(store);
+const write = createTodoWriteTool(store);
+```
+
+```typescript
+interface TodoItem {
+  content: string;
+  status: "pending" | "in_progress" | "completed" | "cancelled";
+  priority: "high" | "medium" | "low";
+}
+
+// todoread: no parameters
+interface TodoWriteParams {
+  todos: TodoItem[];
+  search?: string;   // optional query to filter todos after update
+  status?: "pending" | "in_progress" | "completed" | "cancelled";
+}
+
+interface TodoToolDetails {
+  todos: TodoItem[];
+  incompleteCount: number;
+}
+```
+
+`TODO_PRIORITIES` and `TODO_STATUSES` constants are also exported.
+
+---
+
+## 9. websearch
+
+Search the web (default backend is DuckDuckGo; `WebSearchToolOptions` can point at an alternative endpoint or supply an Exa API key).
+
+**Factory:** `createWebSearchTool(options?)`
+
+```typescript
+interface WebSearchToolOptions {
+  baseUrl?: string;
+  apiKey?: string;
+  rateLimitPerMinute?: number;
+  filterResult?: (raw: string) => string;
+  fallbackSearch?: (query: string, numResults?: number, signal?: AbortSignal) => Promise<string>;
+}
+
+interface WebSearchParams {
+  query: string;
+  numResults?: number;  // default 8, capped at 10
+}
+
+interface WebSearchToolDetails {
+  query: string;
+  numResults?: number;
+}
+```
+
+---
+
+## 10. webfetch
+
+Fetch a URL (must start with `http://` or `https://`) and convert it to the requested format.
+
+**Factory:** `createWebFetchTool(options?)`
+
+```typescript
+interface WebFetchToolOptions {
+  maxResponseSize?: number;  // default 5MB
+  defaultTimeout?: number;   // default 30000 ms
+}
+
+interface WebFetchParams {
+  url: string;
+  format?: "text" | "markdown" | "html";  // default markdown
+  timeout?: number;                        // seconds, capped at 120
+}
+
+interface WebFetchToolDetails {
+  url: string;
+  format?: "text" | "markdown" | "html";
+  timeout?: number;
+  contentType?: string;
+  fetchedBytes?: number;
+}
+```
+
+---
+
+## 11. process
+
+Manage background processes. Covered in detail in [Background Process Tool](/docs/agent/bg-process).
+
+**Factory:** `createProcessTool(options?)` (a `ProcessToolOptions` with `cwd`, `controller`, `getConfiguredShellPath`, `defaultTailLines`, `maxOutputLines`).
+
+```typescript
+interface ProcessParams {
+  action: "start" | "list" | "output" | "logs" | "kill" | "clear" | "write";
+  command?: string;        // required for start
+  name?: string;           // required for start
+  id?: string;             // proc_N or a name match
+  input?: string;          // required for write
+  end?: boolean;           // close stdin after write
+  alertOnSuccess?: boolean; // default false
+  alertOnFailure?: boolean; // default true
+  alertOnKill?: boolean;    // default false
+}
+```
+
+Details type is `ProcessesDetails` (`action`, `success`, `message`, plus optional `process`, `processes`, `output`, `logFiles`, `cleared`).
+
+---
+
+## 12. composio
+
+Six management-category tools for the Composio SaaS integration family, registered in `createToolRegistry`:
+
+| Name | Purpose |
+|------|---------|
+| `composio_toolkits` | List available Composio toolkits |
+| `composio_tools` | List tools within toolkits |
+| `composio_execute` | Execute a Composio tool by slug (e.g. `GITHUB_CREATE_ISSUE`) |
+| `composio_enable` | Enable a toolkit/tool |
+| `composio_connect` | Connect an account |
+| `composio_accounts` | List connected accounts |
+
+`composio_execute` parameters include `toolSlug` (required), optional `arguments`, `toolkits`, `authConfigs`, `connectedAccounts`, `authConfigId`, and `connectedAccountId`. These tools share a `ComposioService` configured through `ToolsOptions.composio` (`ComposioToolFactoryOptions`).
+
+---
+
+## Common Types
+
+```typescript
+interface TruncationResult {
+  content: string;
+  truncated: boolean;
+  truncatedBy: "lines" | "bytes" | null;
+  totalLines: number;
+  totalBytes: number;
+  outputLines: number;
+  outputBytes: number;
+  lastLinePartial: boolean;
+  firstLineExceedsLimit: boolean;
+  maxLines: number;
+  maxBytes: number;
+}
+
+interface TruncationOptions {
+  maxLines?: number;
+  maxBytes?: number;
+}
+```
+
+Shared utilities exported from `indusagi/agent`: `DEFAULT_MAX_LINES`, `DEFAULT_MAX_BYTES`, `formatSize`, `truncateHead`, `truncateTail`, `truncateLine`, `expandPath`, `resolveReadPath`, `resolveToCwd`, and the registry primitives `ToolFactory`, `ToolRegistry`, `ToolMetadata`, `ToolCategory`.
+
+## Clean-room Equivalent
+
+`indusagi/capabilities` (`src/capabilities/index.ts`) exposes the modern tool layer: `defineTool`, a separate `ToolRegistry`, the eleven built-in tools (`readTool`, `writeTool`, `editTool`, `lsTool`, `grepTool`, `findTool`, `bashTool`, `processTool`, `todoSetTool`/`todoReadTool`, `webSearchTool`, `webFetchTool`), and the assembled `builtinRegistry` / `toolBox`.
+
+## Related Documentation
+
+- [Agent Loop and Tools](/docs/agent/loop-and-tools) — the agent loop and how tools are dispatched.
+- [Background Process Tool](/docs/agent/bg-process) — the background `process` tool.
+- [Agent API Reference](/docs/agent/api-reference) — full Agent API reference.

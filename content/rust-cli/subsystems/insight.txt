@@ -1,0 +1,423 @@
+# Insight (Observability)
+
+> `induscode::insight` is the agent's single observability plane (`src/insight`) — a thin wrapper crate over the already-built framework [`indusagi::tracing`](/rust/subsystems/tracing) that re-expresses the agent's vocabulary (trail / probe / signal) at the surface and adds only the four pieces the framework lacks: a multi-consumer **fan-out** channel, an in-memory **collector** sink, an **agent scrubber** with TS-style value-run redaction + length caps + omit-keys, and an **NDJSON replay** reader over a durable `{v,phase,probe,at}` envelope. The crate is `induscode`; the bins are `indusr` / `indusagir`.
+
+The insight module is **not** a re-port of the framework's tracing machinery — it composes over it. `ProbeKind`, `Probe`, `Signal`, `TrailId`, and `ProbeId` are zero-cost aliases / bijections onto the framework's `Segment`, `TraceSignal`, `SegmentKind`, and plain-`String` ids; the recorder wraps the framework `Recorder` and interposes a scrub-before-sink pump; the sinks re-export the framework console / file / stream sinks verbatim and add the two the framework is missing. It is the lower-level distributed-tracing plane: timed probes, sampling gates, secret redaction, fan-out to sinks, and replay of persisted traces.
+
+## Table of Contents
+
+- [What This Is Not](#what-this-is-not)
+- [Module Layout](#module-layout)
+- [The Vocabulary Aliases](#the-vocabulary-aliases)
+- [The Kind Map](#the-kind-map)
+- [Signals and Phases](#signals-and-phases)
+- [The Recorder](#the-recorder)
+- [The Fanout Channel](#the-fanout-channel)
+- [Sampling Gates](#sampling-gates)
+- [Secret Redaction](#secret-redaction)
+- [The NDJSON Envelope](#the-ndjson-envelope)
+- [Sinks and the Collector](#sinks-and-the-collector)
+- [Replay](#replay)
+- [Notable Behaviour](#notable-behaviour)
+- [Public Surface](#public-surface)
+- [On the Framework](#on-the-framework)
+
+## What This Is Not
+
+A common framing is that this subsystem surfaces "usage / cost / token / context stats in the footer." It does **not**. There is no cost, token, or usage accounting code anywhere in `src/insight`. Those footer statistics are rendered by the framework's status widgets, surfaced through the [console](/rust-cli/subsystems/conductor) status bar — conceptually adjacent to this subsystem, but with **no code dependency** on it.
+
+`insight` is the distributed-tracing plane: it times spans of work (probes), decides which trails to sample, scrubs secrets out of attributes and faults, fans signals out to N independent sinks, persists them as NDJSON, and reads persisted traces back from disk. The whole module tree is a wrapper around [`indusagi::tracing`](/rust/subsystems/tracing) — see the parity notes in [`/cli`](/cli) (TS) and [`/python-cli/subsystems/insight`](/python-cli/subsystems/insight) (Python) for the lineage.
+
+## Module Layout
+
+Eight modules behind `insight/mod.rs` (the module tree from `PLAN/80_insight_observability.md` §4.1):
+
+| Module | Role |
+|--------|------|
+| `model.rs` | The agent vocabulary aliased onto the framework — `Probe` / `ClosedProbe` / `Signal` / `TrailId` / `ProbeId` aliases, the `ProbeKind` enum + `PROBE_KINDS`, the kind map (`to_segment` / `from_segment`), `SignalPhase`, and the `signal_phase` / `signal_segment` / `is_close_signal` / `is_closed_probe` guards. (`mod.rs` calls this `vocab` in the PLAN.) |
+| `serialize.rs` | The durable NDJSON `{v,phase,probe,at}` record format shared by the file sink and the replay reader; canonical-JSON byte parity + U+2028/U+2029 escaping. |
+| `recorder.rs` | `AgentRecorder`: the framework `Recorder` plus the scrub-before-sink interposition (a pump task) and sink-drain ownership the framework lacks. |
+| `redaction.rs` | `AgentScrubber` over the framework `SecretScrubber`: key-path detection, value-run replacement, length caps, omit-keys, and fault scrubbing. |
+| `sinks/` | Re-exports the framework console / file / stream sinks + the agent's `CollectorSink` and `AgentFileSink`. |
+| `replay.rs` | `read_lines` / `read_records` / `replay_signals` / `replay_probes` / `replay_trails` over the envelope format. |
+| `sampling.rs` | `always_gate` / `never_gate` / `ratio_gate(fraction)` facades over `SampleGate` + the `verdict` helper. |
+| `fanout.rs` | `FanoutChannel`: N independent readers off one producer — multi-consumer fan-out the single-consumer framework channel cannot do alone. |
+
+The four agent-built pieces are exactly: `fanout.rs` (channel), `sinks::collector` (sink + agent file sink), `redaction.rs` (scrubber), and `replay.rs` (reader). Everything else is a thin re-expression of the framework surface.
+
+## The Vocabulary Aliases
+
+`model.rs` ports the frozen type surface of the TS `insight/contract.ts` as **zero-cost aliases** onto `indusagi::tracing`, so the agent gets greppable `Probe` / `Trail` names while persisting byte-identically to the framework NDJSON:
+
+```rust
+use indusagi::tracing::{Segment, SegmentStatus, TraceRecord, TraceSignal};
+
+/// A branded string naming a trail (transparent alias — the brand erased to
+/// `string` at TS runtime, so this is a plain String over the framework's id).
+pub type TrailId = String;
+/// A branded string naming a probe.
+pub type ProbeId = String;
+/// An immutable timed segment within a trail.
+pub type Probe = Segment;
+/// The exported, serializable form of a *closed* probe.
+pub type ClosedProbe = TraceRecord;
+/// The closed wire-event union, discriminated by phase.
+pub type Signal = TraceSignal;
+```
+
+The id byte widths are kept as the single source of truth in `model::id_widths`, matching the framework's W3C Trace Context sizing:
+
+```rust
+pub mod id_widths {
+    pub const TRAIL: usize = 16; // 16 random bytes → 32 hex chars (128-bit)
+    pub const PROBE: usize = 8;  //  8 random bytes → 16 hex chars (64-bit)
+}
+```
+
+Two predicates narrow the aliases:
+
+| Function | Behaviour |
+|----------|-----------|
+| `is_closed_probe(probe: &Probe) -> bool` | `true` when a probe reached a terminal state (`status != SegmentStatus::Open && ended_at.is_some()`). |
+| `is_close_signal(signal: &Signal) -> bool` | `true` when a signal is a terminal `TraceSignal::Close`. |
+
+## The Kind Map
+
+The agent thinks in **run / turn / tool / model / custom**; the framework persists **run / inference / action / recall / custom**. `ProbeKind` is the agent-facing enum, bijective with the framework `SegmentKind`:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeKind { Run, Turn, Tool, Model, Custom }
+
+pub const PROBE_KINDS: [ProbeKind; 5] =
+    [ProbeKind::Run, ProbeKind::Turn, ProbeKind::Tool, ProbeKind::Model, ProbeKind::Custom];
+```
+
+The map is a clean, lossless bijection — `ProbeKind::from_segment(k.to_segment()) == k` for every agent kind (the `kind_map_round_trips` test):
+
+| App `ProbeKind` | Framework `SegmentKind` |
+|-----------------|-------------------------|
+| `Run` | `Run` |
+| `Turn` | `Inference` |
+| `Tool` | `Action` |
+| `Model` | `Recall` |
+| `Custom` | `Custom` |
+
+```rust
+impl ProbeKind {
+    pub fn to_segment(self) -> SegmentKind { /* run→Run, turn→Inference, tool→Action, model→Recall, custom→Custom */ }
+    pub fn from_segment(kind: SegmentKind) -> ProbeKind { /* the inverse */ }
+}
+```
+
+## Signals and Phases
+
+On the wire a probe transition is a `Signal` (alias of the framework `TraceSignal`). The framework discriminates by its serde `type` tag rather than a `phase` field, so `model.rs` re-expresses that discriminant as `SignalPhase`, which serializes to the TS literals so the envelope `phase` field is byte-identical:
+
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SignalPhase { Open, Update, Close } // serializes to "open" / "update" / "close"
+
+pub fn signal_phase(signal: &Signal) -> SignalPhase;       // recover the phase
+pub fn signal_segment(signal: &Signal) -> Option<&Probe>;  // recover the carried probe
+```
+
+`signal_segment` is load-bearing for the **Gotcha G-2** divergence: `Open` carries the full segment and `Close` carries `record.segment()`, but a framework `Update` carries only `{id, attributes}` — not the full probe the TS `UpdateSignal.probe` did — so `signal_segment` returns `None` for an update. The recorder/serializer re-materializes the live segment for that line instead.
+
+## The Recorder
+
+`AgentRecorder` is the head of the insight pipeline (the TS `InsightRecorder`). It wraps the framework `Recorder` (which owns the raw, pre-scrub `SignalChannel` every opened `SegmentHandle` emits onto), interposes the `AgentScrubber` via a **pump task**, fans the scrubbed stream out to N sinks through a `FanoutChannel`, and owns every drain `JoinHandle` so `shutdown` can await them.
+
+```rust
+pub struct RecorderOptions {
+    pub service: String,                  // DEFAULT_SERVICE = "insight"
+    pub enabled: bool,                    // master switch; a disabled recorder is all no-ops
+    pub gate: Option<SampleGate>,         // admission gate; defaults to always_gate when enabled
+    pub scrubber: Option<AgentScrubber>,  // None ⇒ AgentScrubber::passthru()
+}
+
+impl AgentRecorder {
+    pub fn new(options: RecorderOptions) -> Self;
+    pub fn enabled(&self) -> bool;
+    pub fn service(&self) -> &str;
+    pub fn channel(&self) -> &FanoutChannel;
+    pub fn open_trail(&self, kind: ProbeKind, name: &str, trail_id: Option<String>) -> SegmentHandle;
+    pub fn scope_open(&self, trail_id: String, kind: ProbeKind, name: &str) -> SegmentHandle;
+    pub fn scope_child(&self, trail_id: String, parent_id: String, kind: ProbeKind, name: &str) -> SegmentHandle;
+    pub fn attach_sink<S>(&mut self, sink: S) where S: Sink + Send + 'static;
+    pub async fn flush(&self);
+    pub async fn shutdown(self);
+}
+```
+
+### The scrub-before-sink pump (Gotcha G-4)
+
+The framework `Recorder` emits raw segments straight onto its channel with **no redaction hook** — there is no framework seam for scrubbing. So the recorder spawns a pump task that **is** the seam: it drains the raw framework channel, runs every signal through `AgentScrubber::scrub_signal`, and re-emits it onto the fanout. No sink ever sees a secret.
+
+```rust
+let raw = inner.channel();
+let fan = fanout.clone();
+let pump = tokio::spawn(async move {
+    let mut reader = raw.reader();           // futures::Stream<Item = TraceSignal>
+    while let Some(signal) = reader.next().await {
+        fan.emit(scrubber.scrub_signal(signal));
+    }
+    fan.close();                              // raw channel drained ⇒ finish every fanout stream
+});
+```
+
+### Gates, scope, and sampling-out
+
+`AgentRecorder::new` resolves the gate as `enabled ? options.gate.unwrap_or(always_gate) : never_gate()` — a disabled recorder forces `never_gate`, so it emits nothing regardless of the gate. `open_trail` maps the agent kind via `ProbeKind::to_segment`, supplies an `OpenOptions { trace_id, .. }`, and the gate decides on the minted-or-supplied trace id (the TS "mint first, then admit" order, Gotcha G-6). A sampled-out trail collapses to `SegmentHandle::noop` so its whole subtree is free — `scope_open` / `scope_child` join a known trail by id the same way.
+
+### Sink attachment and shutdown (Gotcha G-5)
+
+`attach_sink` spawns each sink's `drain` loop on an **independent** `FanoutChannel::reader` and retains the `JoinHandle` for `shutdown`. Because the framework `Sink::drain` is a bare `async fn` in a trait — whose returned future carries no auto-`Send` bound the compiler can prove for a generic `S`, and stable Rust has no return-type notation to name it — each drain runs to completion on its own dedicated blocking thread via a current-thread runtime (`tokio::task::spawn_blocking`); only the captured `sink` + `reader` cross the thread boundary, never the future.
+
+`shutdown` flushes, closes the framework channel (which ends the pump loop, which closes the fanout, which drives every sink's drain to its terminal `None`), then joins the pump and every drain. Joining (rather than awaiting a result) never panic-propagates — the `Promise.allSettled` analogue.
+
+```rust
+let mut recorder = AgentRecorder::new(RecorderOptions {
+    service: "induscode".to_string(),
+    gate: Some(ratio_gate(0.1)),   // sample ~10% of trails, keyed on trail id
+    ..Default::default()
+});
+let collector = CollectorSink::new();
+recorder.attach_sink(collector.clone());
+
+let run = recorder.open_trail(ProbeKind::Run, "session", None);
+let step = run.child(ProbeKind::Tool.to_segment(), "read_file");
+step.close(None);
+run.close(None);
+
+recorder.shutdown().await;          // flush, close channels, join every drain
+let signals = collector.signals();
+```
+
+## The Fanout Channel
+
+The framework `SignalChannel` is explicitly **single-consumer**: a second `reader()` shares the same FIFO queue, so a signal handed to one reader is gone for the other. The TS `createChannel`, by contrast, multiplexes — every `stream()` is an independent consumer that sees every emitted signal — so the console, file, and network sinks can each drain the same trail.
+
+`FanoutChannel` reproduces that fan-out without re-implementing the transport: it owns a `Vec<SignalChannel>`, **one framework channel per subscriber**. This preserves per-subscriber FIFO back-pressure (each subscriber has its own queue, so a slow sink never starves another) and was chosen over `tokio::sync::broadcast`, which would collapse the independent buffers into one shared ring (OQ-4).
+
+```rust
+#[derive(Clone)]
+pub struct FanoutChannel { /* Arc<Inner> of subscriber channels + a closed latch */ }
+
+impl FanoutChannel {
+    pub fn new() -> Self;
+    pub fn reader(&self) -> SignalChannelReader;  // attach a fresh independent channel
+    pub fn emit(&self, signal: TraceSignal);      // clone onto every subscriber; no-op once closed
+    pub fn close(&self);                          // close every subscriber channel; idempotent
+    pub fn size(&self) -> usize;
+    pub fn is_closed(&self) -> bool;
+}
+```
+
+It is cheaply `Clone`able (every clone shares the same `Arc<Inner>`), so the pump task can hold a clone that emits while the recorder hands out readers and closes the channel. A subscriber only sees signals emitted **after** it attaches (the TS `channel.ts:73-74` contract); a reader attached after `close` finishes at once.
+
+## Sampling Gates
+
+Gates decide whether a trail is admitted; `sampling.rs` is a set of one-line facades over `indusagi::tracing::SampleGate` (so the framework gate is reused, not re-ported):
+
+| Facade | Behaviour |
+|--------|-----------|
+| `always_gate() -> SampleGate` | Admit every trail (`SampleStrategy::Always`); the recorder default when enabled. |
+| `never_gate() -> SampleGate` | Reject every trail (`SampleStrategy::Never`). |
+| `ratio_gate(fraction: f64) -> SampleGate` | Admit a deterministic fraction (`SampleStrategy::Ratio(fraction)`), keyed on the trail id. |
+| `fixed_gates() -> FixedGates` | Bundle `{ always, never }` for the recorder fallback. |
+| `verdict(gate: &SampleGate, trail_id: &TrailId) -> bool` | The sticky, id-keyed verdict the recorder consults (over `SampleGate::decide`). |
+
+`ratio_gate` is FNV-1a-keyed on the trail id and is **bit-identical** to the TS `trailScore` because the framework gate uses the same constants (`0x811c9dc5` / `0x01000193` / `2^32`) and folds over the same bytes; for ASCII-hex ids the byte fold equals the UTF-16 code units the TS iterated. Edge fractions short-circuit without hashing (`<= 0` rejects everything, `>= 1` admits everything), and a `NaN` fraction **fails closed to 0** (sample nothing) so a malformed config is safe. The verdict is a pure function of the id — never a coin flip — so a probe never disagrees with its trail about being sampled. The TS `ratioGate.admit(rootName)` name-only fallback is intentionally **not** reproduced: the recorder always has the trace id before deciding (Gotcha G-6).
+
+## Secret Redaction
+
+`AgentScrubber` is the attribute processor the pipeline runs before a sink — the `route()` step that has no framework seam. Three things trigger a redaction, on a single depth-first walk that tracks the enclosing key as it descends (so nested secrets like `{ http: { headers: { authorization: "…" } } }` are caught by key):
+
+1. a **key-path** match — the attribute key contains a secret-bearing fragment (`apiKey`, `password`, `authorization`, …) → the whole subtree tokenizes;
+2. a **value** match — a string looks like a credential regardless of its key (a bearer token, an `sk-` key, a JWT, a PEM block, …) → **only the matched run** is replaced, not the whole value;
+3. an **omit** — a key in `omit_keys` is dropped from the output entirely.
+
+```rust
+pub const REDACTED_TOKEN: &str = "[insight:scrubbed]";           // NOT the framework's ‹redacted›
+pub const DEFAULT_MAX_STRING_LENGTH: usize = 4096;
+pub const TRUNCATION_SUFFIX: &str = "...[insight:truncated]";
+
+#[derive(Clone)]
+pub struct AgentScrubber { /* key_fragments, compiled value_patterns, max_len, omit_keys, passthru */ }
+
+impl AgentScrubber {
+    pub fn new(max_len: usize, omit_keys: Vec<String>) -> Self;
+    pub fn passthru() -> Self;                                            // PASSTHRU_REDACTOR (identity)
+    pub fn scrub_value(&self, value: &Value) -> Value;
+    pub fn scrub_attributes(&self, attributes: &Map<String, Value>) -> Map<String, Value>;
+    pub fn scrub_fault(&self, fault: &SegmentError) -> SegmentError;      // scrubs the single `message`
+    pub fn scrub_segment(&self, segment: &Segment) -> Segment;            // attributes + fault
+    pub fn scrub_signal(&self, signal: TraceSignal) -> TraceSignal;       // the pump's per-signal step
+}
+
+pub fn default_redactor() -> AgentScrubber;   // DEFAULT_REDACTOR: default rules + caps
+```
+
+This composes the agent's behaviours **over** the framework rule vocabulary — it references the framework `REDACTION_TOKEN` const to keep the dependency edge real and greppable, but layers on the four behaviours the framework lacks: TS-style value-run replacement, `max_string_length` truncation, `omit_keys` wholesale drop, and `SegmentError` fault scrubbing. The walk never mutates its input; output is always freshly allocated, and scrubbing is **idempotent** (scrubbing a scrubbed value is a fixed point). The passthru scrubber returns every input unchanged and is the recorder's default when redaction is unconfigured.
+
+### The default rule set
+
+| Rule kind | Examples |
+|-----------|----------|
+| `SECRET_KEY_FRAGMENTS` (case-insensitive substring of the key) | `apikey`, `api_key`, `secret`, `password`, `passwd`, `authorization`, `auth_token`, `access_token`, `refresh_token`, `session_token`, `private_key`, `credential`, `cookie`, `set-cookie`, `bearer` |
+| `SECRET_VALUE_SOURCES` (compiled `regex`, run-level replacement) | `Bearer`/`Basic`/`Token` scheme prefixes; provider keys (`sk-…`, `pk-…`, live/test variants); GitHub tokens (`ghp_`/`gho_`/`ghs_`/`github_pat_`); AWS access key ids (`AKIA…`); JWTs (three base64url segments); PEM private-key blocks |
+
+The value patterns target structurally distinctive tokens so ordinary prose is not shredded; the matched run is what gets replaced. `scrub_signal` is **Gotcha G-2**-aware: it scrubs the full segment for `Open`/`Close` but only the attribute bag for an `Update` (which carries no full probe). Fresh ids come from the framework minter via the `id_widths` (trail = 16 bytes / 32 hex, probe = 8 bytes / 16 hex).
+
+## The NDJSON Envelope
+
+`serialize.rs` defines the durable record format shared by the file sink and the replay reader. The agent envelope is `{v, phase, probe, at}` written for **every** phase (open / update / close) — **not** the framework's bare close-only `TraceRecord(Segment)`, because replay of in-flight probes needs the open/update lines (Gotcha G-3):
+
+```rust
+pub const RECORD_VERSION: u8 = 1;
+pub const LINE_FEED: char = '\n';
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TraceRecord {
+    pub v: u8,             // RECORD_VERSION; a future reader can branch on it
+    pub phase: SignalPhase,
+    pub probe: Probe,      // the framework Segment (camelCase serde matches TS field names)
+    pub at: u64,           // emission clock, epoch ms
+}
+
+pub fn record_from_parts(phase: SignalPhase, probe: Probe, at: u64) -> TraceRecord;
+pub fn signal_to_record(signal: &Signal, at: u64) -> Option<TraceRecord>;  // None for a framework Update (G-2)
+pub fn encode_record(record: &TraceRecord) -> String;
+pub fn encode_signal(signal: &Signal, at: u64) -> Option<String>;          // open/close fast path; None for Update
+pub fn decode_record(line: &str) -> serde_json::Result<TraceRecord>;
+pub fn record_is_close(record: &TraceRecord) -> bool;                      // phase == Close
+pub fn signal_is_close(signal: &Signal) -> bool;
+```
+
+Field declaration order is `v, phase, probe, at`, matching the TS object-literal key order. **Byte parity** with the TS `JSON.stringify` is guaranteed by routing every encode through [`indusagi::core::canonical_json`](/rust/subsystems/core) (a character-faithful `JSON.stringify` — JS key order + number formatting + string escaping) rather than `serde_json::to_string` (which is *not* `JSON.stringify`). U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR) are escaped to ` ` / ` ` so a strictly-newline reader recovers each line intact even though both code points are legal inside a JSON string yet line-breaking under a JS/`read_lines` splitter. Each line is terminated by exactly one `\n`.
+
+## Sinks and the Collector
+
+`sinks/mod.rs` re-exports the framework `Sink` trait, `ConsoleSink`, `FileSink`, and `StreamSink<W>` (and their `*Options`) **unchanged**, and adds the two sinks the framework lacks, both in `sinks/collector.rs`:
+
+| Sink | Source | Role |
+|------|--------|------|
+| `ConsoleSink` / `FileSink` / `StreamSink` | `indusagi::tracing` (re-exported) | The framework's console / NDJSON-file / generic-writer sinks, which persist **close records only**. |
+| `CollectorSink` | `sinks/collector.rs` | The in-memory test/inspection sink: drains a channel into a shared `Vec<TraceSignal>`, capturing **every** phase in arrival order. |
+| `AgentFileSink` | `sinks/collector.rs` | The agent's durable file sink: writes the §4.7 `{v,phase,probe,at}` envelope for every probe-carrying phase (vs. the framework `FileSink`'s close-only bare `Segment`). |
+
+### CollectorSink
+
+```rust
+#[derive(Clone, Default)]
+pub struct CollectorSink { /* Arc<Mutex<Vec<TraceSignal>>> */ }
+
+impl CollectorSink {
+    pub fn new() -> Self;
+    pub fn signals(&self) -> Vec<TraceSignal>;          // every drained signal, arrival order
+    pub fn close_records(&self) -> Vec<TraceRecord>;    // the cooked terminal-only view
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+```
+
+`Clone` shares the same backing buffer (an `Arc<Mutex<Vec<_>>>`), so a clone handed to `drain` still fills the vec the caller inspects — the idiom the recorder tests use (`recorder.attach_sink(collector.clone())`, then read `collector.signals()` after `shutdown`).
+
+### AgentFileSink
+
+```rust
+#[derive(Debug, Clone)]
+pub struct AgentFileSinkOptions {
+    pub path: PathBuf,
+    pub mkdirp: bool,    // create the parent directory if missing; default true
+    pub truncate: bool,  // truncate on open instead of appending; default false
+}
+
+pub struct AgentFileSink { /* options + a lazily-opened tokio File */ }
+
+impl AgentFileSink {
+    pub fn new(path: impl Into<PathBuf>) -> Self;
+    pub fn with_options(options: AgentFileSinkOptions) -> Self;
+}
+```
+
+The file is opened **lazily** on the first probe-carrying signal (a sink that is never used touches no disk); `drain` flushes the OS buffer when the stream ends, and the separate `Sink::close` method (idempotent) flushes-then-shuts the handle. Each signal is written via the shared `encode_signal` codec, so the writer and the replay reader provably agree on the line format. `at` is the segment's own timing — `started_at` for an open, `record.ended_at()` for a close. Update signals (no full probe — G-2) are **skipped**, since open/close already carry the full probe the replayer reconstructs from. Writing the open lines (not just closes) is exactly what makes the replay round-trip work.
+
+## Replay
+
+`replay.rs` is a pure reader over the envelope format with no framework dependency beyond the `Probe` / `TraceRecord` types. It never imports the recorder and performs no recording; a malformed line is, by default, **skipped** rather than fatal, so a trace truncated by a crash still yields everything written before the break.
+
+```rust
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReplayOptions { pub strict: bool }   // error on a malformed line instead of skipping
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReplayError { Json(serde_json::Error), Malformed }
+```
+
+The pipeline composes bottom-up:
+
+| Function | Yields |
+|----------|--------|
+| `read_lines<S>(source: S) -> impl Stream<Item = String>` | Chunk → line splitter over a `Stream<Item = String>`: splits on `\n` only, drops blank lines, and emits a trailing unterminated final line so a non-newline frame is not dropped. |
+| `read_records<S>(source, options) -> impl Stream<Item = Result<TraceRecord, ReplayError>>` | Decodes each line, validating `v == RECORD_VERSION` + a known phase; skips a malformed line by default, or yields one `Err` and stops under `strict`. |
+| `replay_signals<S>(source, options) -> Result<Vec<ReplaySignal>, ReplayError>` | The flat `{ phase, probe, at }` records in file order (a `ReplaySignal`, since the framework `Update` variant cannot carry the phase+probe pairing — G-2). |
+| `replay_probes<S>(source, options) -> Result<IndexMap<ProbeId, Probe>, ReplayError>` | The final value of each probe, keyed by id (close wins over open) in first-seen insertion order. |
+| `replay_trails<S>(source, options) -> Result<Vec<ReplayedTrail>, ReplayError>` | The collapsed probes grouped into per-trail parent→children trees. |
+
+```rust
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReplaySignal { pub phase: SignalPhase, pub probe: Probe, pub at: u64 }
+
+#[derive(Debug, Clone)]
+pub struct ReplayedTrail {
+    pub trail_id: TrailId,
+    pub root: Option<Probe>,                              // the parentless probe, if seen
+    pub probes: IndexMap<ProbeId, Probe>,                 // every probe, first-seen order
+    pub children: HashMap<Option<ProbeId>, Vec<ProbeId>>, // parent→children; roots under the None key
+    pub complete: bool,                                   // true iff every probe is terminal
+}
+```
+
+`replay_trails` first collapses to final probe values (close wins, file order preserved via `IndexMap`), buckets them by `trace_id`, and assembles each `ReplayedTrail` via `build_trail`: it walks the collapsed map, builds the parent→children adjacency, locates the root (`parent_id.is_none()`), and sets `complete = false` if any probe is not closed. Because the file sink writes opens too, the reader tolerates a foreign writer that persists open records (the phase is derived per record) even though framework sinks only ever wrote closes.
+
+## Notable Behaviour
+
+1. **No cost / token / usage / footer accounting** lives here — this subsystem is the tracing plane only.
+2. **Wrapper, not re-port.** The vocabulary is zero-cost aliases onto `indusagi::tracing`; the recorder wraps the framework `Recorder`; the sinks re-export the framework ones. Only four pieces are agent-built: fanout, collector + agent file sink, scrubber, replay.
+3. **Scrub-before-sink is the seam (G-4).** The framework `Recorder` has no redaction hook, so the recorder's pump task *is* the redaction step — no sink ever sees an unscrubbed value.
+4. **A framework `Update` carries no full probe (G-2).** `signal_segment` returns `None`, `encode_signal` declines it, and the file sink skips update lines; open/close carry the full probe replay reconstructs from. Reserved fault info on the segment is carried on the `Segment.error` (`SegmentError.message`), which is the single field `scrub_fault` scrubs.
+5. **Per-subscriber FIFO fan-out.** Each sink gets its own framework channel and its own buffer (chosen over `tokio::sync::broadcast`), so a slow sink never starves another; a sink attached after some signals were emitted only sees subsequent ones.
+6. **Drains run on dedicated blocking threads.** Because the framework `Sink::drain` future is not provably `Send` for a generic `S`, each drain runs on a current-thread runtime via `spawn_blocking`; `shutdown` joins them (the `Promise.allSettled` analogue, G-5).
+7. **Byte-faithful NDJSON.** Every encode goes through `canonical_json` for `JSON.stringify` parity, with U+2028/U+2029 escaped so a newline splitter recovers each line.
+8. **Crash-tolerant replay.** A malformed line is skipped by default (or errors once under `strict`), so a truncated trace still replays its written prefix.
+
+## Public Surface
+
+The subsystem is consumed through `induscode::insight`. At scaffold time `mod.rs` re-exports the vocabulary head (`PROBE_KINDS`, `ProbeKind`); the full surface is reached through the module paths:
+
+| Name | Kind | Module | Purpose |
+|------|------|--------|---------|
+| `AgentRecorder` / `RecorderOptions` | struct | `recorder` | The recorder facade and its construction options. `DEFAULT_SERVICE = "insight"`. |
+| `Probe` / `ClosedProbe` / `Signal` | type alias | `model` | The agent's segment / closed-record / wire-event aliases over the framework. |
+| `TrailId` / `ProbeId` | type alias | `model` | The plain-`String` id aliases; widths in `id_widths::{TRAIL, PROBE}`. |
+| `ProbeKind` / `PROBE_KINDS` | enum / const | `model` | The agent kinds and the closed ordered set; `to_segment` / `from_segment`. |
+| `SignalPhase` | enum | `model` | `Open` / `Update` / `Close`; serializes to the TS literals. |
+| `signal_phase` / `signal_segment` / `is_close_signal` / `is_closed_probe` | fn | `model` | Phase / probe recovery and the two terminal-state guards. |
+| `FanoutChannel` | struct | `fanout` | Multi-consumer fan-out: `reader` / `emit` / `close` / `size` / `is_closed`. |
+| `always_gate` / `never_gate` / `ratio_gate` / `fixed_gates` / `verdict` | fn | `sampling` | The sampling-gate facades and the id-keyed verdict. `FixedGates`. |
+| `AgentScrubber` / `default_redactor` | struct / fn | `redaction` | The attribute redactor and the default-rules preset; `passthru()`. |
+| `REDACTED_TOKEN` / `DEFAULT_MAX_STRING_LENGTH` / `TRUNCATION_SUFFIX` | const | `redaction` | `"[insight:scrubbed]"`, `4096`, `"...[insight:truncated]"`. |
+| `TraceRecord` / `RECORD_VERSION` / `LINE_FEED` | struct / const | `serialize` | The `{v,phase,probe,at}` envelope, version `1`, the `\n` boundary. |
+| `record_from_parts` / `signal_to_record` / `encode_record` / `encode_signal` / `decode_record` / `record_is_close` / `signal_is_close` | fn | `serialize` | The NDJSON codec. |
+| `CollectorSink` | struct | `sinks::collector` | The in-memory all-phase sink: `signals()` / `close_records()` / `len` / `is_empty`. |
+| `AgentFileSink` / `AgentFileSinkOptions` | struct | `sinks::collector` | The envelope NDJSON file sink (`mkdirp` / `truncate`, lazy open). |
+| `ConsoleSink` / `FileSink` / `StreamSink` / `Sink` (+ `*Options`) | trait / struct | `indusagi::tracing` (re-export) | Framework sinks reused unchanged. |
+| `read_lines` / `read_records` / `replay_signals` / `replay_probes` / `replay_trails` | fn | `replay` | The NDJSON readers. |
+| `ReplayOptions` / `ReplayError` / `ReplaySignal` / `ReplayedTrail` | struct / enum | `replay` | The reader options, error, flat signal, and reconstructed trail. |
+
+## On the Framework
+
+Everything below this wrapper belongs to the [indusagi framework](/rust). The transport (`SignalChannel` / `SignalChannelReader`), the `Recorder` + `SegmentHandle` + `OpenOptions`, the `Segment` / `SegmentKind` / `SegmentStatus` / `SegmentError` / `TraceRecord` / `TraceSignal` value types, the `SampleGate` / `SampleStrategy` admission engine, the `SecretScrubber` + `REDACTION_TOKEN`, and the three console / file / stream `Sink`s are all framework surfaces consumed from [`indusagi::tracing`](/rust/subsystems/tracing); the canonical-JSON encoder is [`indusagi::core::canonical_json`](/rust/subsystems/core). The insight subsystem adds exactly four things on top: a multi-consumer fan-out channel, an in-memory collector sink, an agent secret scrubber with the behaviours the framework's lacks, and an NDJSON replay reader over a durable per-phase envelope. See [Parity](/rust-cli/reference/parity) for the broader translation record against the [TS](/cli) and [Python](/python-cli/subsystems/insight) editions.

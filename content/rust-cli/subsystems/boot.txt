@@ -1,0 +1,736 @@
+# Boot
+
+> The launch orchestrator of the Rust agent: `boot_run(argv, io)` seeds an immutable
+> `BootContext`, folds it through the five-stage `BootPipeline` (locate-workspace →
+> apply-upgrades → build-invocation → resolve-resources → select-runner), dispatches
+> the resolved `Runner` through the **total** `RunnerRegistry` (repl is the fallback),
+> and drains closables in reverse on the way out. Everything that wires the other
+> subsystems together at startup — runner selection, the shared conductor factory,
+> per-session safety stores, the disk auth vault, idempotent profile upgrades, and
+> addon wiring — lives under `induscode::boot`.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [The boot orchestrator](#the-boot-orchestrator)
+- [The orchestrator contract](#the-orchestrator-contract)
+- [The stage pipeline](#the-stage-pipeline)
+- [Invocation projection](#invocation-projection)
+- [Runner dispatch](#runner-dispatch)
+- [The three runners](#the-three-runners)
+- [The shared conductor factory](#the-shared-conductor-factory)
+- [Resource assembly](#resource-assembly)
+- [The credential vault](#the-credential-vault)
+- [Addon wiring](#addon-wiring)
+- [The delegate runner](#the-delegate-runner)
+- [Profile upgrades](#profile-upgrades)
+- [Feature flags](#feature-flags)
+- [Public exports](#public-exports)
+- [Examples](#examples)
+- [Key concepts](#key-concepts)
+
+## Overview
+
+`induscode::boot` is the top-of-stack assembly layer of the [Rust agent](/rust-cli):
+it turns a sliced `argv` plus an I/O seam into a running coding agent and a process
+exit code. It is the merged-crate analogue of the TS [`boot`](/cli) and Python
+[`boot`](/python-cli/subsystems/boot) subsystems, ported over the framework template
+`indusagi::shell_app::boot` (`Stage`, `run_stages`, `BootIo`, `OutputSink`,
+`InputSource`, `Closable`) and `indusagi::shell_app::runners` (`Runner`,
+`select_runner`).
+
+The design stance, matching the other editions, is **pipeline as data, not control
+flow**: stages are `Box<dyn Stage>` rows folded by `BootPipeline::run`, and dispatch
+is a first-accept scan over an ordered `RunnerRegistry` rather than an `if`/`else`
+ladder. Adding a stage or a mode is a one-line edit to a table.
+
+The module is also the single import site for the orchestrator contract. The crate's
+`boot/mod.rs` re-exports the contract types so callers code against one surface:
+
+```rust
+pub use contract::{
+    BootContext, BootIo, BootPipeline, Closable, InputSource, Invocation, OutputSink,
+    Runner, RunnerId, RunnerRegistry, Stage, StartupResources,
+};
+```
+
+Boot consumes the [launch](/rust-cli/subsystems/launch) flag grammar
+(`launch::parser::read_invocation`), the [conductor](/rust-cli/subsystems/conductor)
+for the session engine, the [capability deck](/rust-cli/subsystems/capability-deck)
+for tools, [briefing](/rust-cli/subsystems/briefing) for the system prompt,
+[channels](/rust-cli/subsystems/channels) for the non-interactive transports, and the
+[console](/rust-cli/console/overview) only behind the `tui` feature so a headless
+build never pays the ratatui cost. Against the framework it types its resolved-resource
+graph against `indusagi::shell_app::Settings` and drives the agent loop through
+`indusagi::runtime`.
+
+Two layers of contract exist, deliberately:
+
+- `induscode::core::boot_contract` (milestone M0) owns the **value shapes** —
+  `BootContext`, `Invocation`, `RunnerId`, `StartupResources`, `CredentialGraph`,
+  `ModelCatalog`, plus *sync* `Stage`/`Runner` trait skeletons. It lives in the leaf
+  `core` module because `launch`/`deck`/`settings` import these shapes, and putting
+  them in `boot` would create a `boot ⇄ launch` cycle Cargo forbids.
+- `induscode::boot::contract` re-states the **async orchestrator** form over the same
+  value types — the async `Stage`/`Runner` traits, the line-oriented `BootIo` seam,
+  and a future-returning `Closable` — because the framework `run_stages` fold and the
+  runner turn loop are `async`.
+
+## The boot orchestrator
+
+`boot_run(argv, io)` is the single async function the binary entry (`src/bin/main.rs`)
+calls. Its signature is stable:
+
+```rust
+pub async fn boot_run(argv: Vec<String>, io: BootIo) -> std::process::ExitCode;
+```
+
+The contract is explicit: `boot_run` **never** calls `process::exit` — it maps every
+outcome to an `ExitCode` returned by value (the only place a code reaches the OS,
+mirroring the framework `cli.rs` discipline) — and it **always** drains the context's
+`closables` in reverse on the way out, regardless of how the runner resolved.
+
+The body is short and linear:
+
+```rust
+pub async fn boot_run(argv: Vec<String>, io: BootIo) -> ExitCode {
+    let seeded = seed_context(argv, io);
+
+    let pipeline = pipeline::stages();
+    let ctx = pipeline.run(seeded).await;
+
+    let registry = runners::registry();
+    let code = registry.select(&ctx.invocation).run(&ctx).await;
+
+    drain_closables(&ctx).await;
+    ExitCode::from(code as u8)
+}
+```
+
+1. **Seed.** `seed_context(argv, io)` builds the initial `BootContext`: it resolves the
+   `Workspace` via `core::create_workspace(Default::default())` (pure path computation —
+   directories are materialised later), sets `BRAND`, seeds an empty `closables` list
+   and a placeholder `Invocation::default()` (mode `None`), and threads the `BootIo`
+   seam through.
+2. **Fold.** `pipeline::stages()` builds the five-stage `BootPipeline`; `pipeline.run`
+   folds it over the seed.
+3. **Dispatch.** `runners::registry()` builds the `[repl, oneshot, link]` registry;
+   `registry.select(&ctx.invocation)` returns the first runner whose `accepts` matches
+   `mode` (repl is the total fallback), and `run(&ctx)` drives it to an `i32` exit code.
+4. **Drain.** `drain_closables(&ctx)` runs every teardown, latest-registered first.
+
+Notably, the **credential / package verbs** (`signin`, `signout`, `auth …`, `install`,
+`remove`, `update`, `list`, `config`) and the **meta short-circuits**
+(`--help` / `--version` / `--list-models`) are owned by the `route()` function in
+`src/bin/main.rs`, which renders usage and routes the auth subcommand through
+[`launch`](/rust-cli/subsystems/launch) *before* calling `boot_run`. So by the time
+argv reaches `boot_run` it is always a session-bound launch — the pipeline parses it and
+the registry dispatches the resolved runner. This keeps `boot_run` the single session
+entry while the binary owns the no-session verbs.
+
+### Closable draining
+
+```rust
+pub async fn drain_closables(ctx: &BootContext) {
+    let drained: Vec<Closable> = match ctx.closables.lock() {
+        Ok(mut guard) => guard.drain(..).collect(),
+        Err(poisoned) => poisoned.into_inner().drain(..).collect(),
+    };
+    for close in drained.into_iter().rev() {
+        close().await;
+    }
+}
+```
+
+The list is drained under the `Mutex` (recovering from a poisoned lock), then each
+teardown is `await`ed in reverse registration order. Individual failures are swallowed
+so one bad closer cannot mask the run's exit code or strand the rest.
+
+## The orchestrator contract
+
+`boot/contract.rs` declares the async seams every other boot module is written against,
+re-exporting the value shapes from `core::boot_contract` so nothing is re-declared.
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `BootContext` | struct | The value threaded through the pipeline: `argv`, `workspace`, `brand`, `invocation`, `resources: Option<StartupResources>`, the live `io: BootIo`, and `closables: Mutex<Vec<Closable>>` |
+| `Invocation` | struct (from `core`) | The thin routing projection of the parsed command line (see [below](#invocation-projection)) |
+| `RunnerId` | enum (from `core`) | `Repl` / `Oneshot` / `Link` — the three top-level execution modes |
+| `StartupResources` | struct (from `core`) | Resolved `settings` (`indusagi::shell_app::Settings`) + `auth: CredentialGraph` + `models: ModelCatalog` |
+| `Stage` | `#[async_trait]` trait | `fn name(&self) -> &str` + `async fn apply(&self, ctx: BootContext) -> BootContext` |
+| `BootPipeline` | struct | `Vec<Box<dyn Stage>>` + `run(&self, initial) -> BootContext` |
+| `Runner` | `#[async_trait(?Send)]` trait | `fn id() -> RunnerId`, `fn accepts(&Invocation) -> bool`, `async fn run(&self, &BootContext) -> i32` |
+| `RunnerRegistry` | struct | The ordered runner table + the **total** `select` first-accept scan |
+| `BootIo` | struct | `output: Arc<dyn OutputSink>` + `input: Arc<dyn InputSource>` |
+| `OutputSink` | trait | `write(&str)` + `write_error(&str)` — line-oriented user/diagnostic output |
+| `InputSource` | `#[async_trait]` trait | `async fn next_line(&self) -> Option<String>` — `None` at EOF |
+| `Closable` | type alias | `Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>` |
+
+`BootContext::closables` uses interior mutability (`Mutex<Vec<Closable>>`) because
+runners hold a shared `&BootContext` through `Runner::run` yet still need to register
+teardowns — the faithful analogue of the TS `Array.push` onto a mutable field of an
+otherwise read-only object. `BootContext` exposes `push_closable(closable)` and a
+convenience `output_error(text)`.
+
+Each `Stage::apply` returns a *fresh* successor via struct-update (`BootContext { field,
+..ctx }`), never an in-place mutation. The framework `Runner::run` is `?Send` because
+the future borrows the (intentionally non-`Sync`) `BootContext` and the launcher drives
+it inline on one task, so a `Send` bound would buy nothing and force `Sync` onto every
+captured boot resource.
+
+The registry differs from the framework's fallible `indusagi::shell_app::select_runner`
+(which returns a `Result` because the shell's help/version are output-only modes): the
+agent's `RunnerRegistry::select` is **total** — repl is the first entry and the
+guaranteed fallback — which is correct precisely because `boot_run` only ever sees
+session-bound launches.
+
+```rust
+pub fn select(&self, inv: &Invocation) -> &dyn Runner {
+    self.runners
+        .iter()
+        .find(|r| r.accepts(inv))
+        .map(|r| r.as_ref())
+        .unwrap_or_else(|| self.runners.first().map(|r| r.as_ref()).expect("repl fallback"))
+}
+```
+
+## The stage pipeline
+
+`boot/pipeline.rs` builds the ordered list and folds it. `stages()` assembles the five
+`Box<dyn Stage>` rows; `BootPipeline::run` reduces a seed through each, awaiting strictly
+in order (never concurrently). The input is never mutated.
+
+```rust
+pub fn stages() -> BootPipeline {
+    BootPipeline::new(vec![
+        Box::new(LocateWorkspace),
+        Box::new(ApplyUpgrades),
+        Box::new(BuildInvocation),
+        Box::new(ResolveResources),
+        Box::new(SelectRunnerMarker),
+    ])
+}
+```
+
+| Stage | `name()` | Effect |
+|-------|----------|--------|
+| `LocateWorkspace` | `locate-workspace` | `ensure_dirs(&ctx.workspace)` — `mkdir -p`s the resolved layout (path computation already happened in the seed). Best-effort: a `mkdir` failure is reported through `output_error` but never aborts boot |
+| `ApplyUpgrades` | `apply-upgrades` | Folds the idempotent `apply_upgrades(&ctx.workspace)` registry; each warning is printed, never fatal |
+| `BuildInvocation` | `build-invocation` | Re-parses `argv` via `launch::parser::read_invocation`, then projects the launch `Invocation` down onto the boot-routing `Invocation` via `map_invocation` |
+| `ResolveResources` | `resolve-resources` | Attaches the best-effort `StartupResources` graph from `resources::resolve_startup_resources(&ctx)` onto `ctx.resources` |
+| `SelectRunnerMarker` | `select-runner` | A marker / tracing no-op; the real dispatch happens in `boot_run` after the pipeline so the chosen runner owns the exit code |
+
+The `LocateWorkspace` and `ApplyUpgrades` stages return the context unchanged (they
+have only filesystem side-effects); `BuildInvocation` and `ResolveResources` return a
+struct-update successor with one field set.
+
+Note the deliberate double-parse: in the other editions a seed parse runs the meta
+short-circuits up front, but in the Rust edition the no-session verbs and meta flags are
+intercepted in `bin/main.rs` *before* `boot_run`. The pipeline's `build-invocation`
+stage is therefore the single parse that drives session dispatch, and it shares the one
+launch parser with `bin/main.rs` so help, parsing, and routing can never drift.
+
+## Invocation projection
+
+`build-invocation` parses the full launch flag grammar (`read_invocation`) and projects
+the rich launch `Invocation` down onto the thin boot-routing `Invocation` the registry
+keys off. The launch parser owns the grammar (see [Launch](/rust-cli/subsystems/launch));
+the boot layer only needs the routing subset.
+
+`map_invocation` maps the launch `OutputMode` onto `RunnerId` one-to-one:
+
+| `OutputMode` | flag | `RunnerId` | Meaning |
+|--------------|------|-----------|---------|
+| `Rpc` | `--json` / `--rpc` | `Link` | Headless JSON-RPC link for a driving parent |
+| `Json` | `--print` && !`--interactive` | `Oneshot` | Single non-interactive request to stdout |
+| `Text` | (default) | `Repl` | Interactive terminal session |
+
+```rust
+let mode = match parsed.mode {
+    OutputMode::Rpc => RunnerId::Link,
+    OutputMode::Json => RunnerId::Oneshot,
+    OutputMode::Text => RunnerId::Repl,
+};
+```
+
+The projection threads the routing-relevant fields onto the boot `Invocation`: `prompt`,
+`model_id`, `fallback_model_id`, `cwd`, `account`, `thinking` (as a string), `system`,
+`append_system`, `tools` (allow-list), `no_tools`, `mcp`, `resume`, `continue_latest`,
+`list_models` (+ `list_models_filter`), and `rest` (positionals).
+
+The `--list-models` value lands in the loose `flags` bag keyed `"list-models"`: presence
+sets `list_models = true` and a non-empty string becomes `list_models_filter`. The
+boolean `--resume` (`-r`) and `--continue` (`-c`) are read out of the same bag —
+`flag_set("resume")` / `flag_set("continue")` — so the repl runner's resume flow actually
+fires (an earlier audit had hardcoded both `false`).
+
+## Runner dispatch
+
+`boot/runners.rs` builds the registry and holds the three runners. `registry()` is the
+table-driven replacement for a mode `if`/`else` ladder:
+
+```rust
+pub fn registry() -> RunnerRegistry {
+    RunnerRegistry::new(vec![
+        Box::new(ReplRunner),
+        Box::new(OneShotRunner),
+        Box::new(LinkRunner),
+    ])
+}
+```
+
+The order is `[repl, oneshot, link]` and selection is the first-accept scan from
+`RunnerRegistry::select`, falling back to the first entry (`ReplRunner`) so dispatch is
+total. Each runner's `accepts` keys solely off `inv.mode`; each `run` first builds the
+shared conductor and then drives its surface to an exit code. The exit codes used:
+
+| Const | Value | Used by |
+|-------|-------|---------|
+| `EXIT_OK` | `0` | Link stream EOF; clean repl mount teardown |
+| `EXIT_REPL_UNAVAILABLE` | `1` | A headless build asked to mount the interactive console; a terminal lifecycle failure |
+| `EXIT_NO_INPUT` | `2` | A one-shot run launched with no request text |
+
+## The three runners
+
+### `ReplRunner` — interactive ratatui console (the default + total fallback)
+
+Matches `mode == Some(RunnerId::Repl)`. Its `run` builds the session conductor via
+`build_conductor(ctx)`, honours `--resume` / `--continue` via `apply_resume` **before**
+mounting (so the console renders the restored transcript from its first frame), then
+calls `mount_repl(ctx, conductor)`.
+
+This is the **inversion** of how the TS `repl-runner` mounted Ink: there `mountConsole`
+owned the React loop; here the runner hands the conductor to
+[`console::mount_console`](/rust-cli/console/overview), which owns the blocking
+immediate-mode ratatui loop and returns on exit.
+
+`mount_repl` is feature-gated. Behind `tui` it assembles `MountConsoleOptions` and calls
+`mount_console(conductor, opts).await`, seeding:
+- `initial_input` from the positional prompt (blank/absent leaves the composer empty);
+- `cwd` from the resolved `--cwd` (else process cwd);
+- `sessions_dir` from `session_scope_dir_for(inv, workspace)` — the **same** cwd-scoped
+  directory `build_conductor` rooted its persistence store at, so the `/resume`,
+  `/tree`, `/branch`, and `/timeline` overlays list exactly what the live session writes;
+- `auth_path` (the `auth.json` the `/login` / `/logout` overlays read/write — the same
+  store the headless `signin`/`signout` verbs use);
+- `prefs` (the two-tier `PreferenceStore` the `/settings` and theme overlays read/commit).
+
+A mount error (terminal lifecycle failure) is reported once and mapped to
+`EXIT_REPL_UNAVAILABLE`. On a `--no-default-features` (headless) build the `tui`-gated
+body compiles out and a bare/interactive command line is told the interactive surface
+needs the `tui` build — it never mounts a plain-text fallback (the TS repl-runner has
+none either).
+
+#### Resume
+
+`apply_resume(ctx, &conductor)` is a no-op unless `--resume` or `--continue` is set. It
+opens a `SessionLibrary` over the cwd-scoped directory, picks the target session id via
+`choose_resume_target`, and calls `conductor.resume(session_id)`. Both flags resolve to
+the most recent row from the newest-first `SessionLibrary::list` (the head row is the
+most recent session in the cwd). After resume it checks for a `ConductorPhase::Faulted`
+snapshot and, on failure (no rows, load fault), degrades to the fresh session with a
+one-line stderr notice rather than crashing.
+
+### `OneShotRunner` — the `--print` path
+
+Matches `mode == Some(RunnerId::Oneshot)`. It computes `oneshot_prompts(&inv)` (the
+positional first prompt when present); with no request text it writes a notice and exits
+`EXIT_NO_INPUT` (`2`) rather than opening a wasted model round. Otherwise it builds the
+conductor, wraps it in a `ChannelContext` over a stdout `LineSink` (`StdoutSink`) and the
+`inert_dialog`, and calls `channels::protocol::run_oneshot(&channel, &request)`. The
+output shape is `OneshotShape::Text` (NDJSON support is wired through the launch
+projection downstream). It mirrors the framework `OneShotRunner` — driving the
+*conductor*, not a bare agent, through the channel's snapshot-fallback text strategy so
+`--print` is never silently empty. See [Channels](/rust-cli/subsystems/channels).
+
+### `LinkRunner` — the headless JSON-RPC wire
+
+Matches `mode == Some(RunnerId::Link)`. It builds the conductor, the
+`channels::protocol::session_ops()` registry, and a `ChannelContext` over `StdoutSink`,
+then runs a serialized read loop over the boot `InputSource` seam: each framed request
+line is handled to settlement before the next is read, blank lines are ignored, and EOF
+(`None`) ends the loop with `EXIT_OK`. `handle_link_line` parses the JSON-RPC envelope,
+dispatches the method through `channels::protocol::dispatch`, and frames exactly one
+correlated `Reply` back through the NDJSON `channels::framer::encode_line` — a request
+with no `id` is a notification (dispatched for effect, never replied to); a malformed
+line yields a single framed parse error and the loop continues. It mirrors the framework
+`WireRunner` read-loop discipline but is data-driven through the declarative op registry.
+
+## The shared conductor factory
+
+`build_conductor(ctx)` is the shared factory both non-interactive runners and the repl
+runner call — the Rust analogue of the TS `buildSessionConductor`. It assembles a
+fully-wired session [`Conductor`](/rust-cli/subsystems/conductor) so the agent it drives
+has its deck tools callable and its system prompt composed — exactly what `-p` and the
+interactive console need.
+
+The steps:
+
+1. **Model resolution** — `resolve_model_id(inv.model_id, saved_default, &authed)` runs
+   the full precedence: an explicit `--model` wins; else the saved
+   `settings.default_model` from the two-tier `PreferenceStore` (an empty string counts
+   as unset, so a fresh install falls through); else the first authenticated provider's
+   current model (`authenticated_providers(&auth_path)`); else the catalog fallback.
+   Reading the saved model and the authenticated providers here is what lets a persisted
+   `/model` choice bind on every startup with no picker.
+2. **Thinking level** — `resolve_thinking(inv.thinking)` maps the token onto an
+   `indusagi::llmgateway::contract::ThinkingLevel` (`off`/`low`/`medium`/`high`/`max`;
+   the aliases `minimal`→`Low` and `xhigh`→`Max` fold onto the nearest real level).
+3. **Tools + MCP + addons** — `build_session_tools(inv, cwd)` provisions the deck's
+   12 built-in cards (read / write / edit / bash / grep / find / …) plus the app-novel
+   cards, grafts the configured MCP servers, then layers addons (see
+   [Resource assembly](#resource-assembly) and [Addon wiring](#addon-wiring)).
+4. **System prompt** — `compose_session_briefing(inv, cwd, &descriptors)` builds the
+   tool-aware [briefing](/rust-cli/subsystems/briefing); `--system` replaces it,
+   `--append-system` appends.
+5. **Permission policy** — `resolve_permission_policy(ctx, cwd)` reads the
+   project-then-global `permissions` block from the `PreferenceStore` and pushes `deny`,
+   then `ask`, then `allow` rules (so a deny anywhere wins the scan) and takes the first
+   `default_mode`. Plan mode is reachable only in the repl (`plan_reachable = inv.mode
+   == Some(RunnerId::Repl)`).
+6. **Session scoping + persistence** — `session_scope_dir_for(inv, workspace)` partitions
+   sessions per working directory; a `indusagi::runtime::store::SessionStore` rooted there
+   is threaded onto `LoopDeps::store` so each settled turn is durably appended to the
+   cwd-scoped `.jsonl` file. The same directory is `plans_dir` for approved plan-mode
+   plans.
+7. **Diagnostics** — when the cwd carries a `tsconfig.json`, a `DiagnosticsEngine` is
+   wired so a turn that edits TS/JS gets its new type errors injected into the next turn.
+8. **Key resolver** — `build_key_resolver(ctx)` (see below) is threaded onto
+   `LoopDeps::key_resolver`; `--fallback-model` onto `LoopDeps::fallback_model_id`.
+
+The conductor is built first so the gate can read its live mode holder and approval
+delegate, then the deck is wrapped in a `GatedToolBox` and re-seated via
+`conductor.register_tools(Some(gated))`. The gate is omitted only when there is nothing
+to enforce — no rules AND an allow-all mode (`Default`/`Bypass`) AND plan not reachable —
+to keep an install with no `permissions` block at allow-all behaviour.
+
+`build_key_resolver` returns an account-scoped api-key resolver over the on-disk
+`AuthVault`, or `None` when there is nothing to scope (no `--account` and no vault file).
+The closure maps a provider slug to its usable key by trying, in order, the requested
+`--account`, the provider's flagged default account, then its first stored account. The
+conductor mints agents whose model invoker stamps the resolved key onto each request's
+`StreamOptions::api_key` — the credential override seam — so a vault key reaches the wire
+without `std::env::set_var` (this crate is `#![forbid(unsafe_code)]`). Returning `None`
+lets the gateway fall back to its own environment lookup; it never panics.
+
+## Resource assembly
+
+`boot/resources.rs` owns the startup-resource graph plus the per-session safety stores,
+the memory store, the session-directory helpers, and the auth vault.
+
+### Startup resources
+
+`build_startup_resources()` returns a `StartupResources` from the framework baseline:
+
+```rust
+pub fn build_startup_resources() -> StartupResources {
+    StartupResources {
+        settings: indusagi::shell_app::DEFAULT_SETTINGS(),
+        auth: CredentialGraph::default(),
+        models: ModelCatalog { resolved: true },
+    }
+}
+```
+
+`resolve_startup_resources(&ctx)` (the `resolve-resources` stage's delegate) returns
+`Some(build_startup_resources())`. Because the framework is a compile-time dependency in
+Rust, the TS dynamic-import / try-catch degrade dance collapses — but the
+degrade-to-minimal *shape* survives via the `StartupResourcesExt::minimal()` trait
+(framework `Settings::default()`, empty auth, an unresolved catalog marker) so a future
+fallible disk-merged settings load still has somewhere to land.
+
+### Session scoping
+
+`session_scope_dir(sessions_root, cwd)` is the canonical cwd-scoped directory both the
+conductor (writer) and the `SessionLibrary` (reader) agree on:
+
+```rust
+pub fn session_scope_dir(sessions_root: &Path, cwd: &str) -> PathBuf {
+    sessions_root.join(format!("--{}--", slug_cwd(cwd)))
+}
+```
+
+`slug_cwd` collapses every non-alphanumeric run to one dash and trims leading/trailing
+dashes, so `/Users/me/proj` → `--Users-me-proj--`. The same slug scheme drives
+`memory_dir_for(profile_dir, cwd)` → `<profile_dir>/memory/--<slug>--`, kept under the
+profile dir so persisted memory never pollutes the working tree.
+
+### Per-session safety stores
+
+| Store | Key constant | Trait projected onto | Role |
+|-------|-------------|----------------------|------|
+| `ReadStateStore` | `READ_STATE_HANDLE_KEY = "readState"` | `indusagi::capabilities::ReadStateHandle` | The read-before-edit gate: records a `ReadStateRecord` (mtime/size/hash/read_at) per file read so `write`/`edit` refuse to mutate a file the session never read or that drifted on disk |
+| `CheckpointStore` | `CHECKPOINT_HANDLE_KEY = "checkpoint"` | `deck::contract::CheckpointStore` | The rewind store: per transcript node id, first-seen pre-mutation file content; `record` captures, `restore(node_id)` rolls the tree back (writing old content, or deleting files that were absent) |
+| `DiskMemoryStore` | `MEMORY_HANDLE_KEY = "memoryStore"`, `MEMORY_ENTRYPOINT = "MEMORY.md"` | (used by the `memory` card) | Durable per-cwd `MEMORY.md` (`read`/`replace`/`append`), written owner-only (`0o600`) on unix; `load_memory_doc` inlines it into the briefing capped at `MAX_ENTRYPOINT_LINES` (200) / `MAX_ENTRYPOINT_BYTES` (25 000) |
+
+Both gate stores key on a normalised absolute path (`normalize_path` collapses `.` and
+`..` lexically, the way Node's `path.normalize` does) so two spellings of the same file
+land on one entry. `create_read_state_store()` and `create_checkpoint_store()` mint fresh,
+independent per-session instances threaded onto `DeckFramework`.
+
+`register_closable(ctx, closable)` is the thin push-side convenience over
+`BootContext::push_closable` for stages/runners that open a long-lived resource (an MCP
+fleet, a link server) so `drain_closables` runs the teardown in reverse even on error.
+
+## The credential vault
+
+`boot/resources.rs` also implements `AuthVault` — the disk-backed multi-account
+credential store keyed `provider → account → record`, persisted to a single `auth.json`
+under the profile dir. `create_auth_vault(path)` is the free-fn constructor.
+
+Each record is a discriminated `AuthRecord`:
+
+```rust
+pub enum AuthRecord {
+    ApiKey { key: String, is_default: bool },
+    OAuth { access: String, refresh: Option<String>, expires: Option<u64>, is_default: bool },
+}
+```
+
+The on-disk JSON shape is `{ "kind": "apiKey"|"oauth", … }`; a legacy pre-discriminant
+`{ "apiKey": …, "isDefault": … }` record is tolerated on read, and an entry that cannot
+be understood is dropped (`normalise_record`). The vault reads and rewrites the whole
+file each call (the file is tiny and operations are interactive), re-applying `0o600`
+(owner-only, unix) on every write. The public surface:
+
+| Method | Purpose |
+|--------|---------|
+| `list_accounts(provider)` | The account names stored for a provider |
+| `default_account(provider)` | The provider's flagged default account, if any |
+| `put_api_key(provider, account, key, make_default)` | Store an api key (clearing other defaults when `make_default`) |
+| `put_oauth(provider, account, access, refresh, expires, make_default)` | Store a browser-sign-in bundle |
+| `auth_kind(provider, account)` | The `"apiKey"` / `"oauth"` discriminant |
+| `read_usable_key(provider, account)` | Resolve a record to a live api-key string |
+| `remove(provider, account)` | Remove a whole provider (`None`) or one account, promoting a survivor to default |
+
+`read_usable_key` returns an api-key record's key verbatim, or a browser-sign-in record's
+`access` token (the value the framework's own lookup reads). **Fidelity note:** the
+frozen Rust framework publishes no OAuth-refresh symbol, so live token rotation is
+deferred — the stored access token is returned unrefreshed (the TS/Python editions
+refresh first when the recorded `expires` is near). See
+[Auth](/rust-cli/configuration/auth) for the credential model and the parity with the
+launch-side `DiskAuthVault`.
+
+## Addon wiring
+
+`boot/addon_wiring.rs` activates the [addon host](/rust-cli/subsystems/addons) for a
+session — the product's extension mechanism for locally-authored modules under
+`<cwd>/.indus/addons`. `build_session_tools` calls it once at deck-assembly time, after
+the built-in deck and the MCP graft, so addon tools and interceptors layer on top.
+
+`build_addon_wiring(cwd)` returns an `AddonWiring`:
+
+```rust
+pub struct AddonWiring {
+    pub interceptors: Arc<InterceptorChain>,
+    pub tools: Vec<Capability>,
+    pub commands: Vec<AddonCommand>,
+}
+```
+
+It builds an `AddonHost` over the declarative TOML loader (`DeclarativeLoader` — data,
+not code), installs a swallow-everything fault sink (`host.on_fault(...)`) so a broken
+addon degrades silently rather than crashing boot, and `load_all`s every addon discovered
+under the `.indus/addons` directory. With no such directory the bundle is empty and the
+wiring is a perfect no-op — the deck flows through unchanged.
+
+The runner threads each piece into the right place:
+- `concat_addon_tools(deck, addon_tools)` appends contributed tools, dropping any whose
+  name a deck/MCP tool already claims (first-claimant-wins de-dup, so an addon `read`
+  cannot shadow the core read tool). Contributed `Tool`s are adapted to deck
+  `Capability`s via `BuiltinCard` and treated as mutating (`read_only = false`), so the
+  permission gate prompts rather than auto-allowing an unknown tool.
+- `wrap_one_with_addons(cap, &chain)` (folded over every capability by the deck's
+  `map_capabilities` walk) wraps a matching capability in an `InterceptedCard` that runs
+  the chain's enter→execute→exit reduce around the real `run`; a blocked enter
+  short-circuits to an `is_error` result and the real tool never runs. A non-matching or
+  empty chain returns the same `Arc`, so an addon-less session is identity-equal.
+
+Scope (v1, matching the other editions): only the per-tool interceptor boundary and tool
+contribution are wired here. The richer lifecycle-event fan-out (`session:start`,
+`turn:end`, …) needs a conductor seam that does not exist yet and is deferred. The
+bundle's slash `commands` are returned for the console command registry.
+
+## The delegate runner
+
+`boot/delegate.rs` (feature `swarm`) is the boot stage that bridges
+[addons](/rust-cli/subsystems/addons) subagent profiles onto the deck's `task` card. It
+discovers `.indus/agents/<name>.toml` subagent profiles
+(`addons::subagents::discover_profiles`) and adapts them onto the framework swarm
+coordinator (`addons::subagents::DelegateRunner`), exposing the result as the deck's
+`deck::contract::DelegateRunner` trait object via `SwarmDelegateAdapter`.
+
+`build_delegate_runner(workspace, crew_root)` returns `Some(Arc<dyn DelegateRunner>)`,
+or `None` when no profiles are discovered (the deck `task` card then keeps its typed-stub
+behaviour). On a delegation the adapter builds a per-run crew directory under `crew_root`
+(a unique suffix keeps concurrent delegations on independent boards), posts one
+`DelegationTask` built from the request `objective` (with `context` folded into the body),
+drives the swarm rounds, and relays the framework's settled report back as the deck's
+opaque result. The adapter owns no coordination logic — every guarantee (the JSONL board,
+dep-gated readiness, the mailbox, git-worktree isolation) is the framework swarm crate's.
+A swarm fault is a failed delegation, never a panic. Behind the `swarm` feature so a
+headless/minimal build drops `indusagi-swarm` entirely.
+
+## Profile upgrades
+
+`boot/pipeline.rs` also holds the idempotent profile-upgrade subsystem the
+`apply-upgrades` stage folds. `apply_upgrades(ws)` folds the ordered `UPGRADES` registry
+over the workspace using a `.upgrade-state.json` marker file
+(`{"appliedIds": [...]}`) under the profile directory, returning an `UpgradeReport
+{ applied, warnings }`.
+
+Each step is skipped if its id is already in the marker; otherwise it is applied and, **on
+success**, its id is appended and the marker rewritten after each success (so partial
+progress survives a crash). A step that fails is recorded as a non-fatal warning, left
+unmarked (retried next launch), and never blocks the remaining steps. A missing or
+malformed marker degrades to "nothing applied yet" so a corrupted marker re-attempts
+(idempotent) steps rather than crashing.
+
+The four registered migrations:
+
+| Id | Effect |
+|----|--------|
+| `fold-credentials-into-secure-auth-file` | Consolidate a legacy `oauth.json` + the `apiKeys` block in `settings.json` into a `0o600` `auth.json`; retire the consumed `oauth.json` to `oauth.json.retired` |
+| `reshelve-loose-transcripts-into-sessions-dir` | Move loose `*.jsonl` transcripts (recognised by a `type: "session"` first-line header) under the profile root into `sessions/<projectDirName>/` |
+| `relocate-managed-helper-binaries-to-bin` | Move managed `fd`/`rg` helper binaries from the legacy `tools/` dir into `bin/` |
+| `rename-legacy-commands-dir-to-prompts` | Rename the legacy `commands/` template directory to `prompts/` |
+
+Each step is idempotent and skip-on-clobber (`relocate_without_clobber` never overwrites a
+live destination). On the fresh `~/.indusagi`-style profile root these are documented
+no-ops — that root never carried a legacy layout — but their ids stay reserved and the
+mechanism stays fully exercisable. Append real steps to the end of `UPGRADES`; never
+reorder or rename an existing id (renaming re-runs the step).
+
+`project_transcript_dir_name(cwd)` computes the reshelve destination leaf as
+`proj-<token>-<hash>`, where `<hash>` is a 32-bit FNV-1a digest computed over the UTF-16
+code units (`short_path_hash`) so it is byte-identical to the TS implementation.
+
+## Feature flags
+
+`induscode::boot` participates in the merged crate's feature set:
+
+| Feature | Effect |
+|---------|--------|
+| `default = []` | Headless boot. Compiles with `--no-default-features` so the whole binary builds without the console/addon crates; the repl runner reports that the interactive surface needs `tui` and exits non-zero, while oneshot/link still run |
+| `tui` | Mounts the live ratatui surface in `ReplRunner::run` via `console::mount_console` |
+| `swarm` | Compiles `boot::delegate` and bridges subagent profiles onto the deck `task` card |
+| `rustls` | Propagates rustls to launch / shell-app / llmgateway |
+
+## Public exports
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `boot_run` | async fn | `boot/mod.rs` | The orchestrator the binary entry calls; returns `ExitCode` |
+| `drain_closables` | async fn | `boot/mod.rs` | Drains teardown callbacks in reverse |
+| `BootContext` / `BootIo` / `Closable` / `OutputSink` / `InputSource` | struct/trait/type | `boot/contract.rs` | The async orchestrator seams |
+| `Invocation` / `RunnerId` / `StartupResources` | struct/enum | `core::boot_contract` (re-exported) | The routing projection, mode enum, and resolved graph |
+| `Stage` / `BootPipeline` | trait/struct | `boot/contract.rs` | The async stage + the fold |
+| `Runner` / `RunnerRegistry` | trait/struct | `boot/contract.rs` | The runner contract + total registry |
+| `stages` | fn | `boot/pipeline.rs` | Builds the five-stage `BootPipeline` |
+| `apply_upgrades` / `UpgradeReport` | fn/struct | `boot/pipeline.rs` | The upgrade driver and its report |
+| `registry` | fn | `boot/runners.rs` | Builds the `[repl, oneshot, link]` registry |
+| `ReplRunner` / `OneShotRunner` / `LinkRunner` | struct | `boot/runners.rs` | The three runners |
+| `resolve_startup_resources` / `build_startup_resources` | fn | `boot/resources.rs` | The resource graph assembly |
+| `session_scope_dir` / `oneshot_prompts` | fn | `boot/resources.rs` | Cwd-scoped session dir + the one-shot prompt list |
+| `ReadStateStore` / `CheckpointStore` / `DiskMemoryStore` | struct | `boot/resources.rs` | The per-session safety stores |
+| `create_read_state_store` / `create_checkpoint_store` | fn | `boot/resources.rs` | Mint fresh per-session stores |
+| `AuthVault` / `create_auth_vault` / `AuthRecord` | struct/fn/enum | `boot/resources.rs` | The disk credential vault |
+| `memory_dir_for` / `load_memory_doc` / `truncate_entrypoint_content` | fn | `boot/resources.rs` | Memory-dir helpers |
+| `register_closable` | fn | `boot/resources.rs` | Push-side of the closables guarantee |
+| `build_addon_wiring` / `AddonWiring` / `concat_addon_tools` / `wrap_tools_with_addons` / `wrap_one_with_addons` | fn/struct | `boot/addon_wiring.rs` | The addon host activation seams |
+| `build_delegate_runner` / `SwarmDelegateAdapter` | fn/struct | `boot/delegate.rs` (feature `swarm`) | The deck delegate runner bridge |
+
+## Examples
+
+Interactive REPL (the default / fallback runner):
+
+```bash
+# bare command line -> select returns ReplRunner
+indusr
+# resume the newest session in this cwd before the console mounts
+indusr --continue
+# (-c is the alias)
+indusr -c
+# resume the most recent session in this cwd
+indusr --resume
+```
+
+One-shot to stdout:
+
+```bash
+# clean text to stdout (OutputMode::Json -> RunnerId::Oneshot)
+indusr -p "summarize the build script"
+# force the interactive session even with a prompt
+indusr -i "summarize the build script"
+```
+
+Headless JSON-RPC link:
+
+```bash
+# OutputMode::Rpc -> RunnerId::Link: session_ops over stdin/stdout
+indusr --json
+indusr --rpc
+```
+
+Flags reaching the conductor:
+
+```bash
+indusr --model anthropic/claude-sonnet-4-5 --thinking high \
+       --tools read,write,bash --append-system ./extra-prompt.md \
+       --mcp ./mcp.json --account work "refactor this module"
+# resolve_model_id picks the explicit --model; build_session_tools allow-lists by
+# canonical name; load_mcp_capabilities grafts ./mcp.json; compose_session_briefing
+# appends the file; resolve_thinking narrows "high" to ThinkingLevel::High;
+# build_key_resolver scopes credential lookup to the "work" account.
+```
+
+Programmatic credential vault use:
+
+```rust
+use induscode::boot::resources::{create_auth_vault, AuthVault};
+use std::path::PathBuf;
+
+let vault: AuthVault = create_auth_vault(PathBuf::from("/Users/me/.indusagi/agent/auth.json"));
+vault.put_api_key("anthropic", "work", "sk-...", true);   // make_default
+let key = vault.read_usable_key("anthropic", "work");      // Some("sk-...")
+```
+
+## Key concepts
+
+- **Immutable stage pipeline** — `stages()` builds a `Vec<Box<dyn Stage>>`;
+  `BootPipeline::run` folds a `BootContext` through them, each returning a fresh
+  successor via struct-update. Pipeline is data, not control flow.
+- **Total runner dispatch** — `registry()` is `[repl, oneshot, link]`;
+  `RunnerRegistry::select` returns the first `accepts` match, with `ReplRunner` as the
+  guaranteed total fallback (differs from the framework's fallible selector because
+  help/version/list-models are intercepted in `bin/main.rs` first). Adding a mode is a
+  one-line table edit.
+- **Console mount inversion** — `ReplRunner` hands the conductor to `mount_console`,
+  which *owns* the blocking ratatui loop and returns on exit; behind `tui`, headless
+  builds compile the mount out and route non-interactive work through oneshot/link.
+- **Shared conductor factory** — `build_conductor(ctx)` centralises the
+  model/thinking/tools/MCP/addons/briefing/permission/persistence choreography all three
+  runners share, wiring the deck, the gate, the key resolver, the session store, and the
+  diagnostics engine onto one `Conductor`.
+- **Per-session safety stores** — `ReadStateStore` (read-before-edit gate) and
+  `CheckpointStore` (rewind) are minted per session onto `DeckFramework`, keyed on
+  lexically-normalised absolute paths.
+- **Two-path credentials** — the primary `build_key_resolver` per-call resolver over the
+  `AuthVault` (no `unsafe` env mutation) plus the gateway env fallback when it returns
+  `None`.
+- **Idempotent profile upgrades** — `apply_upgrades` folds the ordered `UPGRADES`
+  registry using a `.upgrade-state.json` marker; each step runs at most once, failures
+  are non-fatal warnings retried next launch.
+- **Guaranteed teardown** — `drain_closables` runs every `Closable` in reverse, swallowing
+  individual failures, regardless of how the runner resolved.
+
+See [Launch](/rust-cli/subsystems/launch) for the flag grammar and the no-session verbs,
+[Conductor](/rust-cli/subsystems/conductor) for the session engine,
+[Capability Deck](/rust-cli/subsystems/capability-deck) for `provision_deck`,
+[Channels](/rust-cli/subsystems/channels) for the oneshot/link transports,
+[Addons](/rust-cli/subsystems/addons) for the extension contract, and the
+[Architecture](/rust-cli/architecture) overview for how boot sits on top of every
+subsystem. The framework seams ported here live under
+[`indusagi::shell_app`](/rust) and [`indusagi::runtime`](/rust/subsystems/runtime). For
+parity with the other editions see the [TypeScript](/cli) and
+[Python](/python-cli/subsystems/boot) boot docs.

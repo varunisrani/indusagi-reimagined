@@ -23,7 +23,7 @@ export function DocsNavigation({ path, title, items }: { path: string; title: st
     <button className="docs-mobile-toggle" aria-expanded={mobileNav} aria-controls="article-navigation" onClick={() => setMobileNav(!mobileNav)}>Browse pages <span>{mobileNav ? '−' : '+'}</span></button>
     <div id="article-navigation" className={mobileNav ? 'docs-browse is-open' : 'docs-browse'}>
       <label className="docs-search"><Search size={16} /><input aria-label="Search docs" placeholder="Search docs…" value={search} onChange={e => setSearch(e.target.value)} /></label>
-      <nav aria-label="Documentation articles" className="docs-nav">{filtered.length ? filtered.map(n => <SiteLink href={n.url} onClick={() => setMobileNav(false)} className={n.url === active ? 'active' : ''} aria-current={n.url === active ? 'page' : undefined} key={n.url}><span className="nav-index">{String(n.index).padStart(2, '0')}</span>{n.text}</SiteLink>) : <p className="no-docs">No matching pages.</p>}</nav>
+      <nav aria-label="Documentation articles" className="docs-nav">{filtered.length ? Array.from(new Set(filtered.map(item => item.section || 'Start'))).map(section => <div className="docs-nav-group" key={section}><h3>{section}</h3>{filtered.filter(item => (item.section || 'Start') === section).map(n => <SiteLink href={n.url} onClick={() => setMobileNav(false)} className={n.url === active ? 'active' : ''} aria-current={n.url === active ? 'page' : undefined} key={n.url}><span className="nav-index">{String(n.index).padStart(2, '0')}</span>{n.text}</SiteLink>)}</div>) : <p className="no-docs">No matching pages.</p>}</nav>
     </div>
   </Sidebar>;
 }

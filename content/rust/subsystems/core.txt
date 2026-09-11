@@ -1,0 +1,512 @@
+# Core
+
+> `core` is the foundational module of the Rust edition of `indusagi` — the
+> cross-cutting primitives every other subsystem depends on but none owns. It
+> carries no subsystem logic; it ships the load-bearing vocabulary: cooperative
+> cancellation, character-faithful canonical JSON + content hashing, the single
+> env-var registry, the brand naming truth, filesystem location, the workspace
+> version, ULID ids, the shared error enum, the re-iterable `Channel`, and one
+> wall-clock surface. Reached as `indusagi::core::*`, with the hottest symbols
+> re-exported at the top of the `core` module (and `VERSION` lifted all the way
+> to the `indusagi` crate root).
+
+## Table of Contents
+
+- [Quickstart](#quickstart)
+- [Module map](#module-map)
+- [Root re-exports](#root-re-exports)
+- [Cancellation](#cancellation)
+- [Errors](#errors)
+- [Canonical JSON and content hashing](#canonical-json-and-content-hashing)
+- [Brand](#brand)
+- [Environment registry](#environment-registry)
+- [Locator](#locator)
+- [Channel](#channel)
+- [Version, time, ids](#version-time-ids)
+- [Design invariants](#design-invariants)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Quickstart
+
+The core surface is deliberately small and side-effect-light. The path-returning
+helpers are pure; only the `Locator::ensure_*` methods touch disk. Everything is
+reachable through `indusagi::core`, and the most frequently used symbols are
+re-exported at the top of the `core` module so you never have to name the
+submodule.
+
+```rust
+use indusagi::core::{
+    CancellationToken, CancelExt, CoreError, CoreResult,
+    canonical_json, content_hash, Locator, LocatorOverrides,
+    Channel, VERSION, now_ms,
+};
+use indusagi::core::brand::{BRAND, env_name};
+use indusagi::core::ids::{new_id, prefixed_id};
+
+// Cancellation is a typed value, never a panic.
+let root = indusagi::core::cancel::root_token();
+let round = indusagi::core::cancel::round_token(&root);
+round.error_if_cancelled()?;                 // Ok(()) while live
+
+// Content-address a value with byte-exact JSON.stringify semantics.
+let id: String = content_hash(&serde_json::json!({ "k": 42 }));
+
+// Resolve every on-disk path from one struct, honoring INDUSAGI_HOME.
+let loc = Locator::new(LocatorOverrides::default());
+let settings = loc.settings_path();          // ~/.indusagi/settings.json
+
+println!("{VERSION} @ {} — env: {}", now_ms(), env_name("api key")); // INDUSAGI_API_KEY
+# Ok::<(), CoreError>(())
+```
+
+## Module map
+
+`core/mod.rs` declares ten public submodules. Internal layering is flat — none of
+these modules depend on a subsystem crate, and most depend only on `brand` and
+`errors`.
+
+| Module | Source | Holds |
+|--------|--------|-------|
+| `brand` | `core/brand.rs` | The single naming truth: the `Brand` record, the `BRAND` const, and the `env_name` / `env_name_with` grammar |
+| `cancel` | `core/cancel.rs` | The framework's one cancellation currency: a re-export of `CancellationToken`, the parent→round→child chain helpers, and the `CancelExt` typed-error trait |
+| `canonical` | `core/canonical.rs` | A hand-rolled `JSON.stringify` (`canonical_json`) plus `content_hash`, the parity-critical content-addressing surface, and `HASH_WIDTH` |
+| `channel` | `core/channel.rs` | The re-iterable `Channel<T>` stream **factory**, `BoxStream<T>`, and the `channel_of_vec` test convenience |
+| `env` | `core/env.rs` | The single env-var registry: `read_env` / `read_raw`, `indusagi_home`, the `PROVIDER_ENV_MAP` table, `SDK_CREDENTIALS_MARKER` |
+| `errors` | `core/errors.rs` | The closed `CoreError` enum and the `CoreResult<T>` alias |
+| `ids` | `core/ids.rs` | ULID id helpers: `new_id`, `prefixed_id` |
+| `locate` | `core/locate.rs` | The unified `Locator` / `LocatorOverrides` that compute every state path from two roots + `BRAND` |
+| `time` | `core/time.rs` | The single wall-clock surface: `now_ms()` |
+| `version` | `core/version.rs` | The single-source `VERSION` const, read from `CARGO_PKG_VERSION` |
+
+## Root re-exports
+
+`core/mod.rs` lifts the most reached-for symbols to the top of the `core` module
+so downstream code can write
+`use indusagi::core::{VERSION, CoreError, CancellationToken}` without naming the
+submodule. (`VERSION` is additionally re-exported at the `indusagi` crate root —
+via `facade` and `lib.rs` — as the workspace's single version constant.)
+
+```rust
+pub use brand::{BRAND, Brand, env_name};
+pub use cancel::{CancelExt, CancellationToken};
+pub use canonical::{HASH_WIDTH, canonical_json, content_hash};
+pub use channel::{BoxStream, Channel};
+pub use errors::{CoreError, CoreResult};
+pub use locate::{Locator, LocatorOverrides};
+pub use time::now_ms;
+pub use version::VERSION;
+```
+
+## Cancellation
+
+`core::cancel` is the framework's single cancellation currency, replacing the
+TypeScript `AbortController`/`AbortSignal` pair that was chained
+**parent → round → per-call child** in the runtime scheduler. There is no
+bespoke token class: the chaining convention is collapsed onto a thin wrapper
+around `tokio_util::sync::CancellationToken`, which is already cooperative,
+queryable, multi-listener, and drop-safe-chainable. The type is re-exported, so
+the canonical tokio-util token flows through the whole framework unchanged.
+
+```rust
+pub use tokio_util::sync::CancellationToken;
+
+pub fn root_token() -> CancellationToken;
+pub fn round_token(parent: &CancellationToken) -> CancellationToken;
+pub fn child_token(round: &CancellationToken) -> CancellationToken;
+```
+
+`root_token()` is `new AbortController()` whose signal feeds the top of the chain.
+`round_token(parent)` is `parent.child_token()` and `child_token(round)` is
+`round.child_token()` — the same tokio-util derivation applied at each rung,
+named distinctly to document the scheduler's two chaining steps at the call site. Cancellation
+propagates **down** the chain (cancelling a parent cancels every descendant) but
+never **up** (a failing per-call child never tears down its round or parent), and
+the chain is drop-safe — dropping a token does not cancel it, though a tokio-util
+`DropGuard` can be opted into to cancel on scope exit when that is wanted.
+
+### The typed-error gate
+
+`CancelExt` is an extension trait on `CancellationToken` that enforces the
+cooperative-cancel contract: when core code itself needs to *signal* "I observed
+cancel", it yields the typed `CoreError::Cancelled` — never a panic, never a
+swallowed `Ok`.
+
+```rust
+pub trait CancelExt {
+    fn error_if_cancelled(&self) -> Result<(), CoreError>;
+    fn guard<F, T>(&self, fut: F) -> impl Future<Output = Result<T, CoreError>> + Send
+    where
+        F: Future<Output = T> + Send;
+}
+```
+
+- `error_if_cancelled()` is the cooperative analogue of `signal.aborted` that
+  returns a *typed* error instead of a bool — call it at loop tops in find/grep
+  walks and framer reads.
+- `guard(fut)` runs `fut` unless the token cancels first; on cancel the in-flight
+  future is dropped and `CoreError::Cancelled` is returned. It packages the
+  `select! { cancelled => Err, res => res }` pattern (with `biased;` so the cancel
+  arm is checked first) so call sites cannot forget the cancel branch.
+
+The cross-cutting invariant every subsystem must honor: a cancelled **tool**
+returns a typed `is_error` outcome (never `Err`, never a panic); a cancelled
+**connector** yields a terminal `Emission::Error` (it never throws out of the
+stream). Rust is safer here than the Python port — there is no ambient exception
+to swallow, so the `except CancelledError: raise` footgun simply does not exist.
+
+## Errors
+
+`core::errors` defines the *closed* error vocabulary for the primitives in this
+module. It is deliberately **not** `#[non_exhaustive]` so callers get
+compile-time exhaustiveness on `match`. Subsystem crates define their own richer
+error types (`GatewayError`, `RunError`, `ProtocolFault`, …); `CoreError` covers
+only the cross-cutting primitives.
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum CoreError {
+    #[error("{}", .0.as_deref().unwrap_or("cancelled"))]
+    Cancelled(Option<String>),
+    #[error("canonical encoding failed: {0}")]
+    Encoding(String),
+    #[error("missing environment variable: {0}")]
+    MissingEnv(String),
+    #[error("filesystem: {0}")]
+    Io(#[from] std::io::Error),
+}
+
+pub type CoreResult<T> = Result<T, CoreError>;
+```
+
+| Variant | `Display` | Meaning |
+|---------|-----------|---------|
+| `Cancelled(Option<String>)` | the reason, or `cancelled` when `None` | A cooperative cancellation was observed; byte-exact default mirrors Python `CancelledByToken` |
+| `Encoding(String)` | `canonical encoding failed: …` | A value the encoder genuinely cannot represent (a non-finite number is *not* an error — it folds to `null`) |
+| `MissingEnv(String)` | `missing environment variable: …` | A required env var was absent or empty |
+| `Io(std::io::Error)` | `filesystem: …` | A filesystem location could not be prepared; `#[from]` so `?` lifts `io::Error` |
+
+Constructors and predicates round out the type:
+
+```rust
+impl CoreError {
+    pub fn cancelled() -> Self;                                // Cancelled(None)
+    pub fn cancelled_with(reason: impl Into<String>) -> Self;  // Cancelled(Some(..))
+    pub fn is_cancelled(&self) -> bool;                        // branch without a full match
+    pub fn detail(&self) -> impl std::fmt::Display + '_;       // flatten into a String-carrying typed error
+}
+```
+
+`is_cancelled()` lets a call site ask "was this a cancel?" without matching;
+`detail()` lets subsystem error types that store a `String` cause keep the
+cancellation reason when they re-wrap a `?`-bubbled `CoreError`.
+
+## Canonical JSON and content hashing
+
+`serde_json::to_string` is **not** `JSON.stringify`, and the runtime hashes
+session nodes with `sha256(JSON.stringify({parent, turn, createdAt}))[:32]`. The
+swarm and connectors cache and dedupe by content hash, and the wire/auth writers
+must byte-match JS serialization. So `core::canonical` hand-rolls the exact
+`JSON.stringify` semantics rather than going through serde.
+
+```rust
+pub const HASH_WIDTH: usize = 32;
+
+pub fn canonical_json(value: &serde_json::Value) -> String;
+pub fn content_hash(value: &serde_json::Value) -> String; // hex(sha256(..))[..HASH_WIDTH]
+```
+
+The encoder reproduces four JS-specific behaviors exactly:
+
+- **Object key order** — JS `[[OwnPropertyKeys]]`: canonical array-index keys
+  ascending first, then the remaining keys in insertion order. The insertion
+  order relies on serde_json's `preserve_order` feature (an `IndexMap`-backed
+  map); cross-crate consumers that hash must enable it. An array index is all
+  ASCII digits, no leading zero (except literal `"0"`), value `<= 2**32 - 2`.
+- **Dropped optionals** — JS drops `undefined`-valued keys. A `serde_json::Value`
+  has no `undefined`, so the caller (the wire codec) omits such keys before
+  hashing; a JSON `null` is kept and rendered `null`.
+- **Number formatting** — ECMA-262 `Number::toString` (radix 10): integral
+  doubles drop the `.0`, plain notation within `1e-6 <= |x| < 1e21`, exponential
+  outside (`1e+21`, `1e-7`), `NaN`/`Infinity` → `null`. Integers beyond `2**53`
+  keep full precision (a deliberate port-local improvement over JS).
+- **String escaping** — non-ASCII raw, ASCII control chars `\u00XX` (lowercase
+  hex, matching V8/Node), `"` and `\` escaped. A lone-surrogate branch is
+  documented for parity but is structurally unreachable from a well-formed Rust
+  `&str`.
+
+`content_hash` is the parity-critical surface: a node's id and the cache/dedupe
+key. The module ships a **cross-language golden** test that pins both the
+payload and the hash against a Node `JSON.stringify` + `sha256` run and the
+verified Python port — all three produce byte-identical output
+(`49a843a2b9dfc7f04a4fe5be52b90bfa`).
+
+```rust
+let payload = serde_json::json!({ "big": 1e21, "tiny": 1e-7, "neg": -3.25, "n": 42 });
+assert_eq!(canonical_json(&payload), r#"{"big":1e+21,"tiny":1e-7,"neg":-3.25,"n":42}"#);
+assert_eq!(content_hash(&payload).len(), HASH_WIDTH); // 32 hex chars
+```
+
+## Brand
+
+`core::brand` is the single source of naming truth. Every user-visible name the
+product imprints on the world — the spoken app name, the executable, the
+dot-directory under `$HOME`, the `INDUSAGI_*` env prefix, and the basenames of
+on-disk artifacts — is declared once. Nothing else hard-codes these strings;
+everything derives from `BRAND`, so a rebrand is a one-file edit. Rust
+immutability is the default, so no `Object.freeze` is needed — `BRAND` is a plain
+`const`.
+
+```rust
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Brand {
+    pub app_name: &'static str,
+    pub bin_name: &'static str,
+    pub env_prefix: &'static str,             // includes trailing underscore, e.g. "INDUSAGI_"
+    pub profile_dir_name: &'static str,       // e.g. ".indusagi"
+    pub settings_file_name: &'static str,
+    pub auth_store_file_name: &'static str,
+    pub sessions_dir_name: &'static str,
+    pub logs_dir_name: &'static str,
+    pub project_settings_file_name: &'static str,
+    pub project_dir_name: &'static str,
+}
+
+pub const BRAND: Brand = Brand {
+    app_name: "indusagi",
+    bin_name: "indusagi",
+    env_prefix: "INDUSAGI_",
+    profile_dir_name: ".indusagi",
+    settings_file_name: "settings.json",
+    auth_store_file_name: "auth.json",
+    sessions_dir_name: "sessions",
+    logs_dir_name: "logs",
+    project_settings_file_name: "settings.json",
+    project_dir_name: ".indusagi",
+};
+```
+
+The env-name grammar composes a fully-qualified variable name from a bare suffix:
+
+```rust
+pub fn env_name_with(suffix: &str, brand: &Brand) -> String;
+pub fn env_name(suffix: &str) -> String; // == env_name_with(suffix, &BRAND)
+```
+
+The suffix is trimmed, every run of whitespace-or-hyphen is folded to a single
+`_`, the result is upper-cased, and the brand's `env_prefix` is prepended — a
+byte-for-byte reproduction of the TS `suffix.trim().replace(/[\s-]+/g,
+"_").toUpperCase()`. So `env_name("api key")`, `env_name("dash-separated")`, and
+`env_name("  spaced  ")` yield `INDUSAGI_API_KEY`, `INDUSAGI_DASH_SEPARATED`, and
+`INDUSAGI_SPACED` respectively.
+
+## Environment registry
+
+`core::env` is the single env-var registry. Every variable the framework reads is
+declared and resolved through this module — subsystems must not probe `std::env`
+directly (the TS codebase had two competing resolution tables; the Rust port has
+exactly one). The only sanctioned exception is spawning child processes that
+inherit the full environment.
+
+```rust
+pub const ENV_PREFIX: &str = "INDUSAGI";            // prefix without trailing underscore
+pub const SDK_CREDENTIALS_MARKER: &str = "<sdk-managed-credentials>";
+
+pub fn read_env(suffix: &str) -> Option<String>;    // branded: read_env("home") -> INDUSAGI_HOME
+pub fn read_raw(name: &str) -> Option<String>;      // escape hatch for AWS_REGION etc.
+pub fn indusagi_home() -> PathBuf;
+pub fn provider_env_var(provider: &str) -> Option<&'static str>;
+pub fn brand_env_prefix() -> &'static str;          // BRAND.env_prefix
+```
+
+Both `read_env` and `read_raw` trim values and treat empty/whitespace-only as
+**absent**, matching the TS trim-and-undefined-on-empty rule. `indusagi_home()`
+resolves the state-directory root in precedence order: `INDUSAGI_HOME` →
+OS home (`HOME` then `USERPROFILE`) → a last-resort `.` so the function is total.
+
+`SDK_CREDENTIALS_MARKER` is the parity-locked sentinel returned in place of a
+literal key when a provider authenticates through an SDK credential chain (AWS
+profiles, Google ADC) rather than an env var; callers treat it as "credentials
+present".
+
+The provider table ships the single-env-var rows now (they are parity-locked);
+the bespoke resolvers (Vertex triple-gate, Bedrock chain, Copilot/Anthropic/Kimi
+fallbacks) land in a later milestone. `provider_env_var` returns `None` for those
+bespoke providers.
+
+```rust
+pub const PROVIDER_ENV_MAP: &[(&str, &str)] = &[
+    ("openai", "OPENAI_API_KEY"),
+    ("azure-openai-responses", "AZURE_OPENAI_API_KEY"),
+    ("google", "GEMINI_API_KEY"),
+    ("groq", "GROQ_API_KEY"),
+    ("cerebras", "CEREBRAS_API_KEY"),
+    ("xai", "XAI_API_KEY"),
+    ("openrouter", "OPENROUTER_API_KEY"),
+    ("vercel-ai-gateway", "AI_GATEWAY_API_KEY"),
+    ("zai", "ZAI_API_KEY"),
+    ("mistral", "MISTRAL_API_KEY"),
+    ("minimax", "MINIMAX_API_KEY"),
+    ("minimax-cn", "MINIMAX_CN_API_KEY"),
+    ("opencode", "OPENCODE_API_KEY"),
+    ("sarvam", "SARVAM_API_KEY"),
+    ("krutrim", "KRUTRIM_API_KEY"),
+    ("nvidia", "NVIDIA_API_KEY"),
+];
+```
+
+## Locator
+
+`core::locate` collapses the scattered `getProfileDir`/`getSettingsPath`/
+`getSessionsDir` helpers (and the two TS `Locator`s) into one struct. Every
+location the app touches is computed from two roots — `home` and `cwd` — plus the
+`BRAND` naming constants. The path-returning methods are *pure* string joins; the
+`ensure_*` helpers are the only members that touch disk.
+
+```rust
+#[derive(Clone, Debug, Default)]
+pub struct LocatorOverrides {
+    pub home: Option<PathBuf>,   // default: INDUSAGI_HOME then OS home
+    pub cwd: Option<PathBuf>,    // default: std::env::current_dir()
+}
+
+impl Locator {
+    pub fn new(overrides: LocatorOverrides) -> Self;
+    pub fn with_brand(overrides: LocatorOverrides, brand: Brand) -> Self;
+
+    pub fn home(&self) -> &Path;
+    pub fn cwd(&self) -> &Path;
+
+    pub fn profile_dir(&self) -> PathBuf;                              // ~/.indusagi
+    pub fn settings_path(&self) -> PathBuf;                           // ~/.indusagi/settings.json
+    pub fn project_settings_path(&self, cwd: Option<&Path>) -> PathBuf;
+    pub fn sessions_dir(&self) -> PathBuf;                            // ~/.indusagi/sessions
+    pub fn auth_store_path(&self) -> PathBuf;                         // ~/.indusagi/auth.json
+    pub fn logs_dir(&self) -> PathBuf;                                // ~/.indusagi/logs
+
+    pub async fn ensure_profile_dir(&self) -> std::io::Result<PathBuf>;
+    pub async fn ensure_sessions_dir(&self) -> std::io::Result<PathBuf>;
+    pub async fn ensure_logs_dir(&self) -> std::io::Result<PathBuf>;
+    pub async fn ensure_parent_of(&self, file_path: PathBuf) -> std::io::Result<PathBuf>;
+    pub async fn ensure_dir(&self, dir: PathBuf) -> std::io::Result<PathBuf>;
+}
+
+pub fn home_env_var() -> String; // "INDUSAGI_HOME"
+```
+
+The home-root precedence is `explicit override → INDUSAGI_HOME → OS home → "."`,
+with the override winning only when present and non-empty — so `INDUSAGI_HOME`
+relocates *all* per-user state without touching `$HOME`.
+`project_settings_path` resolves a relative `cwd` against the locator's bound
+working directory and uses an absolute `cwd` verbatim;
+`with_brand` makes the identity injectable so an alternate brand can be resolved
+without mutating the global. The async `ensure_*` helpers create directories
+idempotently with `tokio::fs::create_dir_all`.
+
+## Channel
+
+`core::channel` ports the gateway's `channelOf`. The critical contract: a
+`Channel` wraps a generator **factory**, so each iteration re-issues the
+underlying request — iterating the same channel twice fires two requests. This is
+what makes retries work (collect, fail, re-iterate) without the caller rebuilding
+the pipeline.
+
+```rust
+pub type BoxStream<T> = Pin<Box<dyn Stream<Item = T> + Send>>;
+
+#[derive(Clone)]
+pub struct Channel<T> {
+    factory: Arc<dyn Fn() -> BoxStream<T> + Send + Sync>,
+}
+
+impl<T> Channel<T> {
+    pub fn of<F>(factory: F) -> Self
+    where F: Fn() -> BoxStream<T> + Send + Sync + 'static;
+    pub fn iter(&self) -> BoxStream<T>; // re-runs the factory each call
+}
+
+pub fn channel_of_vec<T, F>(make: F) -> Channel<T>
+where T: Send + 'static, F: Fn() -> Vec<T> + Send + Sync + 'static;
+```
+
+The factory is stored behind an `Arc` and re-run on every `iter()` call. The
+closure is `Fn` (not `FnOnce`), so it must clone whatever per-iteration state it
+needs (a fresh `Conversation`/`StreamOptions` per request) — re-iteration is
+rare, so the clone cost is acceptable. The type is generic over its item, so the
+same `Channel` carries gateway `Emission`s, runtime `Signal`s, or anything else;
+the gateway crate specializes it to `Channel<Emission>` and adds `collect_reply`.
+`channel_of_vec` is a scripted/test convenience that re-emits the same sequence
+on each iteration.
+
+## Version, time, ids
+
+Three single-purpose modules cap the surface.
+
+`core::version` single-sources the version, killing the TS three-way drift
+(`index.ts`'s `VERSION`, `package.json`, and the `resolveVersion()`
+filesystem-walk fallback could all disagree). Cargo eliminates it: `VERSION` is a
+compile-time constant read from `CARGO_PKG_VERSION`, which flows from
+`[workspace.package] version` — there is no runtime resolution to drift away.
+
+```rust
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+```
+
+`core::time` is the single wall-clock surface, collapsing a dozen per-module
+`now_ms()` copies (which drifted between `f64`/`i64`/`u64`) into one. The
+canonical return is `u64`; a pre-epoch clock or any `duration_since` error clamps
+to `0` rather than wrapping.
+
+```rust
+#[inline]
+#[must_use]
+pub fn now_ms() -> u64; // the canonical Date.now() analogue, in epoch milliseconds
+```
+
+`core::ids` provides ULID helpers — lexicographically sortable, time-prefixed,
+and collision-resistant, which is what the session DAG, ledger events, and job
+ids want. Thin helpers wrap the `ulid` crate so the id representation stays
+swappable.
+
+```rust
+pub fn new_id() -> String;             // 26-char Crockford-base32 ULID
+pub fn prefixed_id(prefix: &str) -> String; // "job-01J..."
+```
+
+## Design invariants
+
+- **One source per concern** — naming (`BRAND`), version (`VERSION`), wall clock
+  (`now_ms`), env reads (`core::env`), and filesystem paths (`Locator`) each live
+  in exactly one place. Subsystems never re-derive them. The TS codebase's
+  duplicate env tables, drifting version constants, and per-module `now_ms`
+  copies are all eliminated.
+- **Cancellation is a typed value** — observing cancel yields
+  `CoreError::Cancelled`, never a panic and never a silent `Ok`. The
+  parent→round→child chain propagates down, never up, and is drop-safe.
+- **Byte-faithful content addressing** — `canonical_json` reproduces
+  `JSON.stringify` exactly (key order, number layout, escaping), and
+  `content_hash` is pinned by a cross-language golden against Node and Python.
+- **Closed error enum** — `CoreError` is intentionally exhaustive (not
+  `#[non_exhaustive]`) so matches are compile-time complete; subsystems layer
+  their own richer error types above it.
+- **Pure paths, explicit I/O** — `Locator` path methods are pure string joins;
+  only the `ensure_*` async helpers touch disk.
+- **Re-iterable streams** — a `Channel` is a factory, not a buffered stream;
+  iterating it twice re-runs the work, which is what makes retries cheap.
+
+## Relationship to neighbors
+
+`core` is the bottom of the stack: it depends on no subsystem and every subsystem
+depends on it. The [Runtime](/rust/subsystems/runtime) hashes session-DAG nodes
+with `content_hash`, sizes and dispatches tool rounds under the
+`CancellationToken` chain, and carries model emissions over `Channel`; the LLM
+gateway specializes `Channel<Emission>` and reads provider keys through
+`core::env`; the shell app resolves every settings/auth/session/log path through
+`Locator` and stamps user-visible names from `BRAND`. The `CoreError`/`CoreResult`
+pair is the shared base that subsystem error types (`GatewayError`, `RunError`,
+`ProtocolFault`) wrap.
+
+This module is the Rust counterpart of the cross-cutting primitives the
+TypeScript framework scattered across `shell-app/locate`, `runtime/store/hash`,
+and the gateway streaming layer — and parallels the foundations described for the
+[Python runtime](/python/subsystems/runtime). See the
+[Architecture overview](/rust/architecture) for how the layers fit together.

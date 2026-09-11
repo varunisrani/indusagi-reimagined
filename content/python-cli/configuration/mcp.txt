@@ -1,0 +1,226 @@
+# MCP Servers
+
+> Mount external Model Context Protocol (MCP) tool servers into a `pindus`
+> session with the repeatable `--mcp` flag. Each endpoint's tools are connected
+> through the framework MCP pool and concatenated onto the built-in capability
+> deck as ordinary `AgentTool`s, so the agent calls them exactly like `read` or
+> `bash`. Requires the `indusagi[mcp]` extra (pulled in by `indusagi[mcp,tui]`).
+
+## Table of Contents
+
+- [What MCP gives you](#what-mcp-gives-you)
+- [The --mcp flag](#the---mcp-flag)
+- [Config file format](#config-file-format)
+- [Auto-detected config search](#auto-detected-config-search)
+- [How tools are attached](#how-tools-are-attached)
+- [Failure handling and noise suppression](#failure-handling-and-noise-suppression)
+- [Tool naming and filtering](#tool-naming-and-filtering)
+- [Reference](#reference)
+
+## What MCP gives you
+
+The Model Context Protocol lets a third-party server expose a set of tools (and
+resources/prompts) over a wire protocol. `pindus` connects to such servers at
+boot, lists their tools, and adapts each one into the conductor's
+[`AgentTool`](/python-cli/subsystems/capability-deck) shape. The model then sees
+those tools in its briefing alongside the built-ins and can invoke them mid-turn.
+
+Connections are made through the framework MCP facade
+([`indusagi.mcp`](/python/facades/mcp)), which is a thin shim over the core
+protocol bridge ([`indusagi.interop`](/python/subsystems/interop)). The shim
+speaks both transports: subprocess **stdio** servers (the `command`/`args` form)
+and **HTTP/SSE** servers (the `url` form).
+
+## The --mcp flag
+
+`--mcp` names where to find MCP server config. It is a **list** flag — repeat it
+or comma-join values, and every endpoint is attached:
+
+```bash
+# A single project/user config (auto-detected — see search order below)
+pindus --mcp .
+
+# An explicit config file
+pindus --mcp ./mcp.json
+
+# Several endpoints at once (repeated or comma-joined are equivalent)
+pindus --mcp ./fs.json --mcp ./github.json
+pindus --mcp ./fs.json,./github.json
+```
+
+Each value is interpreted by the framework loader: **if it points at a file**,
+that file is loaded directly; **otherwise it is treated as a working directory**
+and the standard config locations under it are merged (see
+[Auto-detected config search](#auto-detected-config-search)).
+
+When `--mcp` is omitted, no external servers are attached and the session runs on
+the built-in deck alone.
+
+## Config file format
+
+A config file is JSON with a top-level `servers` field. `servers` may be either
+an **array** of server objects or an **object** keyed by server name (the key
+becomes the server's `name`). A server is reached over **HTTP** when it carries a
+`url`, or over **stdio** when it carries a `command`; one of the two is required.
+A server with `"enabled": false` is skipped.
+
+```json
+{
+  "servers": [
+    {
+      "name": "filesystem",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/path/to/allowed/dir"],
+      "enabled": true
+    },
+    {
+      "name": "github",
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": { "GITHUB_TOKEN": "your-github-token" },
+      "enabled": true
+    },
+    {
+      "name": "remote-server",
+      "url": "http://localhost:8080/mcp",
+      "headers": { "Authorization": "Bearer your-token" },
+      "enabled": false
+    }
+  ]
+}
+```
+
+The object form is equivalent and often tidier:
+
+```json
+{
+  "servers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "."]
+    },
+    "remote-server": {
+      "url": "http://localhost:8080/mcp",
+      "headers": { "Authorization": "Bearer your-token" }
+    }
+  }
+}
+```
+
+| Field | Applies to | Purpose |
+|-------|-----------|---------|
+| `name` | both | Server id; namespaces its tools. In the object form this is the map key. |
+| `command` | stdio | Executable to spawn (e.g. `npx`, `python`, `node`). |
+| `args` | stdio | Argument list passed to `command`. |
+| `env` | stdio | Extra environment variables for the spawned process. |
+| `url` | HTTP | Endpoint URL; the core transport speaks SSE. |
+| `headers` | HTTP | Headers sent on the connection (e.g. an auth bearer token). |
+| `timeout` | both | Per-request timeout in milliseconds. |
+| `enabled` | both | `false` skips the entry without removing it from the file. |
+
+A file that is missing the `servers` field, or whose `servers` is neither array
+nor object, is reported and yields no servers — it does not crash the run.
+
+## Auto-detected config search
+
+When a `--mcp` value is a **directory** (or `.`), the framework loader merges
+config from the conventional locations, in this order:
+
+1. **Project:** `./.indusvx/mcp.json`
+2. **User (XDG):** `$XDG_CONFIG_HOME/indusvx/mcp.json` (default `~/.config/indusvx/mcp.json`)
+3. **Legacy:** `~/.indusvx/agent/mcp.json`
+4. **Legacy alt:** `~/.indusvx/agent/mcp-servers.json`
+
+All present sources are concatenated, so a project `mcp.json` and a user
+`mcp.json` both contribute their servers. Passing an explicit file path bypasses
+the search and loads only that file.
+
+## How tools are attached
+
+Attachment happens at conductor-assembly time, in
+[`induscode.boot.runners.session`](/python-cli/subsystems/boot). The flow for
+each `--mcp` path:
+
+```python
+servers = loadMCPConfig(path)                       # parse file or merge a cwd
+pool = MCPClientPool(MCPClientPoolOptions(servers=servers))
+await pool.connectAll()
+for client in pool.getAllClients():
+    for definition in await client.listTools():
+        tools.append(createMCPAgentToolFactory(definition, client)())
+```
+
+The framework factory `createMCPAgentToolFactory` mints a tool that is
+structurally a conductor `AgentTool`, so MCP tools require no adapter — they are
+simply appended to the deck:
+
+```python
+# induscode/boot/runners/session.py
+tools = [*select_tools(cwd, inv), *(await load_mcp_tools(inv))]
+```
+
+The combined list becomes `SessionConductorOptions.tools`, and the system prompt
+is composed *after* attachment, so the briefing the model receives already
+describes the MCP tools. The deck itself comes from `provision_deck("all", ...)`
+— see the [Capability Deck](/python-cli/subsystems/capability-deck) page for the
+built-in catalog and how the framework's
+[capabilities](/python/subsystems/capabilities) become `AgentTool`s.
+
+## Failure handling and noise suppression
+
+`--mcp` is best-effort and never sinks a session:
+
+- An endpoint that fails to load or connect is **skipped**; remaining endpoints
+  and the built-in deck still come up. A single bad config or unreachable server
+  degrades the deck rather than aborting boot.
+- A config with zero usable servers contributes nothing and is silently passed
+  over.
+
+The framework pool reports per-server connection progress on stdout/stderr and
+through `logging`. During attachment those streams are scope-redirected to
+`/dev/null` and logging below `ERROR` is disabled, so MCP chatter can never
+corrupt the Textual console render or the `-p --json` NDJSON stream. Setting the
+`INDUSAGI_DEBUG` environment variable keeps all of that connection output
+visible for troubleshooting:
+
+```bash
+INDUSAGI_DEBUG=1 pindus --mcp ./mcp.json -p "list the repo tools you have"
+```
+
+## Tool naming and filtering
+
+MCP tools land on the same deck as the built-ins, so the `--tools` / `--no-tools`
+allow-list applies to them too. Names are matched case-insensitively with `_`
+and `-` stripped, which is worth knowing when an MCP server's tool name contains
+separators. `--no-tools` disables the **built-in** deck for the run; MCP tools
+are attached after that selection, so they are still available.
+
+```bash
+# Built-ins off, but the MCP server's tools still attach
+pindus --no-tools --mcp ./mcp.json
+
+# Restrict to a named subset (built-in or MCP), separators ignored
+pindus --tools read,bash --mcp ./mcp.json
+```
+
+See [Models & flags](/python-cli/reference/cli) for the full flag table and
+[Configuration: Settings](/python-cli/configuration/settings) for persisted
+session defaults.
+
+## Reference
+
+| Symbol | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `--mcp` | flag (list) | `launch/invocation/flags.py` | Attach external MCP endpoints; comma-separated or repeated. |
+| `Invocation.mcp` | field | `boot/contract.py` | The parsed tuple of `--mcp` paths (`None` when unset). |
+| `load_mcp_tools` | async function | `boot/runners/session.py` | Connect every `--mcp` endpoint and return their tools; skips failures. |
+| `select_tools` | function | `boot/runners/session.py` | Build the built-in deck and apply `--tools` / `--no-tools`. |
+| `build_session_conductor` | async function | `boot/runners/session.py` | Assemble the conductor; concatenates deck + MCP tools into `options.tools`. |
+| `loadMCPConfig` | function | `indusagi.mcp` | Parse a config file or merge the auto-detected locations. |
+| `MCPClientPool` / `MCPClientPoolOptions` | class | `indusagi.mcp` | Connect a set of MCP servers and surface their clients. |
+| `createMCPAgentToolFactory` | function | `indusagi.mcp` | Mint a conductor-compatible `AgentTool` from an MCP tool definition. |
+| `StdioServerConfig` / `HttpServerConfig` | dataclass | `indusagi.mcp` | The stdio (`command`) and HTTP (`url`) server config shapes. |
+
+The framework MCP surface is documented in full on the
+[`indusagi.mcp` facade](/python/facades/mcp) page; the underlying protocol bridge
+lives in [interop](/python/subsystems/interop).

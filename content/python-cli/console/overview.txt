@@ -1,0 +1,312 @@
+# The Console
+
+> The interactive Textual console is `induscode`'s product shell — the live
+> terminal surface a run mode hands a session to take over the screen. You reach
+> it by running `pindus` (or `induscode`) in an attended terminal, or by awaiting
+> `mount_console(...)` directly. It renders a banner, a scrolling transcript,
+> streaming markdown, collapsible tool cards, a prompt editor, and a live
+> status/footer strip, while every decision lives in a pure reducer wired around
+> the [indusagi react-ink](/python/ui/react-ink) rendering library.
+
+## Table of Contents
+
+- [What it is](#what-it-is)
+- [Reaching the console](#reaching-the-console)
+- [Anatomy of the surface](#anatomy-of-the-surface)
+- [Streaming markdown and tool cards](#streaming-markdown-and-tool-cards)
+- [The footer and status strip](#the-footer-and-status-strip)
+- [Keystrokes and chords](#keystrokes-and-chords)
+- [Submit routing and inline shell](#submit-routing-and-inline-shell)
+- [The reducer store](#the-reducer-store)
+- [Mounting from Python](#mounting-from-python)
+- [Public surface](#public-surface)
+- [See also](#see-also)
+
+## What it is
+
+The console is deliberately thin. The framework (`indusagi.react_ink`) supplies
+the heavy rendering — the message list, the streaming markdown renderer, the
+footer/status strips, the dialog bodies, and the prompt editor. The console adds
+everything that turns those into a coding-agent app: the banner masthead, the
+scrolling transcript, the live streaming tail, submit routing, the app-level key
+chords, the twelve modal overlays, the slash-command catalog, and the theme
+engine.
+
+Crucially, every decision lives in a *pure* module — `console_reducer`, the
+intent table, the chord/exit-window machines, the slash resolver, the completion
+providers, the overlay flows, the theme pipeline — while `ConsoleApp` (the only
+Textual `App` in the subsystem) just wires events in and renders the result out.
+The whole subsystem performs exactly one Textual mount (`mount.py`), so
+everything else stays pure or presentational and testable without a TTY.
+
+## Reaching the console
+
+In an attended terminal the launcher selects the interactive REPL by default and
+calls into the console:
+
+```bash
+pindus -m claude-sonnet-4          # interactive Textual console
+pindus -m claude-sonnet-4 "explain this repo"   # first turn submitted on mount
+```
+
+Under the hood the [boot REPL runner](/python-cli/subsystems/boot) reaches the
+console through an injectable `set_console_mount` seam that resolves to
+`mount_console`. A run mode awaits exactly one entry point:
+
+```python
+from induscode.console import mount_console
+
+# conductor: a SessionConductor already assembled; services: OverlayServices | None
+exit_code = await mount_console(
+    conductor,
+    services,
+    scheme="midnight",               # else the colourScheme preference, else default
+    initial_input="explain this repo",  # optional first turn submitted on mount
+    verbose=False,
+)
+```
+
+`mount_console` resolves the colour scheme to a `ConsoleTheme`, assembles the
+slash registry, constructs `ConsoleApp`, awaits `App.run_async()`, then prints
+the *exit transcript* (Textual's alternate screen is erased on leave, so the
+settled conversation is re-rendered as plain Rich text into scrollback) and
+returns the process exit code.
+
+## Anatomy of the surface
+
+On mount, `ConsoleApp` registers all four schemes' Textual themes (so the picker
+preview is a native retheme), subscribes to the conductor's `SessionSignal`
+stream, focuses the editor, and composes the widget tree:
+
+| Region | Widget | Role |
+|--------|--------|------|
+| `#transcript` | `VerticalScroll` holding `Banner` + framework `MessageList` | The masthead and the scrolling record of settled turns. |
+| `#live-tail` | anchored `VerticalScroll` of `StreamingMarkdown` + tool cards | The live streaming tail of the in-flight turn. |
+| `#chrome` | bottom-docked `Vertical` | `TaskPanel` + `PromptEditor` + `#suggestions` + `StatusBar`. |
+
+The transcript and live-tail scrolls are non-focusable; only the editor takes
+focus. The `Banner` is the figlet wordmark, two-tone emblem, session/startup
+panels, and changelog, surveyed read-only at startup by `gather_startup` /
+`gather_changelog` over your context docs, [skills, and prompt
+templates](/python-cli/subsystems/briefing).
+
+## Streaming markdown and tool cards
+
+The console projects each conductor `SessionSignal` into reducer events plus
+retained-widget updates. Streaming is built around `_LiveSegment`: each streaming
+kind (an `answer` or a `reason`/thinking block) is one segment — a ledger row id,
+accumulated text, and a retained `StreamingMarkdown` widget.
+
+- A text/thinking delta grows the segment's widget in place.
+- A delta arriving on a *closed* segment mints a fresh row and widget.
+- `tool_start` settles the open segment, so post-tool narration starts a fresh
+  segment — making the run-on / first-delta-clipping bug class structurally
+  impossible.
+- `turn_end` / `fault` settle and clear the live tail; from there the
+  `MessageList` (fed from `conductor.messages()`) is the sole renderer of the
+  settled turn.
+
+`tool_start` / `tool_end` mint and settle a collapsed **tool card** (clamped via
+`tool_card_text`, with arguments summarized by `summarize_tool_args`) plus a
+`ToolExecutionState` row for the `TaskPanel`. Tool output is collapsed by
+default; press **Ctrl-O** (the `view:expandTools` intent) to toggle full
+tool-output rendering. Diffs from edit tools are rendered as structured,
+syntax-highlighted blocks by the framework markdown renderer.
+
+`stream_parity_report` is a self-check that the ledger rows match what the
+retained widgets were actually fed.
+
+## The footer and status strip
+
+The `StatusBar` (`console/components/status_bar.py`) is purely presentational: a
+`Vertical` composing the framework `StatusLine` (the transient toast row) above
+the framework `Footer` (the persistent session/usage strip). Both are fed a
+projected `SessionSnapshot`.
+
+`project_snapshot` projects the conductor state into that snapshot, deriving the
+real context-window denominator: the active model id is resolved to a `ModelCard`
+via the [gateway catalog](/python/subsystems/llm-gateway) (`get_card`) so the
+footer can show the **live context-window percentage** alongside token and cost
+counters. The footer also shows the git branch (`read_branch`) and the available
+provider count (`count_providers`). `_refresh_view` re-syncs the message list,
+task panel, status bar, banner model id, and the OSC-2 terminal title (via
+`self.title`, never raw escape writes) after every dispatch.
+
+> The footer's usage/cost/token accounting is rendered by the framework
+> `Footer` / `SessionSnapshot` widgets. The lower-level distributed-tracing plane
+> (probes, sampling, redaction, replay) is a separate subsystem — see
+> [Insight](/python-cli/subsystems/insight).
+
+## Keystrokes and chords
+
+Printable keys are consumed by the framework `PromptEditor` / `EditorCore` — the
+console contributes only autocomplete, submit, and app-level chords. Editor-level
+verbs (typing, deletion, caret motion, history, completion accept) are delegated
+to the editor and never reach the app while the composer has focus.
+
+App-level chords are pure data: `INTENT_TABLE` maps a framework `KeyId` to a
+`ConsoleIntent`, and `ConsoleApp`'s `BINDINGS` derive from that table. The live
+chord verbs:
+
+| Chord | Verb | Effect |
+|-------|------|--------|
+| `Ctrl-C` | `flow:interrupt` | Abort a busy turn; else clear; else arm/confirm exit. |
+| `Ctrl-Z` | `flow:suspend` | Suspend the process. |
+| `Ctrl-N` / `Ctrl-P` | `flow:cycleModel` | Rotate the active model in scope. |
+| `Shift-Tab` | `model:cycleThinking` | Step the reasoning/thinking ladder. |
+| `Ctrl-T` | `view:toggleReasoning` | Show/hide reasoning blocks. |
+| `Ctrl-O` | `view:expandTools` | Toggle collapsed vs. full tool output. |
+| `Ctrl-V` | `input:pasteImage` | Paste a clipboard image into the turn. |
+| `Ctrl-G` | `input:externalEditor` | Hand the buffer to `$EDITOR`. |
+| `Ctrl-R` | `overlay:open` (sessions) | Raise the session-resume overlay. |
+| `Ctrl-L` | `overlay:open` (models) | Raise the model picker. |
+| `Alt-Up` | `queue:dequeue` | Pull the newest queued input back into the composer. |
+| `Esc` | `flow:dismiss` | Dismiss an overlay / abort a busy turn / feed the double-Esc latch. |
+| `Ctrl-U` | `edit:clearLine` | Clear the line; on an empty buffer, arm the clear-twice latch. |
+
+Two pure machines layer state over the vocabulary:
+
+- **The double-tap latch** (`advance_chord`): a first `Esc` primes a chord; a
+  second within `CHORD_WINDOW_MS` (600 ms) fires the configurable double-Escape
+  action. `Ctrl-U` twice on an empty buffer fires `clear×2`.
+- **The Ctrl-C exit window** (`advance_exit_window`): a busy turn is aborted
+  first; otherwise a press on a non-empty buffer clears it, and a press on an
+  empty buffer arms a window — a second empty-buffer press within
+  `CTRL_C_EXIT_WINDOW_MS` (500 ms) **exits**.
+
+So **Esc aborts** a running turn, and **Ctrl-C exits** the console (after
+clearing). Both machines take an injectable clock and are tested without
+Textual. Composer autocomplete (`complete_at`) routes a leading `/` to the slash
+catalog and an `@`/path token to a live directory listing (dirs-first, with
+trailing-slash descent).
+
+## Submit routing and inline shell
+
+`_handle_submit` routes one committed line in a fixed precedence order:
+
+1. **Inline shell** — a leading `!` escapes the line to the shell via
+   `conductor.execute_bash`; a leading `!!` runs the command but keeps its output
+   out of the conversation context (`excludeFromContext`).
+2. **Slash command** — otherwise `resolve_slash(line, registry)` runs the matched
+   `SlashCommand` with a `SlashContext` (it can dispatch reducer events, open a
+   modal, set the buffer, append a display block, request exit, set status, or
+   return a prompt to run). An unknown `/name` raises a warning toast.
+3. **Plain prompt** — otherwise `_run_turn` appends the prompt row, flips busy,
+   and drives `conductor.submit`.
+
+```bash
+> !git status            # run in the shell, output joins the context
+> !!npm run build        # run in the shell, output kept out of context
+> /model                 # open the model picker (a slash command)
+> explain the agent loop # a plain prompt to the model
+```
+
+See [Slash commands](/python-cli/console/slash-commands) for the full catalog and
+[Dialogs](/python-cli/console/dialogs) for the twelve modal overlay flows.
+
+## The reducer store
+
+All UI-local state is one frozen `ConsoleState` — `rows`, `blocks`, `modal`,
+`status`, `scheme`, `show_reasoning`, `show_images`, `busy`, `tick`. It is
+mutated only by dispatching a `ConsoleEvent` into the pure, total
+`console_reducer`. The surface holds exactly one state and never mutates it.
+Session data (messages/usage/model) lives on the conductor snapshot; the composer
+buffer/caret/history live in the framework editor — none of it is stored here.
+
+```python
+from induscode.console import (
+    init_console_state, console_reducer,
+    RowsAppend, ViewRow, BusySet, StatusSet,
+)
+from indusagi.react_ink import StatusMessage
+
+state = init_console_state(scheme="daylight", show_reasoning=True)
+state = console_reducer(state, RowsAppend(row=ViewRow(id="row-1", kind="prompt", text="hi")))
+state = console_reducer(state, BusySet(busy=True))
+state = console_reducer(state, StatusSet(status=StatusMessage(kind="info", text="Working...")))
+assert state.busy and state.rows[0].text == "hi"
+```
+
+The `ConsoleEvent` union carries the tags `rows:set`, `rows:append`,
+`rows:patch`, `block:append`, `blocks:clear`, `modal:open`, `modal:close`,
+`status:set`, `status:clear`, `scheme:set`, `toggle:reasoning`, `toggle:images`,
+`busy:set`, and `tick`. A `ViewRow` is one transcript row (`id`, `kind`, `text`,
+`run_id`) whose `kind` is one of `prompt | answer | reason | toolRun | notice`.
+An unknown tag raises `ValueError`.
+
+Overlays mirror the screen stack: `overlay:open` dispatches `modal:open`, runs
+`open_overlay` in a worker (a `push_screen_wait` flow), folds the returned
+`OverlayOutcome.events` through the reducer, then dispatches `modal:close` — so
+`ConsoleState.modal` always tracks what is on screen.
+
+## Mounting from Python
+
+The full `mount_console` signature (everything but the conductor is optional):
+
+| Parameter | Purpose |
+|-----------|---------|
+| `conductor` | The session this console drives (the only required input, positional). |
+| `services` | The `OverlayServices` bundle the overlays drive (settings, sessions, vault, login). Absent on headless paths. |
+| `scheme` | An explicit colour-scheme override; else the `colourScheme` preference, else `DEFAULT_SCHEME`. |
+| `slash` | The slash registry to dispatch against; else the built-in catalog. |
+| `initial_input` | An optional first user turn submitted on mount. |
+| `verbose` | Render verbose diagnostics in the banner. |
+| `on_exit` | Invoked when the console asks the host process to leave. |
+| `cwd` | The workspace directory (defaults to the process cwd). |
+| `headless` / `auto_pilot` | Forwarded to `App.run_async` so tests drive the real mount under a Textual `Pilot` without a TTY. |
+| `transcript_file` | Where the exit transcript prints (defaults to stdout). |
+
+You can also fold events through the reducer or resolve a theme purely, with no
+Textual mount at all:
+
+```python
+from induscode.console import resolve_theme, THEMES
+
+theme = resolve_theme("midnight-cb")   # colour-blind-safe dark scheme
+assert theme.scheme == "midnight-cb"
+rich_text = theme.adapter.color("accent", "[tool read]")
+list(THEMES.keys())  # ('midnight', 'daylight', 'midnight-cb', 'daylight-cb')
+```
+
+See [Theming](/python-cli/console/theming) for the palette → tokens → framework
+colours pipeline behind `resolve_theme`.
+
+## Public surface
+
+The `induscode.console` barrel re-exports the surface (the M1 slash framework
+types are re-exported here too, so console consumers import one surface):
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `mount_console` | async function | `console/mount.py` | The single entry a run mode awaits to take over the terminal; returns the exit code. |
+| `ConsoleApp` | class | `console/app.py` | The top-level Textual `App`: owns the reducer store, projects signals, runs overlay workers, routes submit. |
+| `console_reducer` | function | `console/reducer.py` | The single pure total fold over `ConsoleState`; raises on an unknown tag. |
+| `init_console_state` | function | `console/reducer.py` | Build the initial state, overlaying caller UI preferences. |
+| `ConsoleState` | dataclass | `console/contract.py` | The frozen UI-local state slice (rows/blocks/modal/status/scheme/toggles/busy/tick). |
+| `ConsoleEvent` | type | `console/contract.py` | The closed action union with `domain:verb` tags. |
+| `ViewRow` / `ViewRowKind` | dataclass | `console/contract.py` | One immutable transcript row. |
+| `ModalKind` / `MODAL_KINDS` | type | `console/contract.py` | The 12-kind overlay machine. |
+| `transition_modal` | function | `console/contract.py` | Pure helper computing the next `ModalState`. |
+| `ConsoleProps` / `OverlayServices` | dataclass | `console/contract.py` | Host shapes the surface and overlays receive. |
+| `ConsoleTheme` / `ThemeTokens` / `ThemeScheme` | dataclass | `console/contract.py` | The theme vocabulary. |
+| `resolve_theme` / `THEMES` | function / const | `console/theme/resolve.py` | Map a scheme name to a built `ConsoleTheme`; the frozen 4-scheme table. |
+| `project_snapshot` / `read_branch` / `count_providers` | function | `console/app.py` | Project the conductor state into a `SessionSnapshot`; read the git branch; count providers. |
+| `read_double_escape_action` | function | `console/app.py` | Resolve the configurable double-Escape action. |
+
+## See also
+
+- [Slash commands](/python-cli/console/slash-commands) — the transcript,
+  workbench, integrations, and dynamic command catalog.
+- [Dialogs](/python-cli/console/dialogs) — the twelve `push_screen_wait` overlay
+  flows (pickers, sessions, auth, plugin).
+- [Theming](/python-cli/console/theming) — the four schemes and the palette →
+  tokens → framework-colour pipeline.
+- [Conductor](/python-cli/subsystems/conductor) — the `SessionConductor` and its
+  `SessionSignal` stream the console projects.
+- [Boot](/python-cli/subsystems/boot) — how the REPL runner reaches
+  `mount_console`.
+- [Insight](/python-cli/subsystems/insight) — the tracing plane.
+- [react-ink](/python/ui/react-ink) — the framework rendering widgets the console
+  wraps.
+- [LLM Gateway](/python/subsystems/llm-gateway) — the catalog the footer reads
+  for context-window sizing.

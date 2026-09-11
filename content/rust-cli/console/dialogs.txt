@@ -1,0 +1,382 @@
+# Dialogs & Overlays
+
+> The thirteen modal overlays the interactive console raises over the transcript — model picker, scoped models, settings, theme, session browser, tree navigator, prior-turn fork, sign-in/out, OAuth, plugin, and the tool-permission prompt. Reached inside `indusr` via slash commands (`/model`, `/settings`, `/resume`, `/login`, …) or app keybindings; each is one module under `induscode::console::overlays`. Every overlay is the **render half** of a host-driven flow: a leaf module owns the pure projections plus a `draw_*` painter, while the binding/`await`/side effects are the host's job.
+
+## Table of Contents
+
+- [How an overlay is raised](#how-an-overlay-is-raised)
+- [The thirteen modal kinds](#the-thirteen-modal-kinds)
+- [The render-half contract](#the-render-half-contract)
+- [Picker overlays](#picker-overlays)
+- [Session overlays](#session-overlays)
+- [Auth overlays](#auth-overlays)
+- [The plugin overlay](#the-plugin-overlay)
+- [The approval overlay](#the-approval-overlay)
+- [Modal bookkeeping](#modal-bookkeeping)
+- [Reaching each overlay](#reaching-each-overlay)
+
+## How an overlay is raised
+
+The console is an immediate-mode ratatui loop, not a tree of mounted React components. An overlay is **a kind recorded in `ConsoleState.modal`** that the per-frame draw path mirrors onto the framework `DialogStack`. The reducer is the single source of truth: `ConsoleState.modal` is a `ModalState { kind, payload }`, and the draw path picks the matching `draw_*` painter by the active [`ModalKind`](/rust-cli/console/overview).
+
+`ModalKind` and the transition helper live in `console::state` (porting the TS `contract.ts`):
+
+```rust
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ModalKind {
+    #[default]
+    None,
+    Settings,
+    Models,
+    ScopedModels,
+    Theme,
+    Sessions,
+    Tree,
+    UserTurns,
+    SignIn,
+    SignOut,
+    Oauth,
+    Plugin,
+    Approval,
+}
+
+pub fn transition_modal(next: ModalKind, payload: Option<ModalPayload>) -> ModalState;
+```
+
+`NO_MODAL` is the inert `None` state; `transition_modal(ModalKind::None, _)` (or closing) returns `NO_MODAL`, and any other kind raises that overlay carrying the optional typed payload. Because Rust has no `unknown`, the opaque TS `payload?: unknown` becomes a typed `ModalPayload` enum — only five kinds carry data (`Approval`, `Oauth`, `Plugin`, `ScopedModels`, `SignIn`); the rest never construct a payload. See [Console Overview](/rust-cli/console/overview) for the surrounding surface and [Slash Commands](/rust-cli/console/slash-commands) for the verbs that open overlays.
+
+## The thirteen modal kinds
+
+`mod.rs` declares one leaf module per kind (plus the approval queue and resolver helpers that back the approval prompt):
+
+| Kind | Overlay | Module | Painter / widget |
+|------|---------|--------|------------------|
+| `None` | inert — composer has focus | — | — |
+| `Settings` | the settings list | `overlays::settings` | `draw_settings` |
+| `Models` | single-model picker | `overlays::models` | `draw_models` |
+| `ScopedModels` | per-scope model picker | `overlays::scoped_models` | `draw_scoped_models` |
+| `Theme` | colour-scheme picker | `overlays::theme` | `draw_theme` |
+| `Sessions` | session resume / list browser | `overlays::sessions` | `draw_sessions` |
+| `Tree` | transcript-tree navigator | `overlays::tree` | `draw_tree` |
+| `UserTurns` | prior-user-turn fork picker | `overlays::user_turns` | `draw_user_turns` |
+| `SignIn` | provider sign-in launcher | `overlays::signin` | `build_login_dialog` |
+| `SignOut` | sign-out confirmation | `overlays::signout` | `build_logout_dialog` |
+| `Oauth` | in-flight OAuth / api-key entry | `overlays::oauth` | framework `OAuthDialog` |
+| `Plugin` | host/plugin-supplied surface | `overlays::plugin` | `PluginDialog` (bespoke) |
+| `Approval` | tool-permission prompt | `overlays::approval` (+ `approval_queue`, `approval_resolver`) | `ApprovalDialog` (bespoke) |
+
+## The render-half contract
+
+Every leaf overlay module follows the same three-part shape, called out in `PLAN/13_console_overlays_pickers.md`:
+
+1. **An `is_active(state) -> bool` guard** — the single check the host consults before drawing, e.g. `state.modal.kind == ModalKind::Models`. (The auth and approval widgets are constructed/handled directly instead.)
+2. **Pure projections** the host reuses to build dialog rows *before* it pushes the dialog. A synchronous framework `Dialog::handle_key` cannot `await`, so any list backed by I/O (the session catalog, the credential vault, the model catalog) is **pre-fetched** and mapped through these projections, then handed to the painter. Examples: `models::catalog_for`, `sessions::to_session_info`, `signout::to_saved_account`.
+3. **A `draw_*` painter** (or a framework dialog the host pushes) that paints the overlay as a full-screen modal layer the way `DialogStack::render` draws a single dialog — `Clear(area)` then `dialog.render(f, area, theme)`. A fresh framework dialog is built each draw and seeded with the host's shared `modal_selected` cursor (re-clamped), so the render path stays **pure and I/O-free**.
+
+The painters render the frozen framework dialogs from the Rust [`indusagi` framework](/rust) `tui_render` crate (`indusagi::tui_render::components::dialogs`): `ModelDialog`, `ScopedModelsDialog`, `SettingsDialog`, `ThemeDialog`, `SessionDialog`, `TreeDialog`, `UserMessageDialog`, `LoginDialog`, `OAuthDialog`. The two prompts the framework has no widget for (`PluginDialog`, `ApprovalDialog`) are bespoke, composed from the framework `DialogFrame` + `WindowedList`. This is the Rust analogue of the [TS console overlays](/cli) and the [Python overlay flows](/python-cli/console/dialogs); see [Theming](/rust-cli/console/theming) for how the theme picker re-skins live.
+
+## Picker overlays
+
+The four selection dialogs each own pure catalog/projection helpers plus a painter.
+
+### Model picker (`Models`)
+
+`overlays::models` paints the single-model picker over the live `indusagi/ai` facade catalog — 708 models across 24 providers (the `mock` echo provider is excluded), not the gateway's routing cards. The pure projections:
+
+```rust
+pub fn catalog() -> Vec<ModelOption>;
+pub fn authenticated_providers(auth_path: &Path) -> HashSet<String>;
+pub fn catalog_for(authed: Option<&HashSet<String>>) -> Vec<ModelOption>;
+pub fn auth_filter(models: Vec<ModelOption>, authed: &[String]) -> Vec<ModelOption>;
+pub fn bound_index(models: &[ModelOption], bound: &str) -> Option<usize>;
+pub fn provider_for(model_id: &str) -> Option<String>;
+pub fn draw_models(f: &mut Frame, area: Rect, theme: &Theme, models: Vec<ModelOption>, selected: usize);
+```
+
+`catalog()` projects every provider's models to `ModelOption` rows (de-duped by canonical `provider/modelId`, sorted by provider then id; `EXCLUDED_PROVIDERS = ["mock"]`). The host calls `authenticated_providers(auth_path)` once at mount (the §4.8 pre-fetch) — it reads the nested `auth.json` vault (`{ providerId: { account: cred } }`) **unioned** with every provider whose conventional api-key env var (e.g. `ANTHROPIC_API_KEY` → `anthropic`, `GEMINI_API_KEY` → `google`, `MOONSHOT_API_KEY` → `kimi`) holds a non-empty value, so an env-only user is never filtered to nothing. `catalog_for` / `auth_filter` then restrict the list to signed-in providers, with the empty→all fallback: when no provider is authenticated (or the filter would empty the list) the **whole** catalog is shown rather than an empty picker. `bound_index` seeds the highlight on the currently-bound model (matching either the bare `claude-sonnet-4-5` or canonical `anthropic/claude-sonnet-4-5` form). On selection the host binds the chosen card via the conductor's `select_model` (rebuilding the agent over the new model), **persists** it as the saved default (`persist_default_model`) so a later startup binds it with no picker, toasts the new model, and closes; Esc leaves the session untouched. This handler is shared by `/model` and the first-run startup picker.
+
+### Scoped models (`ScopedModels`)
+
+`overlays::scoped_models` edits the per-scope `enabledModels` preference, where an empty override means "every model is enabled". Its two pure projections mirror the seed/collapse round-trip:
+
+```rust
+pub fn seed_selection(models: &[ModelOption], enabled: &[String]) -> Vec<String>;
+pub fn collapse_selection(all_ids: &[String], selected: Vec<String>) -> Vec<String>;
+pub fn draw_scoped_models(f: &mut Frame, area: Rect, theme: &Theme, models: Vec<ModelOption>, enabled: &[String], cursor: usize);
+```
+
+`seed_selection` turns an empty override into "every model selected" and otherwise uses the stored ids; `collapse_selection` is the inverse on save — when every model is selected the override collapses back to `[]` (= no restriction), otherwise the chosen ids are stored verbatim. The `{intent:"reset"}` path is **not a dialog**: per `PLAN/13 §4.6` it is a reset effect that never pushes (the overlay docstrings name it `ConsoleEffect::ResetScopedModels`, a planned host-effect contract — the concrete effect enum is not yet materialized). The painter tracks a `cursor` (the highlighted row) separate from the dialog's checkbox `selected_ids`. Carried by `ModalPayload::ScopedModels(ScopedModelsRef)` (an opaque marker — the payload carries no scope data). The per-scope **save is deferred**: in `mount.rs`'s `confirm_modal_selection`, Enter on a `ScopedModels` row currently just closes (the save needs an as-yet-unthreaded `PreferenceStore`).
+
+### Theme picker (`Theme`)
+
+`overlays::theme` offers four schemes from a static catalog, in listing order — the two base schemes then their daltonized (color-blind-safe) counterparts:
+
+| id | label | description |
+|----|-------|-------------|
+| `midnight` | Midnight | dark terminals |
+| `daylight` | Daylight | light terminals |
+| `midnight-cb` | Midnight (color-blind) | deuteran-safe, dark |
+| `daylight-cb` | Daylight (color-blind) | deuteran-safe, light |
+
+```rust
+pub fn theme_choices() -> Vec<ThemeDialogItem>;
+pub fn theme_names() -> Vec<&'static str>;
+pub fn scheme_index(scheme: ThemeScheme) -> Option<usize>;
+pub fn scheme_at(index: usize) -> Option<ThemeScheme>;
+pub fn draw_theme(f: &mut Frame, area: Rect, theme: &Theme, selected: usize);
+```
+
+The picker is **preview-before-commit**: `scheme_index` seeds the highlight on the active scheme when it opens, and `scheme_at` maps the highlighted row back to a `ThemeScheme` so the host can live-preview it (the framework `ThemeBinding` + `pre_open_theme` capture). Enter commits and persists `colourScheme`, Esc reverts to the scheme the picker opened in. See [Theming](/rust-cli/console/theming).
+
+### Settings (`Settings`)
+
+`overlays::settings` owns the static row catalog and renders it. Unlike the closure-per-row TS `SettingsDialogItem`, the Rust `SettingsItem` is value-based, so the row→write mapping is the host's job. There are **15 rows**, in fixed listing order:
+
+```rust
+pub fn settings_items(value_of: impl Fn(&str) -> Option<String>) -> Vec<SettingsItem>;
+pub fn settings_keys() -> Vec<&'static str>;
+pub fn row_values(key: &str) -> Option<&'static [&'static str]>;
+pub fn next_value(key: &str, current: &str) -> Option<&'static str>;
+pub fn draw_settings(f: &mut Frame, area: Rect, theme: &Theme, value_of: impl Fn(&str) -> Option<String>, selected: usize);
+```
+
+| Row key | Label | Values |
+|---------|-------|--------|
+| `colourScheme` | Colour scheme | `midnight`, `daylight`, `midnight-cb`, `daylight-cb` |
+| `showImages` | Show images | on/off |
+| `imageAutoResize` | Auto-resize images | on/off |
+| `blockImages` | Block images | on/off |
+| `showReasoning` | Show reasoning | on/off |
+| `enableSkillCommands` | Skill commands | on/off |
+| `steeringMode` | Steering mode | `all`, `one-at-a-time` |
+| `followUpMode` | Follow-up mode | `all`, `one-at-a-time` |
+| `autoCompact` | Auto-compact | on/off |
+| `collapseChangelog` | Collapse changelog | on/off |
+| `quietStartup` | Quiet startup | on/off |
+| `logoSweep` | Logo sweep | on/off |
+| `reducedMotion` | Reduced motion | on/off |
+| `showHardwareCursor` | Hardware cursor | on/off |
+| `editorPaddingX` | Editor padding | `0`–`3` |
+
+`settings_items` binds each row's live value via the host's `value_of` lookup (the host reads the `PreferenceStore`; the render path stays I/O-free), and an out-of-vocabulary or absent value falls back to the row's first choice. The framework `SettingsDialog` advances a row to its next value on Enter; `next_value(key, current)` is the pure helper that computes that wrapping advance. The host then commits the cycled `(key, value)` to the live `PreferenceStore` — in `mount.rs` this is `apply_settings_row` → `stage_setting` (the settings dialog stays open after a cycle; Esc closes it). The vocab constants `TOGGLE_VALUES`, `SCHEME_VALUES`, `DELIVERY_VALUES`, and `PADDING_VALUES` are exposed. See [Settings](/rust-cli/configuration/settings).
+
+## Session overlays
+
+The three transcript-navigation overlays each project the app's session vocabulary onto a framework shape and pre-fetch the list before the push (`SavedSession` → `SessionInfo`, `BranchNode` → `SessionTreeOption`, `PriorTurn` → `UserMessageOption`).
+
+### Session browser (`Sessions`)
+
+`overlays::sessions` lists persisted sessions and marks the current one:
+
+```rust
+pub fn to_session_info(row: &SavedSession) -> SessionInfo;
+pub fn to_session_infos(rows: &[SavedSession]) -> Vec<SessionInfo>;
+pub fn draw_sessions(f: &mut Frame, area: Rect, theme: &Theme, sessions: Vec<SessionInfo>, current_id: String, selected: usize);
+```
+
+`to_session_info` maps a catalog `SavedSession` onto the framework `SessionInfo` (a missing `last_modified` defaults to `0`, the preview becomes `first_message`, the path is stringified; `cwd`/`all_messages_text` are `None` — the TS row had no source for them). The host pre-fetches the list (the session library's `list(false)`), hands it to `draw_sessions` with the conductor's open `session_id()` highlighted, and on selection resumes the picked session. Because a synchronous `confirm_modal_selection` cannot `await`, the resume rides the host loop's `Flow::Resume(id)` back to the async loop, which calls `conductor.resume(id)` and repaints the transcript from the restored turns. Delete/rename are deferred (the TS overlay drove them through the catalog; the Rust host does not yet wire them).
+
+### Tree navigator (`Tree`)
+
+`overlays::tree` flattens the active session's transcript tree into selectable depth-annotated nodes and marks the current head:
+
+```rust
+pub fn to_tree_option(node: &BranchNode) -> SessionTreeOption;
+pub fn to_tree_options(nodes: &[BranchNode]) -> Vec<SessionTreeOption>;
+pub fn draw_tree(f: &mut Frame, area: Rect, theme: &Theme, items: Vec<SessionTreeOption>, selected: usize);
+```
+
+`to_tree_option` carries `id`/`label`/`depth`/`is_leaf`/`is_current` straight across (the synthetic root keeps its `None` id). Jumping the conductor's head to the picked node (plus the additive code-rewind) is the host's job, but the conductor exposes **no tree-navigate seam yet**: in `mount.rs`'s `confirm_modal_selection`, Enter on a `Tree` row currently reports the picked target as a status toast (`"Tree navigation not yet wired — would jump to …"`) and closes — the projection and pre-fetch are done; only the conductor capability is deferred.
+
+### Prior-turn fork (`UserTurns`)
+
+`overlays::user_turns` lists the session's prior user turns as fork candidates:
+
+```rust
+pub fn to_turn_option(turn: &PriorTurn) -> UserMessageOption;
+pub fn to_turn_options(turns: &[PriorTurn]) -> Vec<UserMessageOption>;
+pub fn draw_user_turns(f: &mut Frame, area: Rect, theme: &Theme, items: Vec<UserMessageOption>, selected: usize);
+```
+
+`to_turn_option` carries `entry_id` (the fork target), `text`, and `preview`. Forking the transcript at the chosen entry (plus the additive code-rewind) is the host's job, but the conductor exposes **no fork seam yet**: in `mount.rs`'s `confirm_modal_selection`, Enter on a `UserTurns` row currently reports the picked target as a status toast (`"Branch not yet wired — would fork at …"`) and closes — the projection and pre-fetch are done; only the conductor capability is deferred. See [Sessions](/rust-cli/subsystems/sessions).
+
+## Auth overlays
+
+The three credential-tied overlays sit over the launch crate's OAuth machinery and the credential vault.
+
+### Sign-in (`SignIn`)
+
+`overlays::signin` lists the merged login directory as a `LoginDialog` in `LoginMode::Login` and routes the chosen provider by its `AuthKind` into the entry overlay:
+
+```rust
+pub fn entry_mode_for(auth_kind: AuthKind) -> OAuthMode;
+pub fn target_for(provider: &LoginProviderOption) -> AuthEntryTarget;
+pub fn resolve_direct_route(providers: &[LoginProviderOption], requested: Option<&str>) -> Option<AuthEntryTarget>;
+pub fn build_login_dialog(providers: Vec<LoginProviderOption>) -> LoginDialog;
+```
+
+`entry_mode_for` maps `AuthKind::Oauth` → `OAuthMode::Oauth` (the browser flow) and `AuthKind::ApiKey` → `OAuthMode::ApiKey` (the inline key input); both open the *same* entry overlay (`Oauth`), and the mode picks the body. `target_for` builds the `AuthEntryTarget { provider_id, mode }` a chosen provider routes to. The **direct route**: `resolve_direct_route` is pure, so when `/login <provider>` names a known provider the host can skip the picker entirely and open that provider's entry overlay straight away (a bare `/login` or an unknown name falls through to the full launcher). Carried by `ModalPayload::SignIn(SignInRef { requested_provider })`.
+
+### OAuth / api-key entry (`Oauth`)
+
+`overlays::oauth` seeds and drives the framework `OAuthDialog`. The widget already exists (it owns its `OAuthOverlayState`, masks api-key input, and yields the typed value on Enter); this leaf owns the two things the widget cannot — **seeding** and **driving**:
+
+```rust
+pub fn seed_oauth_state(provider_id: &str, provider_name: &str, mode: OAuthMode) -> OAuthOverlayState;
+pub fn apply_progress(state: &mut OAuthOverlayState, progress: OAuthProgress) -> Option<oneshot::Sender<String>>;
+pub fn set_browser_opened(state: &mut OAuthOverlayState, opened: bool);
+pub fn build_api_key_save(state: &OAuthOverlayState) -> Option<ApiKeySave>;
+pub fn provider_model_rule(provider_cards: &[String]) -> Option<&str>;
+```
+
+`seed_oauth_state` builds a fresh dialog state before the flow reports anything — the `input_label` reads `"{providerName} API key"` in api-key mode and `"Authorization code"` in OAuth mode. Because a synchronous `OAuthDialog::handle_key` cannot `await`, the **callbacks-as-channel** rewrite is the genuine async gap: `OverlayCallbacks` implements the launch crate's `OAuthLoginCallbacks` by *sending* `OAuthProgress` events over a `tokio::sync::mpsc` channel, which the host folds into the open dialog with `apply_progress` on each tick:
+
+- `OAuthProgress::Auth(AuthRedirectInfo)` — the consent URL + instructions arrived; sets `auth_info` and the `OPENING_BROWSER` status (the host then opens the URL and folds `set_browser_opened`, switching to `OPENED_BROWSER` / `OPEN_FAILED`).
+- `OAuthProgress::Prompt { prompt, reply }` — the flow needs a value (typically the pasted code); sets `state.prompt` + `input_label`, clears the buffer, and returns the parked `oneshot::Sender<String>` the dialog's Enter fulfils.
+- `OAuthProgress::Progress(String)` — a status note for `state.progress`.
+
+The api-key path is local: `build_api_key_save` turns a submitted key into the vault-write the host performs (trims the buffer, defaults the account to `"default"`, returns `None` for a blank key so the host writes nothing). After any successful sign-in the host binds the provider's *newest* catalog model via `provider_model_rule` — `cards.last()`, not the first, because early catalog entries are retired and 404. Carried by `ModalPayload::Oauth(OAuthFlowRef { provider_id, oauth_mode })`. The flow itself lives in `induscode::launch::oauth`; this leaf only consumes its callback contract. See [Auth & Credentials](/rust-cli/configuration/auth).
+
+### Sign-out (`SignOut`)
+
+`overlays::signout` enumerates every saved account across the known providers as a `LoginDialog` in `LoginMode::Logout`:
+
+```rust
+pub fn to_saved_account(provider_id: &str, provider_label: &str, account_id: &str) -> SavedAccountOption;
+pub fn build_logout_dialog(accounts: Vec<SavedAccountOption>) -> LoginDialog;
+```
+
+The accounts list is **pre-fetched before the push** (the host reads the vault per provider). `to_saved_account` builds each row with the display label `"{providerLabel} · {accountId}"` while carrying the provider *id* (not its label) so the host's remove call targets the right vault key (`vault.remove(provider, account_id)`). With no saved accounts the dialog shows its "No saved credentials were found." empty text.
+
+## The plugin overlay
+
+`overlays::plugin` is the only overlay that needs no runtime services — the request carries everything the prompt shows. The mcp/memory/composio commands gather their real state and pass it down as the request `text`, which this overlay renders line-by-line in a labelled `DialogFrame`:
+
+```rust
+pub struct PluginRequest {
+    pub surface: String,
+    pub title: Option<String>,
+    pub text: Option<String>,
+}
+
+impl PluginRequest {
+    pub fn from_payload(payload: &serde_json::Value) -> Self;
+}
+
+pub struct PluginDialog { /* … */ }
+impl PluginDialog { pub fn new(request: PluginRequest) -> Self; }
+impl Dialog for PluginDialog { type Out = (); /* esc closes */ }
+```
+
+`PluginRequest::from_payload` narrows the opaque JSON payload: a non-object payload (or a missing/non-string `surface`) falls back to the surface name `"plugin"`, while `title`/`text` are carried only when present and string-typed. `PluginDialog` is bespoke (no framework plugin dialog exists) — composed from the framework `DialogFrame` + a `Paragraph`: each body line becomes a `Line`, and an empty line renders as a single space so it never collapses. A request with no text falls back to `"No data available for the {surface} surface."` so the frame is never empty; the frame title defaults to `"Plugin surface"` and the footer reads `"esc to close"`. Only Esc is live (`DialogOutcome::Close`); every other key is inert (the overlay is read-only), and `Release` events are ignored. Carried by `ModalPayload::Plugin(PluginOverlayRef { surface, title, text })`. See [Runtime Bridge](/rust-cli/subsystems/runtime-bridge) and [MCP](/rust-cli/configuration/mcp).
+
+## The approval overlay
+
+The thirteenth kind — absent from the Python/TS modal-kind enum but first-class here — is the tool-permission prompt, raised when the conductor's permission gate reaches an `ask` decision for a tool call. It is backed by three modules: the bespoke `ApprovalDialog` widget, a pure serializing queue, and the cross-task resolver.
+
+### The prompt widget (`overlays::approval`)
+
+`ApprovalDialog` shows the pending request — `Allow <tool> to run?`, a one-line argument preview, and any suggested allow-rule — and a three-choice list:
+
+```rust
+pub struct ApprovalRequest {
+    pub tool_name: String,
+    pub input: serde_json::Value,
+    pub suggestions: Vec<String>,
+}
+
+pub fn read_request(payload: &serde_json::Value) -> Option<ApprovalRequest>;
+pub fn choice_from_id(id: &str) -> ApprovalChoice;
+pub fn summarize_input(input: &serde_json::Value) -> String;
+pub const APPROVAL_CHOICES: [ApprovalChoiceRow; 3];
+pub const DISMISS_CHOICE: ApprovalChoice = ApprovalChoice::Deny;
+```
+
+| id | choice | label | description |
+|----|--------|-------|-------------|
+| `allow-once` | `ApprovalChoice::AllowOnce` | Allow once | run this one call |
+| `allow-always` | `ApprovalChoice::AllowAlways` | Allow always | run it and remember the tool for this session |
+| `deny` | `ApprovalChoice::Deny` | Deny | block this call |
+
+`read_request` narrows the opaque payload (a non-object, or a non-string `toolName`, yields `None`; non-string suggestions are dropped). `choice_from_id` maps a selected id back to the `ApprovalChoice` the gate consumes — pure and total, with any unrecognised id falling back to `DISMISS_CHOICE` (`Deny`) so a stray selection can never silently allow a tool. `summarize_input` renders the arguments as one short line: a shell `command` field (or a bare string) shows verbatim, otherwise a compact JSON encoding, with whitespace collapsed and values longer than `ARG_PREVIEW_LIMIT` (200 chars) elided with a trailing `…` — counting **characters**, not bytes, so a multi-byte value is never split mid-codepoint. The widget is bespoke (the framework has no confirm dialog): a `DialogFrame` titled `Permission`, the header, then a three-row `WindowedList`. Enter yields `DialogOutcome::Select(choice)`, Esc yields `DialogOutcome::Close` (the host folds it to a `Deny` settle), and Up/Down move the highlight clamped to the three rows (no wrap).
+
+### The approval queue (`overlays::approval_queue`)
+
+The UI shows exactly one prompt at a time, so concurrent requests are held in an ordered, headless `ApprovalQueue`:
+
+```rust
+pub struct ApprovalEntry {
+    pub id: String,
+    pub request: ApprovalRequest,
+    pub resolve: oneshot::Sender<ApprovalChoice>,
+}
+
+pub enum ApprovalEvent {
+    Enqueue(ApprovalEntry),
+    Settle { id: String, choice: ApprovalChoice },
+    Clear,
+}
+
+impl ApprovalQueue {
+    pub fn reduce(&mut self, event: ApprovalEvent);
+    pub fn active(&self) -> Option<&ApprovalEntry>;
+}
+```
+
+`Enqueue` parks a request at the tail; the head (`active()`) is the prompt currently shown; `Settle` resolves the entry matching `id` (a no-op when absent) and advances the head; `Clear` drains every outstanding entry, settling each with `ApprovalChoice::Deny` so a cancelled turn never hangs. The one Rust divergence: the parked promise is a `tokio::sync::oneshot::Sender`, and **the send IS the resolve**, so `reduce` owns it — a `oneshot::Sender` is consumed by `send`, making a double-settle a *compile-time* impossibility rather than a runtime latch. Every send is `let _ =`: a dropped receiver (an aborted turn) is a legitimate outcome, never a panic.
+
+### The cross-task resolver (`overlays::approval_resolver`)
+
+`ChannelApprovalResolver` implements the conductor's `ApprovalResolver` and bridges the gate (running on the turn task) to the modal (driven by the blocking UI loop) over two channels:
+
+```rust
+pub struct ChannelApprovalResolver { /* … */ }
+impl ChannelApprovalResolver {
+    pub fn new() -> (Self, mpsc::UnboundedReceiver<ApprovalEntry>);
+}
+
+#[async_trait::async_trait]
+impl ApprovalResolver for ChannelApprovalResolver {
+    async fn request(&self, tool_name: &str, input: &serde_json::Value) -> ApprovalDecision;
+}
+```
+
+`request` mints a monotonic id (`ap_0`, `ap_1`, …), parks an `ApprovalEntry` on an `mpsc::UnboundedSender<ApprovalEntry>` the UI loop drains each frame, and `await`s the entry's `oneshot`. The loop enqueues the entry, opens the `Approval` modal for the head, and on settle sends the user's `ApprovalChoice` back — `AllowOnce`/`AllowAlways` → `ApprovalDecision::Allow`, `Deny` → `ApprovalDecision::Deny`. A closed channel or dropped receiver (the console torn down or the queue cleared) denies, so a turn never hangs on a prompt that can never be answered — the same contract as the queue's `Clear` deny-all.
+
+## Modal bookkeeping
+
+The reducer is the modal authority: `ConsoleState.modal` mirrors what is drawn over the transcript. `transition_modal` is the pure helper computing the next `ModalState` — opening `None` (or closing) returns `NO_MODAL`, any other kind raises that overlay carrying the optional typed `ModalPayload`:
+
+```rust
+use induscode::console::state::{transition_modal, ModalKind, ModalPayload, SignInRef, NO_MODAL};
+
+let state = transition_modal(ModalKind::Settings, None);
+let state = transition_modal(
+    ModalKind::SignIn,
+    Some(ModalPayload::SignIn(SignInRef { requested_provider: Some("anthropic".into()) })),
+);
+let state = transition_modal(ModalKind::None, None); // == NO_MODAL
+```
+
+Because the overlay leaves are pure render halves seeded with the host's shared `modal_selected` cursor, dialog side effects and modal lifecycle stay cleanly separated — the host pushes the framework dialog, `await`s the dismissal (or settles the channel), applies the side effect, and resets `ConsoleState.modal` to `NO_MODAL`.
+
+## Reaching each overlay
+
+Most overlays are reached through a [slash command](/rust-cli/console/slash-commands); a couple also have app keybindings, and the approval prompt is raised by the permission gate rather than the user.
+
+| Overlay | Slash command(s) | Keybinding |
+|---------|------------------|------------|
+| `Models` | `/model` (alias `/models`) | `Ctrl+L` |
+| `ScopedModels` | `/models-for` (alias `/scoped-models`; `edit` / `show` / `reset`) | — |
+| `Settings` | `/settings` | — |
+| `Theme` | via the settings `colourScheme` row | — |
+| `Sessions` | `/resume` (alias `/sessions`) | `Ctrl+R` |
+| `Tree` | `/timeline` (alias `/tree`) | — |
+| `UserTurns` | `/branch` (alias `/fork`) | — |
+| `SignIn` | `/login [provider]` | — |
+| `SignOut` | `/logout` | — |
+| `Oauth` | (sub-flow of `SignIn`) | — |
+| `Plugin` | `/mcp`, `/memory`, `/composio` surfaces | — |
+| `Approval` | (raised by the permission gate on an `ask` decision) | — |
+
+The slash commands transition `ConsoleState.modal` via `transition_modal(kind, payload)`; the approval prompt is opened by the UI loop draining the resolver channel. See [Console Overview](/rust-cli/console/overview), [Slash Commands](/rust-cli/console/slash-commands), and the underlying [`indusagi` framework dialogs](/rust) for the widgets these paint.

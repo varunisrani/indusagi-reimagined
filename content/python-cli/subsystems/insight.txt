@@ -1,0 +1,260 @@
+# Insight
+
+> `induscode.insight` is the agent's observability plane — a thin app-vocabulary wrapper over the `indusagi.tracing` framework (Probe/Trail/Signal aliased onto the framework's Segment/trace/TraceSignal) plus a ported in-memory collector sink and NDJSON replay readers. Reach it with `from induscode.insight import create_recorder, ...`.
+
+`insight/` is the single observability subsystem for the coding agent. By a locked design decision it is a **wrapper, not a re-port** of the framework's tracing machinery: it renames the framework vocabulary into the app's, pins app-specific constants on top of [`indusagi.tracing`](/python/subsystems/tracing), and adds the two pieces the framework lacks — an in-memory `CollectorSink` and NDJSON `replay_*` readers over the framework's own on-disk record schema. It is the lower-level distributed-tracing plane: timed probes, sampling, redaction, sinks, and replay.
+
+## Table of Contents
+
+- [What This Is Not](#what-this-is-not)
+- [Module Layout](#module-layout)
+- [The Recorder](#the-recorder)
+- [Probes, Handles, and Faults](#probes-handles-and-faults)
+- [Signals](#signals)
+- [Sampling Gates](#sampling-gates)
+- [Secret Redaction](#secret-redaction)
+- [Sinks and the Collector](#sinks-and-the-collector)
+- [Replay](#replay)
+- [Public Exports](#public-exports)
+- [Notable Behaviour](#notable-behaviour)
+- [The kit Utilities](#the-kit-utilities)
+
+## What This Is Not
+
+A common framing is that this package surfaces "usage / cost / token / context stats in the footer." It does **not**. There is no cost, token, or usage accounting code anywhere in `insight/`. Those footer statistics are rendered by the framework's `Footer` / `SessionSnapshot` widgets, surfaced through [`console/components/status_bar.py`](/python-cli/console/overview). That footer and this package are conceptually adjacent but have **no code dependency** between them.
+
+`insight/` is the distributed-tracing plane: it times spans of work (probes), decides which trails to sample, scrubs secrets out of attributes, fans signals to sinks, and reads persisted traces back from disk.
+
+## Module Layout
+
+Three modules behind one barrel (`__init__.py`):
+
+| Module | Role |
+|--------|------|
+| `insight/wrapper.py` | The app vocabulary aliased onto the framework — `InsightRecorder`, `Probe`, `ProbeHandle`, the `Signal` union, sampling gates, the `SecretRedactor`, and the locked kind map. |
+| `insight/collector.py` | The in-memory `CollectorSink` the framework lacks (ported), capturing every signal phase in arrival order. |
+| `insight/replay.py` | NDJSON readers over the *framework's* record schema — `replay_signals` / `replay_probes` / `replay_trails` plus their lower-level helpers. |
+
+The framework transport and terminal sinks (`SignalChannel`, `Sink`, `ConsoleSink`, `FileSink`, `StreamSink`, `SecretPattern`) are re-exported unchanged through the barrel, so consumers import the whole insight surface from `induscode.insight` rather than reaching into `indusagi.tracing`.
+
+The locked **kind map** renames the framework's segment kinds into the app vocabulary:
+
+| App `ProbeKind` | Framework segment kind |
+|-----------------|------------------------|
+| `run` | `run` |
+| `turn` | `inference` |
+| `tool` | `action` |
+| `model` | `recall` |
+| `custom` | `custom` |
+
+These are pinned in `KIND_TO_SEGMENT` / `SEGMENT_TO_KIND`; `PROBE_KINDS` is the closed set and `ID_WIDTHS` holds the id byte widths.
+
+## The Recorder
+
+`InsightRecorder` is the single facade the agent talks to. Build one with `create_recorder(...)`; it owns a framework `SignalChannel`, the admission gate, the redactor, an injectable clock, and per-sink fan-out drain tasks.
+
+```python
+from induscode.insight import create_recorder, ratio_gate, create_collector_sink
+
+async def trace_a_run():
+    sink = create_collector_sink()
+    recorder = create_recorder(
+        service="induscode",
+        gate=ratio_gate(0.1),   # sample 10% of trails, keyed on trail id
+        sinks=(sink,),          # requires a running event loop
+    )
+
+    root = recorder.open_trail("session", kind="run")
+    step = root.child("tool", "read_file", {"path": "/etc/hosts"})
+    step.note({"bytes": 1234})
+    step.close("ok")
+    root.close("ok")
+
+    await recorder.shutdown()   # flush, close channels, await drains
+    return sink.probes()
+```
+
+`create_recorder` keyword arguments:
+
+| Kwarg | Default | Purpose |
+|-------|---------|---------|
+| `service` | `"insight"` | Service label for the channel. |
+| `enabled` | `True` | Master switch; when `False`, `open_trail` always returns the no-op handle. |
+| `gate` | `always_gate` | Admission gate (`always_gate` / `never_gate` / `ratio_gate(f)`). |
+| `redactor` | `PASSTHRU_REDACTOR` | Attribute processor applied on input. |
+| `sinks` | `()` | Framework `Sink` instances; each gets its own fan-out channel and drain task. |
+| `now` | wall-clock | Injectable `() -> int` clock for deterministic tests. |
+| `channel` | fresh | Override the framework `SignalChannel`. |
+
+Recorder methods:
+
+| Method | Purpose |
+|--------|---------|
+| `open_trail(name, *, kind="run", trail_id=None, attributes=None)` | Open a brand-new trail; returns its root `ProbeHandle`, or the shared `NOOP_HANDLE` when disabled or gated out. |
+| `scope(trail_id)` | Bind a frozen `TrailRecorder` view to an existing trail id. |
+| `signals()` | Single-consumer async adapter that recovers app-vocabulary `Signal` values from the framework channel. |
+| `flush()` | Yield a tick so synchronously-enqueued signals settle in sink tasks. |
+| `shutdown()` | Flush, close every channel, and await the sink drain tasks. |
+
+`TrailRecorder` is a frozen recorder view bound to one trail id (the framework `Recorder.scope` surface). It exposes `open(kind, name, attrs)` and `child(parent_id, kind, name, attrs)`, both returning `NOOP_HANDLE` when the trail was not sampled.
+
+## Probes, Handles, and Faults
+
+A **`Probe`** is an immutable timed segment within a trail — the app view of a framework `Segment`. Fields: `id`, `trail_id`, `parent_id`, `kind`, `name`, `started_at`, `ended_at`, `status`, `attributes`, `fault`. An `ended_at` of `None` means the probe is still in-flight.
+
+A **`ProbeHandle`** is the behavioural face of one in-flight probe (a protocol):
+
+| Method | Behaviour |
+|--------|-----------|
+| `note(attributes)` | Attach attributes (scrubbed on input); no-op after close. |
+| `child(kind, name, attrs)` | Open a child probe; returns its handle. On `NOOP_HANDLE` this returns itself, so a sampled-out subtree costs nothing. |
+| `fail(error)` | Mark the probe failed, carrying rich fault info; no-op after close. |
+| `close(outcome=None)` | Terminate the probe; idempotent. |
+
+A **`ProbeFault`** is the captured failure attached to a probe — `message` plus optional `name` / `stack` (richer than the framework's message-only `SegmentError`). `fault_of(value)` coerces any raised value into a serializable `ProbeFault`: an exception becomes message + type name + rendered traceback, anything else becomes `str(value)`.
+
+Two projection helpers bridge the two vocabularies:
+
+- `probe_from_segment(segment)` projects a framework `Segment` onto a `Probe`, mapping the kind back to app vocabulary and lifting the reserved fault `name` / `stack` attributes onto `Probe.fault`.
+- `is_closed_probe(probe)` is `True` when a probe reached a terminal state (`status != open` and `ended_at is not None`).
+
+## Signals
+
+On the wire, each probe transition is a `Signal`. The app-vocabulary union has three members, each carrying `(probe, at)` with a `ClassVar` phase literal:
+
+```python
+Signal = OpenSignal | UpdateSignal | CloseSignal
+```
+
+`recorder.signals()` is the single-consumer async iterator that recovers these from the framework channel. Because the framework's update signal carries only `(id, attributes)`, `UpdateSignal` probes are **reconstructed statefully** from the open they amend, and the update's `at` is stamped at observation time. `is_close_signal(signal)` narrows a `Signal` to a terminal `CloseSignal`.
+
+`fail()` is brought to parity by emitting an in-flight `UpdateSignal` whose reserved attributes (`insight.fault.message` / `.name` / `.stack`) carry the failure past the framework's status-less update; the adapter lifts them back into an error-status probe and strips the reserved keys so they never surface as caller attributes.
+
+## Sampling Gates
+
+Gates decide whether a trail is admitted; they delegate to the framework `SampleGate` / `RatioStrategy`. All gates expose `verdict(trail_id) -> bool`.
+
+| Gate | Behaviour |
+|------|-----------|
+| `always_gate` | Admit everything (shared `_FixedGate` instance; recorder default). |
+| `never_gate` | Reject everything (shared `_FixedGate` instance). |
+| `ratio_gate(fraction)` / `RatioGate` | Admit a deterministic fraction keyed on the trail id. |
+
+`RatioGate` keys its decision on an FNV-1a hash of the trail id that is documented-verified **bit-identical** to the TS `hash32` for fixture ids (`a*32 → 1297108005`, `b*32 → 2615884229`), which is exactly why the framework gate is reused rather than re-ported. A `NaN` fraction fails closed to `0`.
+
+## Secret Redaction
+
+`SecretRedactor` is the attribute processor applied on input (open / child / note / fail). Build one with `create_redactor(...)`; `DEFAULT_REDACTOR` is the configured scrubber and `PASSTHRU_REDACTOR` (no redaction) is the recorder's default.
+
+The redactor diverges from the framework `SecretScrubber` in a single walk over the attribute subtree:
+
+- **key rules** tokenize a whole subtree,
+- **value rules** `re.sub` only the matched run (the framework scrubber replaces the whole value),
+- `omit_keys` drops keys entirely,
+- a 4096-char length cap is applied in the same pass.
+
+The app constants behind it: `APP_SECRET_PATTERNS` (one key rule plus per-credential-shape value rules, built on the framework `SecretPattern`), `REDACTED_TOKEN` (`"[insight:scrubbed]"`), `DEFAULT_MAX_STRING_LENGTH` (`4096`), and `TRUNCATION_SUFFIX` (`"...[insight:truncated]"`).
+
+Fresh ids are minted via `mint_trail_id()` (128-bit / 32-hex) and `mint_probe_id()` (64-bit / 16-hex), wrapping the framework's `fresh_trace_id` / `fresh_segment_id`.
+
+## Sinks and the Collector
+
+The framework ships console / file / stream sinks but **no in-memory collector**, so `insight/` ports one. `CollectorSink` (via `create_collector_sink(id="collector")`) is a regular framework `Sink` that drains a `SignalChannel` and appends **every** signal — open, update, and close — in arrival order, unlike the file and stream sinks which persist closes only.
+
+```python
+sink = create_collector_sink()
+recorder = create_recorder(sinks=(sink,))
+# ... drive the recorder ...
+sink.signals          # every raw framework signal, in arrival order
+sink.close_records    # terminal TraceRecords carried by close signals
+sink.probes()         # app-vocabulary Probe views of the close records
+```
+
+The framework `FileSink` / `StreamSink` write only **close records** as flat camelCase NDJSON (`id` / `traceId` / `parentId` / `kind` / `name` / `startedAt` / `endedAt` / `status` / `attributes` / `error`).
+
+## Replay
+
+`replay.py` reads the framework's NDJSON record schema back into the app vocabulary. The high-level readers are async:
+
+| Reader | Yields |
+|--------|--------|
+| `replay_signals(source, *, strict=False)` | A stream of `Signal`s (phase derived per record — terminal → close `@endedAt`, else open `@startedAt`). |
+| `replay_probes(source, *, strict=False)` | A collapsed last-write-wins `Probe` dict keyed by id. |
+| `replay_trails(source, *, strict=False)` | Per-trail `ReplayedTrail` parent→children trees with a completeness flag. |
+
+Malformed lines are skipped unless `strict=True`. The lower-level helpers compose into the readers:
+
+- `read_lines(source)` — UTF-8 incremental, multi-byte-safe chunk → line splitter.
+- `read_records(source, *, strict=False)` — validated record-dict stream.
+- `decode_record(line)` — single-line JSON parse.
+- `record_to_probe(record)` — record-dict → `Probe` projection (lifts the reserved fault `name` / `stack`).
+
+A `ReplayedTrail` is one reconstructed trail (`trail_id`, `root`, `probes` map, parent→children adjacency, `complete` flag). `ChunkSource` is the sync-or-async raw text/byte chunk source type alias.
+
+## Public Exports
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `InsightRecorder` / `create_recorder` | class / function | `wrapper.py` | The recorder facade and its factory. |
+| `TrailRecorder` | dataclass | `wrapper.py` | Frozen recorder view bound to one trail id. |
+| `Probe` / `ProbeHandle` / `ProbeFault` | dataclass / class | `wrapper.py` | The timed segment, its in-flight handle, and a captured failure. |
+| `fault_of` / `probe_from_segment` / `is_closed_probe` | function | `wrapper.py` | Fault coercion, framework→app projection, terminal-state predicate. |
+| `OpenSignal` / `UpdateSignal` / `CloseSignal` / `Signal` | dataclass / type | `wrapper.py` | The wire signal union. |
+| `is_close_signal` | function | `wrapper.py` | Narrow a `Signal` to a `CloseSignal`. |
+| `always_gate` / `never_gate` / `ratio_gate` / `RatioGate` | const / class | `wrapper.py` | Sampling gates. |
+| `SecretRedactor` / `create_redactor` / `DEFAULT_REDACTOR` / `PASSTHRU_REDACTOR` | class / const | `wrapper.py` | The attribute redactor and presets. |
+| `mint_trail_id` / `mint_probe_id` | function | `wrapper.py` | Mint fresh trail / probe ids. |
+| `KIND_TO_SEGMENT` / `SEGMENT_TO_KIND` / `PROBE_KINDS` / `ID_WIDTHS` | const | `wrapper.py` | The locked kind map, closed kind set, id widths. |
+| `APP_SECRET_PATTERNS` / `REDACTED_TOKEN` / `DEFAULT_MAX_STRING_LENGTH` / `TRUNCATION_SUFFIX` | const | `wrapper.py` | The app redaction rule set and constants. |
+| `NOOP_HANDLE` | const | `wrapper.py` | The shared frozen sampled-out handle. |
+| `CollectorSink` / `create_collector_sink` | class / function | `collector.py` | The in-memory all-phase sink. |
+| `replay_signals` / `replay_probes` / `replay_trails` | async function | `replay.py` | NDJSON record-schema readers. |
+| `read_lines` / `read_records` / `decode_record` / `record_to_probe` | function | `replay.py` | Lower-level replay helpers. |
+| `ReplayedTrail` / `ChunkSource` | dataclass / type | `replay.py` | A reconstructed trail and the chunk source alias. |
+| `SignalChannel` / `Sink` / `ConsoleSink` / `FileSink` / `StreamSink` / `SecretPattern` | class | `indusagi.tracing` | Framework transport and sinks re-exported unchanged. |
+
+## Notable Behaviour
+
+1. **No cost / token / usage / footer accounting** lives here — those stats come from the framework `Footer` / `SessionSnapshot` widgets in the [console](/python-cli/console/overview). This package is the tracing plane only.
+2. **Not yet wired.** A grep finds no importers of `induscode.insight` anywhere outside the package itself — it is built and self-consistent but currently unconsumed by the agent runtime.
+3. **Event-loop requirement.** Passing `sinks=` to the recorder calls `asyncio.get_running_loop().create_task(...)` in `__init__`, so constructing a recorder with sinks **outside a running loop raises**.
+4. **Single-consumer.** `signals()` and `CollectorSink.drain()` / the framework channel are single-consumer — call once and drain. Multiple sinks each get their own fan-out channel.
+5. **Reserved fault keys.** `insight.fault.{message,name,stack}` are the channel that carries rich fault info past the framework's message-only `SegmentError`; they are stripped from the exposed attribute bag in `probe_from_segment` / `record_to_probe`, so they only surface on `Probe.fault`.
+6. **Scrubbing on input, not at emit**, and update probes are reconstructed statefully with an observation-time `at` — documented divergences the ported test suite does not need to observe.
+7. **Foreign-writer tolerance.** Replay accepts a writer that persists open records (phase derived per record), even though framework sinks only write closes.
+
+## The kit Utilities
+
+`induscode.kit` is the **bottom-most leaf layer** of the agent — a small set of framework-agnostic, stdlib-only helpers with zero imports of the [`indusagi`](/python/README) framework and zero imports of any sibling subpackage. Higher layers compose it; it depends on nothing. Six files, ~982 lines. Consumers import from the barrel (`from induscode.kit import ...`) rather than reaching into modules. The only confirmed consumer today is the [console](/python-cli/console/overview): `console/app.py` imports `open_in_external_editor` and `read_clipboard_image`.
+
+Five independent module groups:
+
+| Module | Job |
+|--------|-----|
+| `kit/shell.py` | POSIX shell-argument quoting (`quote_arg`, `needs_quoting`, `build_shell_command`). |
+| `kit/image.py` | PNG / JPEG magic-byte sniffing and release-asset-name rendering. |
+| `kit/clipboard_image.py` | Pull a raster image off the OS clipboard, stage it as a temp PNG. |
+| `kit/external_editor.py` | Hand the composer buffer off to `$VISUAL` / `$EDITOR` / `vi`. |
+| `kit/tool_fetch.py` | A managed-binary (`fd` / `rg`) provisioner **stub** — resolution and URL-building only. |
+
+Selected exports:
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `quote_arg` / `needs_quoting` / `build_shell_command` | function | `kit/shell.py` | POSIX-quote one arg, test whether quoting is needed, join an arg sequence into a shell line. |
+| `sniff_image_format` / `detect_image_media_type` / `is_supported_image` | function | `kit/image.py` | Classify a `ByteSource` as `png` / `jpeg` (reads at most `IMAGE_SNIFF_BYTES` = 8). |
+| `resolve_asset_name` / `AssetNameContext` | function / dataclass | `kit/image.py` | `{platform}` / `{arch}` / `{version}` / `{name}` token substitution for release assets. |
+| `read_clipboard_image` / `ClipboardImageOptions` | function / dataclass | `kit/clipboard_image.py` | Best-effort clipboard → temp PNG; `None` on any miss, hermetically testable. |
+| `open_in_external_editor` / `ExternalEditorOptions` | function / dataclass | `kit/external_editor.py` | Stage a buffer in a temp `.md`, launch the editor, return edited text or `None`. |
+| `resolve_managed_binary_path` | function | `kit/tool_fetch.py` | Pure path builder for a managed binary (bare on POSIX, `+.exe` on win32). |
+| `pick_release_asset` / `build_download_request` / `plan_provision` | function | `kit/tool_fetch.py` | Pick the host asset, render a `DownloadRequest`, assemble a `ProvisionPlan` (network injected as `ReleaseLookup`). |
+| `ToolDescriptor` / `ReleaseAsset` / `ReleaseInfo` / `DownloadRequest` / `ProvisionPlan` | dataclass | `kit/tool_fetch.py` | The provisioner value types (all frozen + slots). |
+| `KIT_USER_AGENT` | const | `kit/tool_fetch.py` | `"indusagi-kit-provisioner/1.0"` — the only literal mention of `indusagi` in `kit`. |
+
+Design notes that matter:
+
+- `tool_fetch.py` is a **stub**: it computes paths, picks assets, and builds requests but never downloads, unpacks, or installs anything — that is the caller's job. The network is a deliberately injected `ReleaseLookup` protocol, so the module imports no HTTP client and stays offline-testable.
+- The clipboard tries `pngpaste` then an `osascript «class PNGf»` fallback on darwin, and `wl-paste` (Wayland) then `xclip` on linux. The I/O modules are best-effort: every spawn error, timeout, non-zero exit, oversized capture (>50 MiB), or empty result collapses to `None`.
+- The barrel deliberately omits the upstream generic stdlib-clone "filler" libraries (array / string / date / json helpers) because they had zero consumers.
+
+See [Architecture](/python-cli/architecture) for the subsystem map, and [Package Exports](/python-cli/reference/package-exports) for the full namespace catalog.

@@ -1,0 +1,100 @@
+# Swarm
+
+> `src/swarm` is the L3 External multi-agent layer — crews of teammate agents
+> working a shared task board over a mailbox, optionally isolated in git worktrees.
+> Imported as `indusagi/swarm`, or as the `swarm` namespace from `indusagi`.
+
+A crew is a roster of teammate agents working a shared, dependency-aware board of
+tickets, talking over one cursor-based channel, with every coordination step
+narrated to an append-only activity log. The coordinator (`Crew`) ties four domain
+services — each a thin wrapper over a frozen kernel — plus an optional worktree
+isolation seam into one driveable object.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-directories](#sub-directories)
+- [The coordinator](#the-coordinator)
+- [Domain services and kernel](#domain-services-and-kernel)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+From `src/swarm/index.ts`:
+
+| Export | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `createCrew`, `Crew` | fn / class | `coordinator.ts` | The coordinator that runs rounds of work |
+| `defaultSpawnAgent` | function | `coordinator.ts` | The default teammate-agent factory (a real `createAgent`) |
+| `CrewManifest`, `ModelPolicy` | classes | `roster/` | The roster of teammates |
+| `TicketBoard`, `DepGraph` | classes | `workboard/` | The dependency-aware shared task store |
+| `ticketSchema`, `ticketStatuses` | values | `workboard/` | The ticket zod schema and status set |
+| `Channel`, `encode`, `decode` | class/fn | `postbox/` | The cursor-based mailbox and its codecs |
+| `ENVELOPE_SCHEMA`, `ENVELOPE_TYPES` | values | `postbox/` | The envelope schema and type set |
+| `Workspace`, `nodeRunner` | class/value | `isolation/` | Per-teammate git-worktree isolation |
+| `ActivityLog`, `CREW_EVENT_KINDS` | class/value | `telemetry/activity.ts` | The append-only coordination transcript |
+| `JsonCell`, `JsonlLog`, `newId`, `SwarmFault`, `swarmFault` | values | `kernel/` | The shared primitives |
+
+Types: `CrewOptions`, `CrewStatus`, `RoundOutcome`, `TaskDraft`, `SpawnAgent`;
+`CrewMember`, `CrewRecord`, `MemberDraft`, `CrewToolCollection`; `Ticket`,
+`TicketStatus`, `TicketDraft`; `Envelope`, `EnvelopeType`, `PayloadOf`;
+`WorktreeRef`, `WorktreeEntry`, `CreateOptions`, `RemoveOptions`, `ShellRunner`,
+`RunResult`; `CrewEvent`, `CrewEventKind`, `CrewEventInput`; `GuardOptions`,
+`TreeNode`, `SwarmFaultKind`.
+
+## Sub-directories
+
+| Directory | Holds |
+|-----------|-------|
+| `coordinator.ts` | `Crew` / `createCrew` — the conductor that runs one round at a time |
+| `roster/` | `manifest.ts` — `CrewManifest`, `ModelPolicy` (who is on the crew) |
+| `workboard/` | `board.ts` (`TicketBoard`), `dep-graph.ts` (`DepGraph`) — the shared to-do list |
+| `postbox/` | `channel.ts` (`Channel`), `codecs.ts` (`encode`/`decode`) — the mailbox |
+| `isolation/` | `worktree.ts` (`Workspace`), `runner.ts` (`nodeRunner`) — git-worktree isolation |
+| `telemetry/` | `activity.ts` — `ActivityLog`, the coordination transcript |
+| `kernel/` | `json-cell.ts`, `jsonl-log.ts`, `ids.ts` (`newId`, ULID), `faults.ts` (`SwarmFault`) |
+
+## The coordinator
+
+A `Crew` owns no `node:fs` locking or coercion of its own — that lives in the kernel
+under the services. The coordinator adds the *policy*: matching ready tickets to
+idle members, spawning a teammate agent to work a ticket, and folding its result
+back onto the board and the channel. The agent spawner is **injectable**: by default
+`defaultSpawnAgent` backs a member with a real `createAgent` bound to the member's
+model and tool collection; tests pass a scripted fake (it need only implement the
+`Agent` handle's `submit` and `snapshot`).
+
+`Crew.runRound` is the heartbeat: read the board's ready tickets and the idle
+members, pair them, and for each pair claim the ticket, spawn the member's agent,
+let it work, post a `result` envelope, complete or fail the ticket, and narrate
+every step to the activity log:
+
+```ts
+import { createCrew } from "indusagi/swarm";
+
+const crew = await createCrew(/* CrewOptions */); // createCrew is async
+const outcome = await crew.runRound();            // resolves a RoundOutcome
+```
+
+## Domain services and kernel
+
+The four services wrap the frozen kernel: `CrewManifest` is the roster (with a
+`ModelPolicy` for which model a member runs on); `TicketBoard` is the shared task
+store backed by a `DepGraph` so a ticket only becomes ready once its dependencies
+complete (`ticketSchema` / `ticketStatuses` define a ticket); `Channel` is the
+cursor-based mailbox of `Envelope`s (`encode`/`decode`, `ENVELOPE_SCHEMA`,
+`ENVELOPE_TYPES`); and `ActivityLog` is the append-only transcript of `CrewEvent`s
+(`CREW_EVENT_KINDS`). `Workspace` adds optional per-teammate git-worktree isolation
+over a `ShellRunner` (`nodeRunner` is the real one). The kernel primitives —
+`JsonCell` (atomic JSON state), `JsonlLog` (append-only log), `newId` (ULID), and
+`SwarmFault` — are re-exported so a host can compose its own service over the same
+foundation.
+
+## Relationship to neighbors
+
+Each teammate is a [Runtime](/docs/subsystems/runtime) `Agent` built with
+`createAgent` and a [Capabilities](/docs/subsystems/capabilities) `toolBox`
+(`CrewToolCollection` selects which one). The swarm is a layer *above* the agent
+runtime: it orchestrates many agents rather than driving one model conversation.
+
+Back to the [Architecture overview](/docs/architecture).

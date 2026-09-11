@@ -1,0 +1,423 @@
+# Capability Deck
+
+> The capability deck is `induscode`'s tooling layer — the typed seam between the Rust coding-agent product and the callable tools the agent runtime executes. Reach it as `induscode::deck`. A capability is an `Arc<dyn Card>`, the deck's uniform callable; `provision_deck(Profile, DeckContext)` assembles a [`ToolDeck`](/rust-cli/subsystems/conductor) whose `into_tool_box()` the [conductor](/rust-cli/subsystems/conductor) consumes verbatim as a framework `ToolBox`. The deck does NOT author tools — it *manages* them, bridging the framework's twelve native tool factories, authoring seven app-novel cards, and grafting external MCP server tools through an event-sourced enrollment ledger.
+
+## Table of Contents
+
+- [What the Deck Is](#what-the-deck-is)
+- [The Frozen Contract](#the-frozen-contract)
+- [The Card Trait and Capability](#the-card-trait-and-capability)
+- [Tool Cards: the Catalog](#tool-cards-the-catalog)
+- [The Built-in Bridge](#the-built-in-bridge)
+- [Profiles and Provisioning](#profiles-and-provisioning)
+- [The Runtime ToolBox Adapter](#the-runtime-toolbox-adapter)
+- [App-novel Cards](#app-novel-cards)
+- [The Checkpoint Wrapper](#the-checkpoint-wrapper)
+- [The Bridge Ledger](#the-bridge-ledger)
+- [Bridge Keys: Content-Hash and ULID](#bridge-keys-content-hash-and-ulid)
+- [Mounting MCP Servers](#mounting-mcp-servers)
+- [MCP Config Discovery](#mcp-config-discovery)
+- [Faults](#faults)
+- [Public Surface](#public-surface)
+- [Parity Notes](#parity-notes)
+
+## What the Deck Is
+
+The deck is the single typed seam between the `induscode` product and the tools the agent loop calls — file ops, the shell, search, the web, the checklist, plus app-novel checklist / background-process / plan-mode / delegate / SaaS / memory cards, and dynamically-grafted MCP server tools. It is the Rust port of `indus-code-rebuild/src/capability-deck`.
+
+The decisive structural delta, read live from the [Rust framework](/rust): **there is no callable `AgentTool` object.** The framework's `indusagi-facade` only defines `pub type AgentTool = Value`, an opaque JSON projection. The framework currency is the `Tool` trait → [`indusagi::capabilities::DefinedTool`](/rust/subsystems/capabilities) → [`indusagi::capabilities::ToolBox`](/rust/subsystems/runtime). So where the TS deck aliased `Capability = AgentTool`, the Rust deck defines a uniform `Card` trait that both a framework `DefinedTool` (via the bridge adapter) and each app card implement, so a deck can hold a heterogeneous `Vec<Capability>` exactly as the TS deck held `AnyCapability[]`.
+
+Three design commitments shape it:
+
+- **A capability is the deck's uniform callable.** `pub type Capability = Arc<dyn Card>`. The deck *manages* framework tools rather than wrapping them in a parallel descriptor type.
+- **The catalog is a single source of truth.** Every index, profile membership, and lookup is *derived* from one `capability_cards()` slice. One data-driven `provision_deck` walks the catalog and filters by profile membership instead of a trio of per-profile build functions.
+- **MCP enrollment is event-sourced.** The live tool set is the pure fold (`reduce_ledger`) of an append-only `enroll`/`retire` event stream.
+
+The module is layered, with `contract.rs` as a frozen, scaffold-owned, IO-free type seam everything else is written against:
+
+```
+deck/mod.rs           the deck's public vocabulary (re-exports)
+  contract.rs         frozen type surface (Card, Capability, CapabilityCard, DeckContext, Profile, DeckFault, ...)
+  builtin.rs          ONE 12-row table re-exposing framework native factories
+  catalog.rs          capability_cards() = built-in cards ++ app-novel cards + derived lookups
+  cards/              7 app-novel cards (todo, bg_process, task, saas, memory, enter_plan_mode, exit_plan_mode)
+    checkpoint.rs     the file-checkpoint wrapper applied to write/edit at provision time
+  provision.rs        provision_deck — the single data-driven assembler + the runtime ToolBox adapter
+  mcp/                event-sourced MCP enrollment (gated on the `mcp` feature)
+    mod.rs            mount + enroll / detach / config discovery
+    ledger.rs         BridgeLedger, reduce_ledger, BridgeCapability, key minting
+```
+
+Consumers reach the surface through `induscode::deck`; `mod.rs` re-exports the deck's public vocabulary:
+
+```rust
+pub use contract::{
+    Capability, CapabilityCard, CapabilityId, Card, DeckContext, DeckFault, DeckFramework,
+    DeckResult, Profile, capability_id,
+};
+```
+
+## The Frozen Contract
+
+`contract.rs` declares *only* shapes plus a handful of tiny inert helpers (an id newtype, a fault enum) — no I/O, no provisioning, no orchestration. It is owned by the scaffold and frozen for the milestone. The TS lineage's TypeBox generics collapse here: a `JsonSchema` is the framework's plain JSON-schema value, and the structural `AgentTool` Protocol becomes the `Card` trait.
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `Capability` | type alias | `Arc<dyn Card>` — the element type every deck `Vec` surfaces, mirroring the TS `AnyCapability[]`. |
+| `Card` | trait | The uniform behavior of one deck-managed tool: `name` / `label` / `description` / `parameters` / `read_only` / async `run`. |
+| `CapabilityId` / `capability_id` | newtype + fn | Branded wire-facing tool name (`"read"`, `"bash"`, `"<server>__<tool>"`) and its sole sanctioned minter. |
+| `BuildFn` | type alias | `Arc<dyn Fn(&DeckContext) -> Capability + Send + Sync>` — the catalog row's build closure. |
+| `CapabilityCard` | struct | One catalog row: `id` / `title` / `summary` / `profiles` plus a `build: BuildFn` factory. |
+| `Profile` | enum | `Authoring` / `Survey` / `All` — the named capability sets a session can be provisioned with. |
+| `DeckContext` | struct | The working context handed to `build`: `cwd: String` plus the injectable `framework: DeckFramework` handle bag. |
+| `DeckFramework` | struct | The typed home for optional, host-injected handles: `read_state`, `checkpoint`, `delegate`, `saas`, `memory`. |
+| `CheckpointStore` / `DelegateRunner` / `SaasGatewayPort` / `MemoryStore` | traits | The injected-handle trait signatures `DeckFramework` names; the card modules own the impls. |
+| `DeckFault` / `DeckResult<T>` | enum + alias | Typed, exhaustive failure (no `_` arm) + the fallible-op result alias. |
+
+The TS open-bag `fs?`/`shell?` ports are dropped: in Rust the OS-backed fs/shell reach a tool through the `indusagi::capabilities::ToolContext` the deck's runner mints per dispatch (via `make_local_context`), not through the build context. Likewise the TS `DeckFrameworkHandles` open `{[name]: unknown}` bag becomes a *typed struct* `DeckFramework` — Rust has no duck-typed bag.
+
+## The Card Trait and Capability
+
+`Card` is the single trait both a framework `DefinedTool` (through the bridge adapter) and every app card implement:
+
+```rust
+#[async_trait]
+pub trait Card: Send + Sync {
+    fn name(&self) -> &str;          // the wire-facing tool name the model invokes
+    fn label(&self) -> &str;         // the deck-side display title
+    fn description(&self) -> &str;   // the model-facing description
+    fn parameters(&self) -> JsonSchema;  // the JSON-Schema parameters object
+    fn read_only(&self) -> bool { false }  // permission gate always permits read-only tools
+    async fn run(&self, input: serde_json::Value, ctx: &ToolContext) -> ToolResult;
+}
+```
+
+`run` receives the model-supplied input bag and the live `ToolContext` minted per dispatch by the deck's runner — which carries the working directory, the OS-backed fs/shell seams, the dispatch cancel token, and the `DeckFramework` handles projected onto the framework `Framework` (so the read-before-edit gate sees the deck's injected `ReadStateHandle`). A cancelled or failed run returns an `is_error` result — never a panic.
+
+## Tool Cards: the Catalog
+
+A **tool card** (`CapabilityCard`) is metadata plus a builder: it advertises the capability's identity (`id`, `title`, `summary`) for help / introspection / slash-command listings, and carries a `build: BuildFn` closure that mints the live capability for a given `DeckContext`. `build` is pure with respect to the deck — it reads injected backends from the context and returns a configured capability; it performs no enrollment and mutates no shared state. The membership tag (`profiles`) the TS deck kept on the bridge descriptor is folded onto the card here.
+
+`catalog.rs` owns `capability_cards()` — the one assembled slice — and derives the rest. Because the `BuildFn` is an `Arc<dyn Fn>` (not `const`-constructible), the catalog is realized once on first access into a process-wide `OnceLock<Vec<CapabilityCard>>` and handed out by reference:
+
+```rust
+fn assemble_catalog() -> Vec<CapabilityCard> {
+    let mut cards = builtin_cards();        // the 12 framework built-ins
+    cards.extend(app_novel_cards());        // then the 7 app-novel cards
+    cards
+}
+```
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `capability_cards()` | `&'static [CapabilityCard]` | The static catalog: 12 built-ins then 7 app cards, in catalog order. |
+| `capability_index()` | `&'static IndexMap<CapabilityId, usize>` | id → catalog position, O(1) for a `--tools name1,name2` selection or model-named tool. First occurrence wins on a duplicate. |
+| `capability_ids()` | `Vec<CapabilityId>` | Wire-facing ids of every catalog row, in catalog order. |
+| `has_capability(id)` | `bool` | True when a catalog row exists under this id. |
+| `find_card(id)` | `Option<&'static CapabilityCard>` | Fetch a catalog row by id. |
+| `card_profiles()` | `IndexMap<CapabilityId, &'static [Profile]>` | Profile membership for every row, derived from the catalog. |
+| `cards_for_profile(profile)` | `Vec<&'static CapabilityCard>` | Catalog rows that participate in a profile — the single place built-in profile filtering happens. Returns borrowed `'static` rows. |
+
+Because every index is derived from the one slice, there is never a second parallel map to keep in sync. `capability_cards()` is a stable singleton — repeated reads return the same slice (`as_ptr()` equality).
+
+## The Built-in Bridge
+
+`builtin.rs` is the ONE seam to the framework's native tools. The framework already authors its file / search / shell / web / process / checklist tools as fully-formed `DefinedTool`s and ships an arg-free `*_tool()` factory for each (`registry.rs`). The bridge pairs every native factory with a descriptor in one 12-row table — `builtin_descriptors()` — rather than a dozen one-line re-export stubs.
+
+The adapter is `BuiltinCard`, which wraps one `DefinedTool` to the `Card` trait. The framework owns the tool's behavior; the adapter re-labels it for the catalog and translates the deck's `Card::run` (resolving a `ToolResult`) onto the framework's `DefinedTool::invoke` (resolving a flat `ToolOutcome`). It synthesizes a `ToolCall { id: "<name>-builtin", … }`, invokes, and unfolds the outcome back into a single-block `ToolResult` — a lone text block round-trips as text, anything else as a JSON block, preserving `is_error`.
+
+The 12 built-ins, with their wire-facing ids and profile membership:
+
+| Wire id | Title | Framework factory | Membership |
+|---------|-------|-------------------|------------|
+| `read` | Read file | `read_tool` | read-only |
+| `ls` | List directory | `ls_tool` | read-only |
+| `grep` | Search file contents | `grep_tool` | read-only |
+| `find` | Find files by name | `find_tool` | read-only |
+| `websearch` | Web search | `web_search_tool` | read-only |
+| `webfetch` | Fetch URL | `web_fetch_tool` | read-only |
+| `todo_read` | Read checklist | `todo_read_tool` | read-only |
+| `write` | Write file | `write_tool` | mutating |
+| `edit` | Edit file | `edit_tool` | mutating |
+| `bash` | Run shell command | `bash_tool` | mutating |
+| `process` | Manage background processes | `process_tool` | mutating |
+| `todo_set` | Update checklist | `todo_set_tool` | mutating |
+
+All model-facing tool `name` strings are the framework's own wire contract, kept verbatim — only deck-side titles / summaries are the deck's prose. The two checklist tools shift from the TS names `todoread`/`todowrite` to the framework's **actual Rust** names `todo_read`/`todo_set`; the model and conductor key off them. The `builtin_name_parity` test asserts the advertised name set equals the framework's `READ_ONLY_NAMES ∪ MUTATING_NAMES`, and that there are exactly 12.
+
+### The arg-free factory delta
+
+The TS bridge called `createReadTool(ctx.cwd, {readState, checkpoint})` — cwd and handles were factory arguments. In Rust, `read_tool()`/`write_tool()`/`edit_tool()` take **no arguments**: cwd and the read-state handle reach the tool through the `ToolContext` minted *per dispatch* by the deck's runner, not at build time. So a descriptor's `build(ctx)` does not parameterize the factory — it captures the framework tool into a `BuiltinCard`; the `DeckContext` → `ToolContext` translation (in the runtime adapter) is where `cwd`/`read_state`/`checkpoint` actually land. The `BridgeBuilder` closure keeps its `&DeckContext` parameter so a future framework factory that *does* need build-time binding slots in without changing the catalog seam.
+
+The bridge exposes the table three derived ways — `builtin_bridge()` (id-keyed `IndexMap`), `builtin_ids()` (ordered `Vec`), `builtin_profiles()` (id-keyed membership) — plus helpers:
+
+```rust
+build_builtin(id, ctx)                  // resolve-and-build one built-in (typed DeckFault::UnknownCapability)
+build_builtins_for_profile(profile, ctx)  // build every built-in eligible for a profile
+builtin_descriptors()                   // the ordered descriptor tuple the catalog projects
+builtin_cards()                         // each descriptor as a catalog CapabilityCard
+```
+
+The read-only set is tagged `READ_ONLY: &[Profile] = &[Profile::Authoring, Profile::Survey]`; mutating tools are `MUTATING: &[Profile] = &[Profile::Survey]`. A built-in's `read_only` flag is *derived* from its `Authoring` membership so the catalog and the `Card::read_only` answer never drift. These rest on the [framework capabilities](/rust/subsystems/capabilities) kernel — the deck never reimplements a tool; it only *binds* the factory to a context and re-labels it.
+
+## Profiles and Provisioning
+
+`Profile` is a closed enum — the named capability sets that replace a trio of near-identical build functions:
+
+```rust
+pub enum Profile {
+    Authoring,  // observe-only built-ins (read/ls/grep/find/websearch/webfetch/todo_read); no app cards
+    Survey,     // every built-in (mutating included); no app cards
+    All,        // every built-in plus every app-novel card
+}
+```
+
+`provision.rs` is the single data-driven assembler. `provision_deck(profile, ctx)` selects the catalog rows admitting the profile, builds each against the `DeckContext`, and returns a `ToolDeck`:
+
+```rust
+use induscode::deck::{provision::provision_deck, DeckContext, Profile};
+
+let deck = provision_deck(Profile::All, DeckContext::new("/path/to/project"))?;
+let tools = deck.tools();          // fresh Vec<Capability> for inspection / --tools selection
+let box_  = deck.into_tool_box();  // Box<dyn ToolBox> the conductor wires in as its tools
+```
+
+A profile is a *selection policy* over the catalog — data, not control flow. Each card carries its own `Profile` membership directly, so the selection collapses into one `CapabilityCard::in_profile` filter (the TS `PROFILE_TABLE` is gone). `cards_for_deck_profile(profile)` is the selection `provision_deck` walks; `build_selected` builds each row and folds the checkpoint wrapper around mutating built-ins.
+
+| Deck profile | Built-in membership selected | App-novel cards |
+|--------------|------------------------------|-----------------|
+| `Authoring` | the read-only subset (read/ls/grep/find/websearch/webfetch/`todo_read`) | no |
+| `Survey` | every built-in, mutating tools included | no |
+| `All` | every built-in | yes (all 7) |
+
+> **Profile-name inversion (ported verbatim, pinned by tests — do not "fix").** The deck `Authoring` profile selects the framework *read-only* (observe-only) built-in set; `Survey` selects *every* built-in (mutating included); `All` selects every built-in plus the app-novel cards. The read-only set of profiles is therefore `[Authoring, Survey]`. This deliberate offset is realized through per-card membership: a read-only built-in is tagged `[Authoring, Survey]`, a mutating built-in `[Survey]`, an app card `[All]`.
+
+Because `Profile` is a closed enum, `cards_for_deck_profile` is **total and infallible** — the TS unknown-profile fault (`"nope" as never`) is structurally unrepresentable in Rust. The `DeckResult` wrapper is kept only for parity with the TS signature and to leave room for a `--tools` intersection later. The Rust build closures are also infallible (no `try`/`catch` seam), so `build_selected` is a straight map — `DeckFault::BuildFailed` is reserved for fallible bridge enrollment.
+
+The assembled `ToolDeck` exposes additional seams the boot wiring uses:
+
+| Method | Purpose |
+|--------|---------|
+| `tools()` | The flat capability list, as a fresh clone (a caller cannot reach the deck's backing list). |
+| `graft(extra)` | Concatenate extra (bridge / MCP / addon) capabilities *after* the static selection. |
+| `map_capabilities(f)` | Replace every capability with `f(cap)` — the addon interceptor-chain wrapping seam. |
+| `retain(keep)` | Keep only capabilities `keep` returns true for — the `--tools` allow-list filter, applied before the MCP/addon graft. |
+| `into_tool_box()` | Build the runtime `Box<dyn ToolBox>` the conductor consumes. |
+
+A grafted MCP tool carries a qualified `"<server>__<tool>"` name, so a name collision with a built-in is not representable.
+
+## The Runtime ToolBox Adapter
+
+`into_tool_box()` builds a `DeckToolBox`: an `indusagi::runtime::ToolBox` that pairs the descriptors the model is told about with a `DeckRunner` that fulfils them.
+
+The base `ToolContext` is minted **once** from the deck's `cwd` and the injected `read_state` handle (the only field the framework `Framework` exposes — checkpoint / delegate / saas / memory ride on the cards themselves, not the framework context):
+
+```rust
+let base = make_local_context(
+    ctx.cwd.clone(), None, None,
+    Some(Framework { read_state: ctx.framework.read_state.clone() }),
+);
+```
+
+`DeckRunner::run` resolves a `ToolCall` to its `Capability` by name from a `HashMap<String, Capability>`, threads the dispatch cancel token onto the shared base context via `ToolContext::with_cancel` (preserving the context identity so identity-keyed stores survive across calls), runs the card, and projects the `ToolResult` back into a runtime `ToolOutcome`. Sharing one `context_id` is required so the framework `todo_read`/`todo_set` built-ins see one store across a session. An unknown tool name is surfaced as an `is_error` outcome — never a panic.
+
+`project_result` folds content blocks into one output value: a single text block → a JSON string, a single JSON block → the value, zero-or-many blocks → an array of tagged `{type, …}` fragments so no fragment is dropped.
+
+## App-novel Cards
+
+`cards/` authors the seven in-house tools the framework does NOT provide, concatenated onto the built-ins by `app_novel_cards()` only for the `All` profile. Order is load-bearing:
+
+```rust
+pub fn app_novel_cards() -> Vec<CapabilityCard> {
+    vec![
+        todo::todo_card(),
+        bg_process::daemon_card(),
+        task::task_card(),
+        saas::saas_card(),
+        memory::memory_card(),
+        plan::enter_plan_mode_card(),
+        plan::exit_plan_mode_card(),
+    ]
+}
+```
+
+Each card is a struct implementing `Card`, keying behavior on an `action` discriminant with defensive runtime guards that return `is_error` results rather than panicking. Each joins only `Profile::All`.
+
+| Card fn | Tool `name` | Actions | Behavior |
+|---------|-------------|---------|----------|
+| `todo_card` | `todo` | `read` \| `set` | In-deck `TodoLedger` (a `Mutex<Vec<TodoItem>>`), distinct from the framework `todo_read`/`todo_set` built-ins; `set` wholesale-replaces the list. Items carry `TodoState` (pending/active/done/dropped) + `TodoWeight` (low/normal/high) and render with glyphs `[ ]`/`[~]`/`[x]`/`[-]`. |
+| `daemon_card` | `bg-process` | `start` \| `poll` \| `stop` \| `list` | Background-process table over the framework `Shell::spawn` seam (not Node `child_process`), with bounded ring buffers (`MAX_BUFFERED_LINES = 2_000`), capture files under `.indusvx-bg`, and SIGTERM→SIGKILL escalation after `STOP_GRACE_MS = 3_000`. |
+| `task_card` | `task` | (objective + agent/context) | Sub-agent delegate over `DelegateRunner` (backed by `indusagi-swarm`, feature `swarm`); degrades to a typed stub when the handle is absent. Threads the runner's `list_agents()` roster into the description. |
+| `saas_card` | `saas-action` | `discover` \| `execute` | Connector tool over `SaasGatewayPort` (backed by `indusagi-connectors-saas`, feature `composio`); stub when absent. Vendor slugs (`GITHUB_CREATE_ISSUE`) pass through verbatim. |
+| `memory_card` | `memory` | `read` \| `replace` \| `append` | Working-memory scratch-note tool over `MemoryStore`, defaulting to a card-owned `InMemoryStore` (`Mutex<String>`) when no handle is injected. |
+| `enter_plan_mode_card` | `enter_plan_mode` | (none) | Read-only marker tool: returns `{ enterPlanMode: true, applied: false }` plus explore-only prose. |
+| `exit_plan_mode_card` | `exit_plan_mode` | (plan) | Read-only marker tool: returns `{ exitPlan: true, plan }`; the conductor intercepts it to raise the user-approval prompt. |
+
+The `task`, `saas`, and `memory` cards expose a thin, typed adapter seam over a framework handle injected through `DeckFramework`; when no handle is wired they degrade to a typed stub (delegate/saas) or an in-process default (memory) so every card builds and runs in any environment, including tests. The `task` and `saas` cards are **always built** — as stubs when their `swarm`/`composio` feature is off — so the catalog shape is stable across feature sets; the feature gates only the REAL handle wiring (which lives in `induscode-addons`).
+
+Stores (`TodoLedger`, the `DaemonTable`, `InMemoryStore`) are per-built-capability, so two sessions never share state; background-process output is capped at 2000 lines per stream.
+
+### Plan-mode tools and plan-file persistence
+
+The two plan tools are side-effect-free and marked `read_only` so the permission gate always permits them — including the very tool used to request *leaving* plan mode. Neither flips the mode itself; the conductor watches the tool-result seam for the `enterPlanMode` / `exitPlan` markers (the plan-mode gate is deferred to M-conductor). The TS card's optional in-context `PlanController` is dropped — the typed `DeckFramework` has no plan field — so the entry detail's `applied` is always `false`.
+
+`plan.rs` also ships the plan-file helpers the conductor's exit handshake uses to persist an approved plan:
+
+```rust
+pub const PLANS_DIRNAME: &str = "plans";
+pub fn plan_slug(plan: &str) -> String;                         // first non-empty line → fs-safe slug, capped at 48 chars, "plan" fallback
+pub fn plan_file_path(session_dir, slug) -> PathBuf;            // <session_dir>/plans/<slug>.md
+pub fn write_plan(session_dir, plan) -> io::Result<PathBuf>;    // writes <base36-timestamp>-<slug>.md so repeats never collide
+pub fn read_plan(path) -> Option<String>;                       // None on a missing/unreadable file
+```
+
+The timestamp prefix is base-36 epoch-millis (the JS `Number.toString(36)` analogue), so repeated plans in one session do not overwrite each other.
+
+## The Checkpoint Wrapper
+
+The frozen framework `Framework` context carries only `read_state`, so the `write`/`edit` tools record nothing for a later code-rewind. The TS bridge passed a `checkpoint` handle straight into `createWriteTool`/`createEditTool`; Rust has no such build-time seam (the factories take no args, the kernel `Framework` has no checkpoint field), so the deck closes the gap in `cards/checkpoint.rs`.
+
+When the `DeckContext` carries a `checkpoint` handle, `provision.rs`'s `build_selected` folds each built `write`/`edit` capability inside a `CheckpointingCard` via `maybe_wrap_checkpoint`. The wrapper reads the target file's CURRENT on-disk content (through `ctx.fs`), files it into the injected `CheckpointStore` under the active transcript node, then delegates to the inner card unchanged. Every model-facing field (`name`/`label`/`description`/`parameters`/`read_only`) is projected straight through, so the wrap is invisible to the model and the descriptor catalog — only `run` is augmented.
+
+```rust
+pub const CHECKPOINTED_TOOLS: &[&str] = &["write", "edit"];  // bash/process excluded
+```
+
+The behaviour mirrors the framework's pre-write `record(abs_path, previous)` contract: `previous == None` records that the file did NOT exist (a restore then deletes it); the store enforces first-seen-wins per (node, path); reading the prior content is best-effort, so a write of a brand-new or unreadable file still proceeds. With no checkpoint handle wired, `maybe_wrap_checkpoint` returns the same `Arc` identity-equal, so an install without rewind behaves exactly as today.
+
+## The Bridge Ledger
+
+MCP enrollment is **event-sourced**, gated behind the `mcp` feature. Rather than mutate a shared list of live tools (which makes "who's enrolled right now" a function of call order and hides every past change), enrollment is an append-only event log folded into a derived snapshot. The reducer is `reduce(state, ops) -> snapshot`.
+
+`deck::mcp::ledger` holds the value types:
+
+| Type | Kind | Purpose |
+|------|------|---------|
+| `BridgeOp` | enum | `Enroll` \| `Retire` — a closed set, exhaustive `match` with no `_` arm. |
+| `BridgeKey` | newtype | The branded stable key of an enrolled bridge capability. |
+| `BridgeEntry` | struct | One append-only event: `op`, `key`, `server`, `capability` (`Some` on enroll, `None` on retire), `seq`, `at`. |
+| `LedgerSnapshot` | struct | The reduced view: `live: IndexMap<BridgeKey, BridgeCapability>`, `by_server: IndexMap<String, usize>`, `high_water: u64`. |
+| `EnrollRequest` | struct | The fields an enrollment supplies (`capability`, `server`, optional `key`); the ledger stamps `op`/`seq`/`at`. |
+| `BridgeLedger` | struct | The immutable value: the ordered `log`, its folded `snapshot`, and `next_seq`. |
+
+`BridgeLedger` is a plain immutable value: the log is the source of truth, the snapshot is a cache of its fold. Every transition returns a *new* ledger — the input is never touched:
+
+| Method | Op | Behavior |
+|--------|-----|----------|
+| `BridgeLedger::empty()` | — | An empty ledger; sequence numbering starts at 1. |
+| `BridgeLedger::from_log(log)` | — | Rehydrate from a persisted event log (fold for the snapshot, resume past the high-water mark). Replay is deterministic. |
+| `enroll(req, at)` | enroll | **Upsert** — re-enrolling the same `BridgeKey` replaces its live entry rather than duplicating it. |
+| `retire(key, server, at)` | retire | **Splice** — the fold drops the keyed entry; an unknown key is a harmless no-op (still recorded for audit). |
+| `withdraw_server(server, at)` | retire ×N | Retire every capability a server currently has live, in one batch (the disconnect counterpart to grafting a server). |
+| `live_capabilities()` | — | The flat list of every live capability — what a host grafts onto the static catalog. |
+| `live_capabilities_for_server(server)` | — | The live capabilities a single server contributes (for status panels). |
+
+`reduce_ledger(&[BridgeEntry])` is the single sanctioned reducer: pure and total, it sorts a borrowed index by `seq` (never mutating the caller's slice), lets a later sequence win on a repeated key (`Enroll` upsert), removes retired keys (`shift_remove`, matching JS `Map.delete` which does not reorder survivors), and derives per-server counts from the live set. The view is independent of input order. `IndexMap` (not `HashMap`) keeps insertion order so `live_capabilities()` is stable across reduces, matching the TS `Map` insertion-order parity.
+
+### BridgeCapability — the grafted tool as a Card
+
+`BridgeCapability` is the deck's adapted view of one grafted remote tool, `Arc`-shared so it lives in both the log entry and the snapshot cheaply. It implements `Card`, so a grafted MCP tool is a uniform deck capability beside the static catalog. Its `name`/`label` are both the qualified `"<server>__<tool>"`; `run` hands the call to the box's shared `ToolRunner` under that qualified name (the runner routes back to the owning endpoint by `call.name`) and projects the opaque `ToolOutcome` onto a `ToolResult` via `project_outcome` — a `Value::String` preserved verbatim, `Value::Null` → empty, anything else JSON-pretty-printed; `is_error` rides through. `bridge_box_to_capabilities(box_)` adapts every descriptor a mounted `ToolBox` advertises (carrying its already-normalized parameters) plus the box's shared runner into `BridgeCapability`s.
+
+## Bridge Keys: Content-Hash and ULID
+
+`ledger.rs` mints the stable key that makes re-enrolling idempotent. Keys are minted from the capability's *identity*, never from a working-directory digest, so the same external tool grafted from two sessions collapses to one key.
+
+```rust
+qualify_bridge_name(server: &str, tool: &str) -> String                              // "<server>__<tool>" using the framework QUALIFIER
+bridge_content_key(server: &str, tool: &str, parameters: Option<&Value>) -> BridgeKey  // default: "bk_<32hex>"
+bridge_ulid_key() -> BridgeKey                                                        // opt-in: "bk_<ULID>", distinct/time-sortable events
+server_of_qualified(name: &str) -> &str                                              // recover the owning server from a qualified name
+```
+
+`bridge_content_key` digests the qualified `<server>__<tool>` name plus the parameter schema, so the key is a pure function of *what the tool is*. The `{name, schema}` identity is first key-sorted by a recursive `sort_keys` (so a schema differing only in object-key order yields the same key — the TS `canonicalize`, with array order preserved as semantically meaningful), then hashed via the framework's `indusagi::core::content_hash` (sha256-over-canonical-json, 32 hex chars). A missing schema is `Value::Null`, distinct from any object. A tool whose schema changed yields a new key, correctly surfacing it as a distinct capability.
+
+Because the digest is an in-process dedup key (no wire protocol), cross-impl byte-parity with the TS hash is not required — only stability within and across runs of this binary, which `content_hash` guarantees. `bridge_ulid_key` uses a process-wide monotonic `ulid::Generator` so ids minted in the same millisecond still order; use it when each enrollment must be a *distinct* event rather than a deduplicated identity.
+
+## Mounting MCP Servers
+
+`deck::mcp` (in `mod.rs`) is the side-effecting half. The framework's [`indusagi::interop::mount_protocol_bridge`](/rust/subsystems/interop) does the protocol work — it connects every configured server, lists each ready endpoint's tools, normalizes their schemas, and hands back a mounted bridge whose `box_` advertises every grafted remote tool under its qualified `<server>__<tool>` name. This module adds enrollment, status, cataloging, and lifecycle:
+
+```rust
+use induscode::deck::mcp::{attach_bridge_capabilities, bridge_config, detach_bridge};
+use induscode::deck::mcp::ledger::BridgeLedger;
+
+let config = bridge_config(servers);                 // Vec<ServerConfig> -> BridgeConfig
+let result = attach_bridge_capabilities(BridgeLedger::empty(), config).await;
+// result: AttachResult { ledger, fleet, status, enrolled, fault }
+let tools = result.ledger.live_capabilities();       // Vec<BridgeCapability>
+```
+
+- **Enrollment.** `attach_bridge_capabilities(ledger, config)` mounts the fleet, adapts the box via `bridge_box_to_capabilities`, and folds each capability into a *new* ledger as an `enroll` event (the server recovered from the qualified name). It returns an `AttachResult` carrying the new `ledger`, the live `fleet` (the caller must eventually tear it down), the aggregate `FleetStatus`, the `enrolled` count, and a non-fatal `fault`. An empty config is a no-op: the input ledger flows straight through.
+- **Detach.** `detach_bridge(ledger, fleet, servers)` withdraws named servers' live entries (or, when `servers` is `None`, every server in the fleet status) and best-effort tears the fleet down.
+- **Status.** `bridge_tool_names(ledger)`, `bridge_tool_counts(ledger)`, and `bridge_status(fleet)` read the live state — the first two from the ledger snapshot (no live fleet handle needed), the third a pass-through over `ServerFleet::status`.
+- **Cataloging.** `bridge_capability_card(capability)` re-presents a grafted capability as a `CapabilityCard` so dynamic MCP tools surface in help / introspection beside the static rows; the card's `build` simply returns the already-live capability, and its `profiles` is empty (`&[]`) so it stays out of profile-filtered provisioning while still cataloged.
+
+Unlike the TS, **`mount_protocol_bridge` is infallible** — it returns a `MountedProtocolBridge` directly, not a `Result` — so there is no wholesale-mount fault branch; per-server health is read from `fleet.status()`. Per-server failure isolation comes for free: a server that faulted on connect contributes no descriptors and is simply absent from the enrollment. The `AttachResult.fault` (a `DeckFault::Bridge`) is reserved for config validation only.
+
+## MCP Config Discovery
+
+`load_mcp_config(path_or_cwd)` reads the `.indusvx/mcp.json` family into a `Vec<ServerConfig>`, merged in precedence order (the port of the framework `loadMCPConfig`):
+
+1. Project: `<cwd>/.indusvx/mcp.json`
+2. User (XDG): `$XDG_CONFIG_HOME/indusvx/mcp.json` (default `~/.config`)
+3. Legacy: `~/.indusvx/agent/mcp.json` and `~/.indusvx/agent/mcp-servers.json`
+
+When `path_or_cwd` is itself an existing *file*, it is parsed directly. A malformed or unreadable file is skipped (a bad MCP config must not sink the session) rather than raised. `parse_config_file` supports both the array (`{"servers": [{"name": …}]}`) and object (`{"servers": {"name": {…}}}`) formats, drops `"enabled": false` rows, and discriminates transports: a `"url"` field selects `ServerConfig::Sse`, a `"command"` field selects `ServerConfig::Stdio`. A row matching neither is skipped rather than failing the whole file. `bridge_config(servers)` wraps a flat list into a `BridgeConfig`.
+
+The ledger's `at` audit field is an ISO-8601 UTC string derived from `indusagi::core::time::now_ms` through a small dependency-free civil-from-days conversion, so the bridge pulls no extra date crate.
+
+## Faults
+
+`DeckFault` is a closed, exhaustive enum (no `_` arm, so a new variant forces every `match` to be revisited) carrying its own message via `thiserror::Error`:
+
+| Variant | Raised when |
+|---------|-------------|
+| `UnknownCapability(String)` | A requested capability id is not in the catalog (the `--tools` / `build_builtin` path). |
+| `BuildFailed { id, message }` | A card's `build` failed while minting a capability (reserved for fallible bridge enrollment). |
+| `Bridge(String)` | Connecting / listing / grafting an MCP server failed (config-validation; carried on `AttachResult`, not raised). |
+| `Backend(String)` | A required injected backend handle was missing or invalid. |
+
+`pub type DeckResult<T> = Result<T, DeckFault>` is the convenience alias every fallible deck op returns.
+
+## Public Surface
+
+`deck/mod.rs` re-exports only the **contract vocabulary** at the `induscode::deck` top level — `Capability`, `CapabilityCard`, `CapabilityId`, `Card`, `DeckContext`, `DeckFault`, `DeckFramework`, `DeckResult`, `Profile`, and `capability_id`. Everything else is `pub` but reached through its own submodule path (`induscode::deck::builtin::*`, `::catalog::*`, `::provision::*`, `::cards::*`, `::mcp::*`), with the MCP surface gated on the `mcp` feature. The table below names each item with the module that owns it:
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `Capability` | type alias | `contract.rs` | `Arc<dyn Card>` — the deck's uniform callable. |
+| `Card` | trait | `contract.rs` | The uniform behavior of one deck-managed tool. |
+| `CapabilityId` / `capability_id` | newtype + fn | `contract.rs` | Branded wire-facing tool name + minter. |
+| `CapabilityCard` / `BuildFn` | struct + alias | `contract.rs` | One catalog row: metadata + `build` factory. |
+| `Profile` / `DeckContext` / `DeckFramework` | enum + structs | `contract.rs` | Named capability sets, the build context, the injected-handle bag. |
+| `CheckpointStore` / `DelegateRunner` / `SaasGatewayPort` / `MemoryStore` | traits | `contract.rs` | The injected-handle trait signatures. |
+| `DeckFault` / `DeckResult` | enum + alias | `contract.rs` | Typed failure + result alias. |
+| `BuiltinCard` / `BuiltinDescriptor` / `BridgeBuilder` | struct + alias | `builtin.rs` | The `DefinedTool` adapter, a built-in descriptor, the builder closure type. |
+| `builtin_bridge` / `builtin_ids` / `builtin_profiles` / `builtin_descriptors` / `builtin_cards` | fn | `builtin.rs` | The 12-row built-in table and its derived views. |
+| `build_builtin` / `build_builtins_for_profile` | fn | `builtin.rs` | Resolve-and-build helpers over the table. |
+| `capability_cards` / `capability_index` | fn | `catalog.rs` | The catalog slice and its by-id index. |
+| `capability_ids` / `has_capability` / `find_card` / `card_profiles` / `cards_for_profile` | fn | `catalog.rs` | Derived lookups over the catalog. |
+| `provision_deck` / `cards_for_deck_profile` / `ToolDeck` | fn + struct | `provision.rs` | The single assembler, the selection it walks, and the assembled deck. |
+| `app_novel_cards` | fn | `cards/mod.rs` | The 7 in-house cards (added only for the `All` profile). |
+| `todo_card` / `daemon_card` / `task_card` / `saas_card` / `memory_card` / `enter_plan_mode_card` / `exit_plan_mode_card` | fn | `cards/*.rs` | The app-novel card rows and their builders, stores, and value types. |
+| `maybe_wrap_checkpoint` / `CheckpointingCard` / `CHECKPOINTED_TOOLS` | fn + struct + const | `cards/checkpoint.rs` | The write/edit checkpoint fold. |
+| `plan_slug` / `plan_file_path` / `write_plan` / `read_plan` / `PLANS_DIRNAME` | fn + const | `cards/plan.rs` | Plan-file persistence. |
+| `BridgeLedger` / `EnrollRequest` / `BridgeEntry` / `BridgeOp` / `LedgerSnapshot` / `BridgeKey` | struct + enums | `mcp/ledger.rs` | The immutable ledger value, enrollment fields, events, the reduced view, the key. |
+| `reduce_ledger` | fn | `mcp/ledger.rs` | The single pure, total fold. |
+| `BridgeCapability` / `bridge_box_to_capabilities` / `server_of_qualified` | struct + fn | `mcp/ledger.rs` | The grafted tool as a `Card`, the box adapter, the server recoverer. |
+| `bridge_content_key` / `bridge_ulid_key` / `qualify_bridge_name` | fn | `mcp/ledger.rs` | Content-hash / ULID key minting + name qualifier. |
+| `attach_bridge_capabilities` / `detach_bridge` / `AttachResult` | fn + struct | `mcp/mod.rs` | Mount + enroll / withdraw + tear down + the outcome. |
+| `bridge_config` / `bridge_capability_card` / `load_mcp_config` | fn | `mcp/mod.rs` | Build a `BridgeConfig`, catalog a graft, discover `mcp.json`. |
+| `bridge_tool_names` / `bridge_tool_counts` / `bridge_status` | fn | `mcp/mod.rs` | Read the live bridge state. |
+
+## Parity Notes
+
+- **No callable `AgentTool` object.** The framework's `AgentTool` is opaque JSON; the deck defines the `Card` trait so a `DefinedTool` (via the bridge adapter) and each app card present one uniform `Arc<dyn Card>` callable. See the [TS](/cli) and [Python](/python-cli/subsystems/capability-deck) editions, which alias `Capability = AgentTool` directly.
+- **Wire-name rename.** The two checklist built-ins advertise the framework's actual Rust names `todo_read`/`todo_set`, not the TS `todoread`/`todowrite`; `builtin_name_parity` pins this against the framework registry.
+- **Two extra app cards.** The Rust deck ships seven app-novel cards versus the Python deck's five — the two plan-mode markers (`enter_plan_mode`/`exit_plan_mode`) are deck cards here (the gate is deferred to the [conductor](/rust-cli/subsystems/conductor)).
+- **Arg-free factories.** Framework tool factories take no arguments; cwd / read-state / checkpoint reach a tool through the per-dispatch `ToolContext`, not at build time — hence the `DeckToolBox` runner mints one shared base context and the `CheckpointingCard` exists to recover the build-time checkpoint threading the kernel `Framework` cannot express.
+- **Closed enums make faults unrepresentable.** `Profile` and `BridgeOp` are closed, so `provision_deck` is total (no unknown-profile fault) and the reducer's `match` needs no wildcard.
+- **Infallible mount.** Rust's `mount_protocol_bridge` returns a value, not a `Result`, so MCP attach has no wholesale-fault branch — per-server health flows through `FleetStatus`.
+- **Per-session isolation.** Built capability stores (`TodoLedger`, `DaemonTable`, `InMemoryStore`) are per-built-capability, so two sessions never share state; background-process output is capped at 2000 lines per stream.
+
+For how the session consumes the deck, see [Boot](/rust-cli/subsystems/boot) and the [Conductor](/rust-cli/subsystems/conductor); for the framework tools the deck bridges, see [framework capabilities](/rust/subsystems/capabilities) and [interop](/rust/subsystems/interop).

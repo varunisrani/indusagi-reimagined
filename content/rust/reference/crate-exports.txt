@@ -1,0 +1,736 @@
+# Crate Exports
+
+> The `indusagi` crate is a single, merged Rust library (npm-style one package):
+> every former `indusagi-*` library crate is now a `pub mod` inside `src/lib.rs`.
+> Downstream code reaches every layer through one `indusagi` dependency — either by
+> the canonical module path (`indusagi::runtime`) or the `index.ts`-mirroring value
+> namespaces (`indusagi::gateway`, `indusagi::saas`, `indusagi::shell`). This page
+> maps the complete public surface: every module, its feature gate, and the key
+> `pub use` re-exports each barrel surfaces at its root.
+
+## Table of Contents
+
+- [Crate root](#crate-root)
+- [Module map](#module-map)
+- [Namespace aliases](#namespace-aliases)
+- [core](#core)
+- [tracing](#tracing)
+- [llmgateway](#llmgateway)
+- [capabilities](#capabilities)
+- [runtime](#runtime)
+- [interop](#interop)
+- [connectors-saas](#connectors-saas)
+- [swarm](#swarm)
+- [smithy](#smithy)
+- [tui](#tui)
+- [tui-render](#tui-render)
+- [shell-app](#shell-app)
+- [facade](#facade)
+- [Feature gates](#feature-gates)
+- [Crates and binaries](#crates-and-binaries)
+
+## Crate root
+
+`crates/indusagi/src/lib.rs` is the umbrella barrel — a faithful port of the
+TypeScript `src/index.ts`, which was a tiny re-export barrel (nine
+`export * as <ns> from "./<subsystem>"` lines plus one `VERSION`). The Rust root
+declares every subsystem as a `pub mod`, surfaces the differently-named barrel
+namespaces as module aliases, and binds the single version constant.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `VERSION` | `pub const &str` | `lib.rs` | The single workspace version, `env!("CARGO_PKG_VERSION")`. The one canonical umbrella version constant — single-sourced from `Cargo.toml` (kills the TS 3-way drift). |
+
+```rust
+/// `export const VERSION` — the single workspace version, single-sourced from
+/// `Cargo.toml`. This is the canonical umbrella version constant.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+```
+
+```rust
+use indusagi::VERSION;
+println!("{VERSION}");          // e.g. "0.1.0"
+```
+
+The version is `0.1.0` at the workspace level (it continues the npm `0.13.x`
+line). See [Architecture](/rust/architecture) for how the layers compose, and
+the [Python edition](/python/reference/package-exports) for the parity lineage.
+
+## Module map
+
+Every former `indusagi-*` library crate is now a `pub mod` here. Feature-gated
+modules mirror the umbrella's optional-subsystem feature taxonomy.
+
+| Former crate | Module | Feature gate | Holds |
+|--------------|--------|--------------|-------|
+| `indusagi-core` | `core` | — | Cross-cutting primitives (cancellation, env, brand, locator, canonical-JSON, ids, errors, channel, time). |
+| `indusagi-tracing` | `tracing` | — | OTel-free tracing (segments, signal channel, sampling, scrubbing, sinks). |
+| `indusagi-llmgateway` | `llmgateway` | — | Zero-SDK LLM provider gateway (connectors, Emission protocol, framers, catalog, credentials). |
+| `indusagi-capabilities` | `capabilities` | — | Built-in tool suite over a frozen kernel and abstract Fs/Shell seams. |
+| `indusagi-tui` | `tui` | `tui` | Host-agnostic terminal primitives (keys, keybindings, fuzzy, editor, theme). |
+| `indusagi-interop` | `interop` | `mcp` | MCP interop in both directions (client + provider host). |
+| `indusagi-connectors-saas` | `connectors_saas` | — | Composio SaaS connectors (hexagonal `SaasBackend` port, gateway, control tools, OAuth polling FSM). |
+| `indusagi-runtime` | `runtime` | — | Pure-FSM agent runtime (cadence reducer, conductor, tool scheduler, compaction, session DAG store). |
+| `indusagi-swarm` | `swarm` | `swarm` | File-backed multi-agent crew layer (coordination, ticket board, worktree isolation). |
+| `indusagi-smithy` | `smithy` | — | Agent-builder meta-tool (flag FSM, blueprint validation, embedded knowledge pack, redacting forge). |
+| `indusagi-tui-render` | `tui_render` | `tui` | Ratatui render layer (immediate-mode app, dialogs, markdown/diff/highlight, ui-bridge adapter). |
+| `indusagi-facade` | `facade` | — | Thin compatibility shims over the core modules (the old type/role vocabulary for ai/agent/mcp; memory is intentionally empty). |
+| `indusagi-shell-app` | `shell_app` | — | CLI shell (flag parser, boot pipeline, print/NDJSON/REPL runners, OAuth login subcommand). |
+
+## Namespace aliases
+
+The TS `src/index.ts` barrel used nine namespace names. Modules whose name already
+matches their namespace (`runtime`, `capabilities`, `interop`, `swarm`, `smithy`,
+`tracing`) resolve directly via the `pub mod` declarations — no alias is emitted
+(a second `pub use … as runtime;` would collide). Only the barrel names that
+differ from their module name get an explicit alias, plus a few Python-umbrella
+aliases and the legacy facade subpaths.
+
+| `src/index.ts` line | Rust alias | Resolves to |
+|---------------------|------------|-------------|
+| `export * as gateway from "./llmgateway"` | `indusagi::gateway` | `crate::llmgateway` |
+| `export * as saas from "./connectors-saas"` | `indusagi::saas` | `crate::connectors_saas` |
+| `export * as shell from "./shell-app"` | `indusagi::shell` | `crate::shell_app` |
+| (Python umbrella `_SUBSYSTEMS["saas"] -> "connectors"`) | `indusagi::connectors` | `crate::connectors_saas` |
+| `indusagi/ai` subpath | `indusagi::ai` | `crate::facade::ai` |
+| `indusagi/agent` subpath | `indusagi::agent` | `crate::facade::agent` |
+| `indusagi/mcp` subpath (feature `mcp`) | `indusagi::mcp` | `crate::facade::mcp` |
+| `indusagi/memory` subpath | `indusagi::memory` | `crate::facade::memory` |
+
+```rust
+/// `export * as gateway from "./llmgateway"`.
+pub use crate::llmgateway as gateway;
+/// `export * as saas from "./connectors-saas"`.
+pub use crate::connectors_saas as saas;
+/// `export * as shell from "./shell-app"`.
+pub use crate::shell_app as shell;
+/// Python umbrella's `connectors` key — same module, second name.
+pub use crate::connectors_saas as connectors;
+
+pub use crate::facade::ai;
+pub use crate::facade::agent;
+#[cfg(feature = "mcp")]
+pub use crate::facade::mcp;
+pub use crate::facade::memory;
+```
+
+Both spellings resolve to the same module object: `indusagi::gateway` *is*
+`indusagi::llmgateway`, `indusagi::saas` *is* `indusagi::connectors_saas`, and
+`indusagi::shell` *is* `indusagi::shell_app`.
+
+## core
+
+`crate::core` — the foundational layer that no subsystem owns but all of them
+need. It carries no subsystem logic, only the load-bearing primitives. Modules:
+`brand`, `cancel`, `canonical`, `channel`, `env`, `errors`, `ids`, `locate`,
+`time`, `version`.
+
+Root re-exports (the symbols downstream code reaches for):
+
+```rust
+pub use brand::{BRAND, Brand, env_name};
+pub use cancel::{CancelExt, CancellationToken};
+pub use canonical::{HASH_WIDTH, canonical_json, content_hash};
+pub use channel::{BoxStream, Channel};
+pub use errors::{CoreError, CoreResult};
+pub use locate::{Locator, LocatorOverrides};
+pub use time::now_ms;
+pub use version::VERSION;
+```
+
+| Symbol | Kind | Purpose |
+|--------|------|---------|
+| `CancellationToken` / `CancelExt` | struct / trait | The framework's single cancellation currency (parent→round→child chaining); cancel yields a typed `CoreError`, never a panic. |
+| `canonical_json` / `content_hash` / `HASH_WIDTH` | fn / fn / const | Character-faithful `JSON.stringify` encoder + content-addressing surface. |
+| `BRAND` / `Brand` / `env_name` | const / struct / fn | The one source of naming truth + env-var grammar. |
+| `Locator` / `LocatorOverrides` | struct | Unified state-path locator honoring `INDUSAGI_HOME`. |
+| `CoreError` / `CoreResult` | enum / alias | The shared closed error vocabulary. |
+| `Channel` / `BoxStream` | struct / alias | The re-iterable channel stream factory. |
+| `now_ms` | fn | The single wall-clock surface (the `Date.now()` analogue). |
+| `VERSION` | const | Single-source version (re-exported up to the crate root). |
+
+## tracing
+
+`crate::tracing` — a homegrown, dependency-light, OTel-free tracer. **Not** the
+`tracing` crate; a self-contained tracer with its own vocabulary. Modules:
+`channel`, `hub`, `recorder`, `redaction`, `sampling`, `signal`, `sinks`,
+`adapter`.
+
+```rust
+pub use signal::{
+    Attributes, CloseOptions, OpenHandleInput, OpenSegmentInput, Segment, SegmentError,
+    SegmentHandle, SegmentKind, SegmentStatus, SignalSink, TerminalStatus, TraceRecord,
+    close_segment, fresh_id, fresh_segment_id, fresh_trace_id, open_handle, open_segment,
+    with_attributes,
+};
+pub use channel::{SignalChannel, SignalChannelOptions, SignalChannelReader, TraceSignal};
+pub use redaction::{
+    REDACTION_TOKEN, SecretPattern, SecretScrubber, SecretScrubberOptions, default_secret_patterns,
+};
+pub use sampling::{SampleGate, SampleStrategy};
+pub use recorder::{OpenOptions, Recorder};
+pub use hub::{TelemetryHub, get_default_hub, set_default_hub};
+pub use sinks::{
+    ConsoleSink, ConsoleSinkOptions, FileSink, FileSinkOptions, LogFn, Sink, StreamSink,
+    StreamSinkOptions,
+};
+pub use adapter::{RunEvent, RunEventSubscribe, RunSnapshot, ToolOutcome, trace_agent_run};
+```
+
+The immutable `Segment` value (kinds `run`/`inference`/`action`/`recall`/`custom`)
+is driven by the functional `SegmentHandle` (`note`/`child`/`fail`/`close`);
+sampled-out work collapses to a single noop handle. `trace_agent_run` is the
+optional runtime bridge.
+
+## llmgateway
+
+`crate::llmgateway` (alias `indusagi::gateway`) — the single chokepoint to any
+LLM. No provider SDK is imported; every wire shape is re-derived from public HTTP
+docs and assembled/parsed by hand. Modules: `catalog`, `connectors`, `contract`,
+`conversion`, `credentials`, `gateway`, `streaming`.
+
+### Dispatch and catalog
+
+```rust
+pub use gateway::{complete, complete_with_card, stream, stream_with_card};
+pub use catalog::{CardSelection, estimate_cost, get_card, model_cards, models};
+```
+
+| Symbol | Kind | Purpose |
+|--------|------|---------|
+| `stream` / `complete` | fn | Streaming / one-shot dispatch by model id. |
+| `stream_with_card` / `complete_with_card` | fn | Dispatch against a pre-resolved `ModelCard`. |
+| `model_cards` / `models` / `get_card` / `CardSelection` | fn / fn / fn / struct | The static catalog (**13** `ModelCard`s) + fluent query + lookup. |
+| `estimate_cost` | fn | Price a `Usage` figure against a card. |
+
+### The frozen contract
+
+```rust
+pub use contract::{
+    ApiKind, AssistantRole, Block, Channel, Connector, Conversation, CostSheet, CredentialResolver,
+    Emission, GatewayError, GatewayErrorExtra, GatewayErrorKind, JsonSchema, Modality, ModelCard,
+    ProviderId, Reply, StopReason, StreamOptions, ThinkingLevel, ToolChoice, ToolDescriptor, Turn,
+    Usage, gateway_error,
+};
+```
+
+The frozen type vocabulary: the 8-variant `Emission` union (incl.
+error-as-terminal + `done`), `Block`/`Turn`/`Conversation`,
+`Reply`/`Usage`/`StopReason`, `ModelCard`/`ApiKind`/`ProviderId`,
+`StreamOptions`, `GatewayError`, and the `Connector`/`CredentialResolver` traits.
+
+### Connectors, conversion, credentials, streaming
+
+```rust
+pub use connectors::{
+    HttpRequest, HttpResponse, HttpTransport, ReqwestTransport, connector_for_api,
+    create_anthropic_connector, create_azure_openai_connector, create_bedrock_connector,
+    create_google_connector, create_google_vertex_connector, create_kimi_connector,
+    create_mock_connector, create_nvidia_connector, create_ollama_connector,
+    create_openai_chat_connector, create_openai_responses_connector, reqwest_transport,
+};
+pub use conversion::{
+    OpenAICompatibleConfig, complete_openai_compatible_chat, fold_reply,
+    stream_openai_compatible_chat, to_anthropic_request, to_openai_chat_messages,
+    to_openai_tool_choice, to_openai_tools, to_responses_input, to_responses_tools,
+};
+pub use credentials::{
+    AuthUrlInputs, OAuthConfig, OAuthTokens, PkcePair, SecretDescriptor, SecretScheme,
+    build_auth_url, create_pkce_pair, derive_code_challenge, environment_credential_resolver,
+    exchange_code, oauth_config_for, refresh_token, resolve_secret,
+};
+pub use streaming::{ServerEvent, channel_of, collect_reply, ndjson_lines, sse_events};
+```
+
+Eleven wire connectors ship (anthropic, openai-chat, openai-responses, google,
+google-vertex, azure-openai, nvidia, kimi, ollama, the network-free mock, and the
+fail-fast bedrock stub). `fold_reply` is the pure reducer; `streaming` carries the
+WHATWG SSE framer and the NDJSON framer; `credentials` carries OAuth2
+exchange/refresh and PKCE S256. See the [Python LLM Gateway](/python/subsystems/llm-gateway)
+for the parity contract.
+
+## capabilities
+
+`crate::capabilities` — the built-in tool suite over a frozen kernel and abstract
+Fs/Shell seams. Modules: `backends`, `files`, `kernel`, `planning`, `registry`,
+`search`, `shell`, `web`.
+
+### Kernel surface
+
+```rust
+pub use kernel::{
+    CapabilityError, ClipEnd, DefinedTool, DirChild, FacadeOutput, Framework, Fs, FsEntryInfo,
+    JsonSchema, OutputBudget, READ_STATE_HANDLE_KEY, ReadStateHandle, ReadStateRecord,
+    RemoveOptions, Shell, ShellExecOptions, ShellExecResult, ShellHandle, ShellLaunchOptions, Tool,
+    ToolBox, ToolCall, ToolContentBlock, ToolContext, ToolDescriptor, ToolOutcome, ToolRegistry,
+    ToolResult, ToolRunner, clamp, coerce_input, default_notice, define_tool,
+};
+```
+
+The declarative `Tool` authoring shape, the single `define_tool` adapter, the two
+abstract I/O seams (`Fs` / `Shell`), the UTF-8 byte-budget `clamp`, and the
+in-memory `ToolRegistry`.
+
+### The twelve built-in tools and assembly
+
+```rust
+pub use files::{
+    MODIFIED_SINCE_READ_MESSAGE, READ_BEFORE_EDIT_MESSAGE, edit_tool, ls_tool, read_tool,
+    render_unified_diff, write_tool,
+};
+pub use planning::{TodoItem, TodoStatus, reset_todos, todo_read_tool, todo_set_tool};
+pub use search::{find_tool, grep_tool};
+pub use shell::{bash_tool, process_tool, reset_process_table};
+pub use web::{web_fetch_tool, web_search_tool};
+
+pub use backends::{local_fs, local_shell, make_local_context, standard_budget};
+pub use registry::{ToolCollection, builtin_registry, tool_box, try_tool_box};
+```
+
+Twelve concrete tools authored only against the kernel surface: `read`, `write`,
+`edit`, `ls` (`files`); `grep`, `find` (`search`); `bash`, `process` (`shell`);
+`todo_set`, `todo_read` (`planning`); `web_search`, `web_fetch` (`web`).
+`backends` is the single sanctioned binding of `Fs`/`Shell` to the real OS;
+`tool_box` is the one-call assembly helper. The Myers diff is ported verbatim and
+`grep` uses the `regex` crate (RE2: no lookaround/backrefs). See
+[Capabilities](/python/subsystems/capabilities) for the kernel contract.
+
+## runtime
+
+`crate::runtime` — the pure-FSM agent runtime: it drives one LLM conversation from
+a prompt to settlement, split into a pure layer and a single impure conductor.
+Modules: `cadence`, `conductor`, `contract`, `dispatch`, `ledger`, `memory`,
+`store`, `turn`, `wire` (plus a private `capabilities_bridge`).
+
+### The contract and pure transition machine
+
+```rust
+pub use contract::{
+    AgentConfig, CompactionPolicy, Effect, Migrator, ModelInvoker, PendingTool, RunError,
+    RunErrorKind, RunEvent, RunPhase, RunSnapshot, SessionHead, SessionNode, Signal, ToolBox,
+    ToolCall, ToolOutcome, ToolRunner, ToolStage, run_error,
+};
+pub use cadence::{StepFn, Transition, cadence, cadence as step, initial_snapshot};
+```
+
+The frozen vocabulary: the 7 phases (`RunPhase`), 7 signals (`Signal`), 5 effects
+(`Effect`), 7 run events (`RunEvent`); plus the session DAG contract
+(`SessionNode`/`SessionHead`/`Migrator`) and the `ModelInvoker` seam.
+`cadence(config)` yields the bound `step(&state, signal)` function (re-exported as
+`step` for hosts that drive the FSM directly).
+
+### The engine and supporting surfaces
+
+```rust
+pub use conductor::{Agent, AgentDeps, AgentEventHandler, create_agent};
+pub use dispatch::{DEFAULT_CONCURRENCY, Scheduler, create_scheduler};
+pub use memory::{compact, estimate_context_tokens, find_cut_point, should_compact, summarize};
+pub use store::{Clock, SessionGraph, SessionStore, hash_node};
+pub use turn::drive_turn;
+pub use capabilities_bridge::{CapabilitiesToolBox, agent_with_capabilities};
+pub use ledger::{RunEventHandler, RunLedger, SnapshotAccumulator, Unsubscribe};
+pub use wire::{ProjectionContext, Projector, TurnRole, build_conversation};
+```
+
+| Symbol | Kind | Purpose |
+|--------|------|---------|
+| `create_agent` / `Agent` / `AgentDeps` / `AgentEventHandler` | fn / struct / struct / type | The host-facing factory + handle (the `drive()` quiescence loop, 64-turn budget, shrink-or-skip compaction gate). |
+| `Scheduler` / `create_scheduler` / `DEFAULT_CONCURRENCY` | struct / fn / const | The bounded-concurrency, completion-order tool scheduler with parent→round→child cancellation chaining. |
+| `should_compact` / `find_cut_point` / `compact` / `summarize` / `estimate_context_tokens` | fn | The compaction interpreter (chars/4 estimate). |
+| `SessionStore` / `SessionGraph` / `hash_node` / `Clock` | struct / fn / trait | The content-addressed session DAG + JSONL persistence. |
+| `agent_with_capabilities` / `CapabilitiesToolBox` | fn / struct | The capabilities→runtime `ToolBox` adapter + convenience wiring. |
+| `build_conversation` / `Projector` / `ProjectionContext` / `TurnRole` | fn / struct / struct / enum | Pure projection of a message list + `AgentConfig` into a gateway `Conversation`. |
+
+The runtime deliberately does **not** re-export gateway types — one canonical
+import site per type. See [Runtime](/python/subsystems/runtime).
+
+## interop
+
+`crate::interop` (feature `mcp`) — MCP interop in both directions, over the
+official Rust MCP SDK (`rmcp`). The single module `protocol_bridge` is flattened
+to the crate root, mirroring the TS `interop/index.ts`:
+
+```rust
+pub mod protocol_bridge;
+pub use protocol_bridge::*;
+```
+
+Two mirror-image halves: the **client side** connects to external MCP servers
+(stdio subprocess or streamable-HTTP), normalizes schemas, and grafts remote tools
+into the kernel `ToolRegistry` under collision-free `server__tool` names (joined by
+`protocol_bridge::QUALIFIER`); a `ServerFleet` runs many endpoints with per-server
+fault isolation. The **provider host** (`ProviderHost`) publishes the agent's own
+`ToolBox` so external MCP clients can enumerate and invoke our tools. Parity-
+critical surface: `normalize_schema` (byte-for-byte), the six-variant `FaultKind`
+enum, and the endpoint lifecycle state machine. See [Interop](/python/subsystems/interop).
+
+## connectors-saas
+
+`crate::connectors_saas` (aliases `indusagi::saas`, `indusagi::connectors`) — a
+hexagonal bridge turning a third-party SaaS-tool catalog (Composio: GitHub, Gmail,
+Slack, …) into native agent tools. Modules: `adapter`, `backends`, `control`,
+`core`, `gateway`, `render`.
+
+```rust
+pub use gateway::{
+    ConnectReport, ConnectTuning, EnableReport, SaasGateway, SaasGatewayOptions, StatusReport,
+    create_saas_gateway,
+};
+pub use core::port::{
+    ConnectedAccount, ConnectionRequest, ConnectionState, ConnectionStatus, ExecuteOptions,
+    InitiateOptions, JsonSchema, RemoteResult, RemoteTool, SaasBackend, SaasError, SaasResult,
+    ToolkitInfo,
+};
+pub use control::connect::{
+    AwaitOptions, ConnectAction, ConnectOutcome, connect_rules, initiate_and_await, is_terminal,
+    plan_connect,
+};
+pub use control::tools::Gateway;
+pub use core::builder::{build_control_tools, build_remote_tool, coin_remote_name};
+pub use core::cache::{HashCache, hash_key};
+pub use core::scope_planner::{ResolvedScope, ScopeKind, ScopePlanner};
+pub use render::{
+    default_summarizer, format_connected_accounts, format_connection_request,
+    format_connection_state, format_tool_list, format_toolkit_list, summarize_result,
+};
+#[cfg(feature = "composio")]
+pub use adapter::{ComposioBackend, ComposioBackendOptions, create_composio_backend};
+```
+
+The stateful façade `SaasGateway` owns the live tool set, the four high-level
+control tools (`saas_enable`/`saas_execute`/`saas_connect`/`saas_status`), the
+remote-tools map, and the enable cache (content-hash, future-memoizing). The
+`SaasBackend` port (six async methods) is the dependency-inversion seam; the lone
+vendor adapter (`ComposioBackend`) sits behind the `composio` feature. See
+[Connectors](/python/subsystems/connectors).
+
+## swarm
+
+`crate::swarm` (feature `swarm`) — a file-backed multi-agent crew coordination
+stack. Modules: `coordinator`, `isolation`, `kernel`, `postbox`, `roster`,
+`telemetry`, `workboard`.
+
+```rust
+pub use coordinator::{
+    Crew, CrewOptions, CrewStatus, RoundOutcome, SpawnAgent, TaskDraft, create_crew,
+    default_spawn_agent,
+};
+pub use roster::{
+    CrewManifest, CrewMember, CrewRecord, CrewToolCollection, MemberDraft, ModelPolicy,
+};
+pub use workboard::{DepGraph, Ticket, TicketBoard, TicketDraft, TicketStatus, ticket_statuses};
+pub use postbox::{Channel, ENVELOPE_TYPES, Envelope, EnvelopeType, decode, encode};
+pub use isolation::{
+    CreateOptions, RemoveOptions, RunResult, ShellRunner, Workspace, WorktreeEntry, WorktreeRef,
+    node_runner,
+};
+pub use telemetry::activity::{
+    ActivityLog, CREW_EVENT_KINDS, CrewEvent, CrewEventInput, CrewEventKind,
+};
+pub use kernel::{
+    GuardOptions, JsonCell, JsonlLog, SwarmFault, SwarmFaultKind, TreeNode, new_id, swarm_fault,
+};
+```
+
+The coordinator (`Crew` / `create_crew`) ties together four domain services — the
+roster (`CrewManifest`), the dependency-aware ticket board (`TicketBoard`), the
+cursor-based mailbox (`Channel`), and the append-only `ActivityLog` — plus an
+optional git-worktree isolation seam (`Workspace`). The kernel primitives
+(`JsonCell`, `JsonlLog`, `new_id`, `SwarmFault`) implement the mkdir-lock +
+atomic-rename JSONL coordination. See [Swarm](/python/subsystems/swarm).
+
+## smithy
+
+`crate::smithy` — the agent-builder meta-tool: a tool whose job is to help a user
+design and generate new agents that run on the runtime. Modules: `config`,
+`forge`, `knowledge`, `persona`, `runtime`, `ui`.
+
+```rust
+pub use config::{FlagError, FlagReader, FlagSpec, SmithyConfig, SmithyFlagName, read_flags};
+pub use persona::{
+    AgentBlueprint, AgentProfile, AgentSpec, BlueprintError, PROFILE_NAMES, PROFILES, ProfileName,
+    ToolCollectionName, define_agent, deserialize_blueprint, get_profile, is_profile_name,
+    serialize_blueprint, to_agent_config, try_validate_blueprint, validate_blueprint,
+};
+pub use knowledge::{
+    Guide, GuideManifestEntry, KnowledgeError, KnowledgeManifest, KnowledgePack, load_knowledge,
+};
+pub use runtime::{LedgerEntry, LedgerSummary, ToolEvent, ToolLedger, ToolTally};
+pub use ui::{
+    BlockVisitor, ConsoleForgeView, DEFAULT_SANITIZE_OPTIONS, ForgeView, RenderBlock,
+    RenderBlockKind, RenderRole, RenderTranscript, RenderTurn, SanitizeOptions, TranscriptModel,
+    VisitContext, VisitorTable, default_visitors, format_transcript,
+};
+pub use forge::{AskFn, Forge, ForgeOptions, InterviewAnswers, InterviewKey, create_forge};
+```
+
+The `FlagReader` state machine reads Smithy's CLI into a `SmithyConfig`;
+`AgentBlueprint` + `PROFILES` + `define_agent`/`to_agent_config` turn a partial
+spec into a validated, runnable agent; `KnowledgePack` is the externalised guide
+pack baked into the binary with `include_dir!`; `Forge` is the build session that
+wires everything into an interactive (or config-driven) agent builder. See
+[Smithy](/python/subsystems/smithy).
+
+## tui
+
+`crate::tui` (feature `tui`) — host-agnostic terminal primitives (synchronous, no
+tokio, no ratatui/crossterm). Pure string/byte logic. Modules: `autocomplete`,
+`contracts`, `editor`, `fuzzy`, `keybindings`, `keys`, `theme`, `utils`.
+
+```rust
+pub use autocomplete::{
+    AutocompleteItem, AutocompleteProvider, CombinedAutocompleteProvider, SlashCommand,
+};
+pub use contracts::{
+    Component, OverlayAnchor, OverlayHandle, OverlayMargin, OverlayOptions, SizeValue, Tui,
+};
+pub use editor::EditorComponent;
+pub use fuzzy::{FuzzyMatch, fuzzy_filter, fuzzy_match};
+pub use keybindings::{
+    DEFAULT_EDITOR_KEYBINDINGS, EditorAction, EditorKeybindingsConfig, EditorKeybindingsManager,
+    get_editor_keybindings, set_editor_keybindings,
+};
+pub use keys::{
+    Key, KeyEventType, KeyId, is_key_release, is_key_repeat, is_kitty_protocol_active, matches_key,
+    parse_key, set_kitty_protocol_active,
+};
+pub use theme::{EditorTheme, MarkdownTheme, SelectListTheme, SettingsListTheme};
+pub use utils::{truncate_to_width, visible_width, wrap_text_with_ansi};
+```
+
+The logical key model is preserved here, but raw terminal decode is delegated to
+crossterm at the render layer — these primitives stay decode-agnostic. See
+[Python TUI primitives](/python/ui/tui).
+
+## tui-render
+
+`crate::tui_render` (feature `tui`) — the immediate-mode live terminal UI on
+ratatui 0.30. Replaces the deleted Ink/React reconciler (`src/react-host/` is gone,
+not ported) and ports the `react-ink` component library + the `ui-bridge`
+projection. Modules: `app`, `bridge`, `components`, `diff`, `interactive_app`,
+`markdown`, `theme_adapter`, `types`, `utils`. It also re-exports the host-agnostic
+primitives layer so a render consumer reaches both layers through one crate:
+
+```rust
+pub use crate::tui;
+
+pub use app::{Action, App, AppState, Component, Dialog, DialogOutcome, DialogStack, Focus, Theme};
+pub use bridge::{
+    AgentMessage, AssistantBlock, LiveUsage, StopReason, ToolContent, UserContent,
+    gateway_usage_to_ml, live_usage, to_agent_messages, turn_to_agent_messages,
+};
+pub use diff::{
+    CHANGE_THRESHOLD, CONTEXT_LINES, DiffHunk, DiffKind, DiffLine, DiffSide, StructuredDiff,
+    WordSpan, build_structured_diff, word_diff_line,
+};
+pub use interactive_app::{MountOptions, drive_headless, mount_interactive};
+pub use theme_adapter::{InkTheme, ThemeRole, create_theme_adapter};
+pub use types::{
+    OAuthOverlayState, PendingMessageItem, SessionInfo, SessionSnapshot, SessionStats,
+    SessionTreeOption, StatusKind, StatusMessage, ToolExecutionState, UiDisplayBlock,
+    UserMessageOption,
+};
+```
+
+State lives in plain Rust structs (`App` / `AppState`); every frame is one
+`terminal.draw(|f| …)` pass and ratatui's cell-diff replaces React's virtual-DOM
+diff. Dialogs are modal state machines on an overlay stack (`DialogStack`), each
+implementing `Dialog`; every widget implements `Component`. The `bridge` module is
+the runtime→render projection (the inverse mapping of the facade). See
+[Python react-ink](/python/ui/react-ink) and [ui-bridge](/python/ui/ui-bridge).
+
+## shell-app
+
+`crate::shell_app` (alias `indusagi::shell`) — one crate that turns a command line
+into a running agent. Modules: `auth_cli`, `boot`, `cli`, `config`, `invocation`,
+`locate`, `runners`, `upgrade`.
+
+```rust
+pub use cli::{render_usage, resolve_version, run};
+pub use invocation::{
+    FLAG_SPECS, FlagKind, FlagSpec, FlagValue, InvocationError, Mode, ParsedInvocation,
+    TokenizeOptions, tokenize_invocation,
+};
+pub use config::{
+    CompactionSettings, DEFAULT_SETTINGS, Settings, ToolCollectionName, ToolSettings,
+    load_settings, resolve_model_id,
+};
+pub use locate::{Locator, ShellLocator};
+pub use boot::{
+    BootContext, BootIo, Closable, InputSource, OutputSink, Stage, build_boot_context, run_stages,
+};
+pub use runners::{
+    AgentDeps, EndOfInput, InteractiveView, NoRunnerError, OneShotRunner, RUNNERS, ReplRunner,
+    Runner, TextView, WireRunner, select_runner,
+};
+pub use upgrade::{UPGRADES, Upgrade, apply_upgrades};
+pub use auth_cli::{AuthIo, CredentialStore, StoredCredential, run_auth_command};
+```
+
+| Symbol | Kind | Purpose |
+|--------|------|---------|
+| `run` | fn | The top-level entry: parses argv, short-circuits help/version, boots, dispatches, returns an exit code (never exits). The bin maps to `indusagi::shell_app::run`. |
+| `FLAG_SPECS` / `tokenize_invocation` / `Mode` / `ParsedInvocation` | static / fn / enum / struct | The declarative 10-flag table + table-driven parser; derives `Mode` (Help/Version/Print/Wire/Repl). |
+| `Settings` / `DEFAULT_SETTINGS` / `load_settings` / `resolve_model_id` | struct / fn / fn / fn | The 3-layer settings merge (defaults ← global ← project). `DEFAULT_SETTINGS()` is a fn (the TS const builder). |
+| `RUNNERS` / `select_runner` / `Runner` | fn / fn / trait | The runner registry (`RUNNERS()` returns `Vec<Box<dyn Runner>>`) + selector (`OneShotRunner`, `WireRunner`, `ReplRunner`). |
+| `BootContext` / `build_boot_context` / `Stage` / `run_stages` | struct / fn / trait / fn | The ordered boot pipeline. |
+| `UPGRADES` / `apply_upgrades` / `Upgrade` | static / fn / struct | Idempotent, id-keyed startup migrations. |
+| `run_auth_command` / `AuthIo` / `CredentialStore` | fn / trait / struct | The `auth login/refresh/status` OAuth subcommand. |
+
+See [Shell App](/python/subsystems/shell-app) and the [Rust CLI](/rust/reference/cli).
+
+## facade
+
+`crate::facade` — thin compatibility shims over the core modules. The TS package
+shipped four subpath exports — `indusagi/ai`, `indusagi/agent`, `indusagi/mcp`,
+`indusagi/memory` — whose entry files fronted a hand-written second engine. Per the
+scoping decision (W-4) that engine is **not** re-ported: this is a thin
+translation layer that keeps the old `type`/`role` vocabulary public names exactly
+and projects everything else onto the green core. Modules: `agent`, `ai`,
+`catalog`, `event_stream`, `mcp` (feature `mcp`), `memory`, `session_v3`. The
+single workspace `VERSION` is re-exported at the facade root.
+
+| TS subpath | Facade module | Projects onto |
+|------------|---------------|---------------|
+| `indusagi/ai` | `facade::ai` | `crate::llmgateway` |
+| `indusagi/agent` | `facade::agent` | `crate::runtime` + `crate::capabilities` |
+| `indusagi/mcp` | `facade::mcp` | `crate::interop` |
+| `indusagi/memory` | `facade::memory` | — (intentionally **empty**, W-4) |
+
+Two cross-cutting concerns own their own modules: `facade::catalog` (the single
+shared model catalog — re-exports the gateway's one catalog, never a second copy,
+per the R-4 drift gate) and `facade::session_v3` (the append-only v3 JSONL
+`SessionManager`, read-compatible byte-for-byte with TS-written session files).
+
+### facade::ai
+
+The old `type`/`role` LLM vocabulary projected onto the gateway. Many shapes are
+deliberately `serde_json::Value` aliases to preserve TS-loose typing. Selected:
+
+| Symbol | Kind | Purpose |
+|--------|------|---------|
+| `Context` / `UserMessage` / `AssistantMessage` / `ToolResultMessage` | struct | Message vocabulary. |
+| `TextContent` / `ThinkingContent` / `ImageContent` / `ToolCall` | struct | Content blocks. |
+| `Model` / `ModelCost` / `Usage` / `UsageCost` / `Tool` | struct | Model + usage + tool shapes. |
+| `ModelRegistry` / `ProviderRegistry` | struct | The registries (projecting `model_cards()` only — no second catalog). |
+| `get_model` / `try_get_model` / `get_models` / `find_models` / `get_providers` | fn | Catalog lookup. |
+| `estimate_cost` / `calculate_cost` | fn | Cost estimation. |
+| `get_env_api_key` / `resolve_env_api_key` / `rotate_env_api_key` / `is_likely_valid_api_key` | fn | Env-key probing (`EnvApiKeyResolution`, `SDK_CREDENTIALS_MARKER`). |
+| `stream` / `stream_by_api` | fn | Dispatch (returns a `GatewayEventChannel`, an alias of `crate::llmgateway::Channel`). |
+| `register_api_provider` / `get_api_provider` / `enable_api_provider` / ... | fn | The pluggable `ApiProvider` registry. |
+| `PROVIDER_NAMES` / `API_NAMES` / `STOP_REASONS` | const | Name tables. |
+
+`facade::ai` re-exports the event-stream surface
+(`EventStream`, `EventStreamCursor`, `AssistantMessageEventStream`,
+`create_assistant_message_event_stream`) from `facade::event_stream`. Parity with
+the [ai facade](/python/facades/ai).
+
+### facade::agent
+
+The high-level `Agent` facade over runtime + capabilities. The `Agent` struct
+carries the prompt/steer/follow-up loop:
+
+```rust
+impl Agent {
+    pub fn new(options: AgentOptions) -> Self;
+    pub async fn prompt(&mut self, input: impl Into<Value>) -> Result<(), String>;
+    pub async fn continue_run(&mut self) -> Result<(), String>;
+    pub fn steer(&mut self, m: AgentMessage);
+    pub fn follow_up(&mut self, m: AgentMessage);
+    pub async fn wait_for_idle(&self);
+    pub fn abort(&mut self);
+    pub fn set_tools(&mut self, tools: Vec<AgentTool>);
+    pub fn subscribe(&mut self, listener: Listener) -> usize;
+    // ... set_system_prompt / set_model / set_thinking_level / reset / state ...
+}
+```
+
+Plus the `AgentEvent` union + `AGENT_EVENT_GROUPS`, the message-type registry
+(`register_message_type` / `get_message_type` / `registered_message_types`),
+compaction-summary helpers (`create_compaction_summary_message`,
+`create_branch_summary_message`, the `COMPACTION_SUMMARY_PREFIX`/`SUFFIX`
+constants), the `ToolRegistry` + `create_tool_registry`, and the tool collection
+factories (`create_coding_tools`, `create_read_only_tools`, `create_all_tools`,
+plus the shorthand `coding_tools` / `read_only_tools` / `all_tools`). It re-exports
+the v3 session vocabulary (`SessionManager`, `SessionContext`, `SessionEntry`,
+`build_session_context`, `find_most_recent_session`, ...) from
+`facade::session_v3`. Parity with the [agent facade](/python/facades/agent).
+
+### facade::mcp
+
+The legacy `indusagi/mcp` camelCase vocabulary (feature `mcp`), shimming over
+`crate::interop`. The TS-parity names are kept **exactly** (camelCase function
+names in Rust): `MCPClient` / `MCPClientPool` (+`MCPClientPoolOptions`,
+`MCPClientOptions`), `MCPServer` / `createMCPServer`, the tool factories
+(`createMCPAgentToolFactory`, `createMCPToolsMap`, `createMCPToolsRecord`,
+`registerMCPToolsInRegistry`), schema conversion (`jsonSchemaToTypeBox`,
+`convertMCPInputSchema`, `convertMCPOutputSchema`, `applyPassthrough`), config
+loaders (`loadMCPConfig`, `getUserConfigPath`, `getProjectConfigPath`,
+`saveUserConfig`, `createDefaultConfig`), the error factories
+(`MCPError`/`MCPErrorCode` + `createConnectionError`/`createTimeoutError`/...),
+the config shapes (`MCPServerConfig`, `StdioServerConfig`, `HttpServerConfig`,
+`MCPConfigFile`), and `InitializedMCP`. Parity with the
+[mcp facade](/python/facades/mcp).
+
+### facade::memory
+
+Intentionally **empty** (W-4). The TS `facade/memory.ts` is exactly `export {};`
+and the Python mirror sets `__all__ = []`. This module declares no `pub` symbols —
+it exists only so code written against the legacy `indusagi/memory` subpath keeps
+importing. An M7 acceptance gate asserts exactly that. Real conversational memory
+lives in `crate::runtime`, not here. Parity with the
+[memory facade](/python/facades/memory).
+
+## Feature gates
+
+The `default` feature keeps the full historical surface (`mcp + tui + rustls`), so
+the default build is byte-identical to the prior unconditional dependency set.
+
+| Feature | Default | Gates | Pulls in |
+|---------|---------|-------|----------|
+| `rustls` | yes | TLS backend, forwarded to the merged `reqwest` transport | `reqwest/rustls` |
+| `mcp` | yes | the `interop` module + the facade's `indusagi/mcp` shim | `rmcp`, `http` |
+| `tui` | yes | the `tui` + `tui_render` modules | `ratatui`, `crossterm`, `pulldown-cmark`, `syntect`, `two-face`, `similar`, `lru`, `unicode-width`, `unicode-segmentation` |
+| `composio` | no | the SaaS connector vendor adapter (`connectors_saas::adapter`) | (pure code gate; `reqwest` is already present) |
+| `swarm` | no | the `swarm` module | (pure code gate) |
+| `full` | no | everything at once | `mcp + tui + composio + swarm` |
+
+```toml
+[dependencies]
+indusagi = "0.1.0"                                  # default = rustls + mcp + tui
+
+# minimal core only:
+indusagi = { version = "0.1.0", default-features = false, features = ["rustls"] }
+
+# everything:
+indusagi = { version = "0.1.0", features = ["full"] }
+```
+
+A build without `mcp` drops both the `interop` module and the
+`indusagi::mcp`/`facade::mcp` aliases; a build without `tui` drops the `tui` and
+`tui_render` modules. There is deliberately no `native-tls` feature (reqwest
+0.13.4's native-tls hard-requires an absent crate version).
+
+## Crates and binaries
+
+The Rust edition is a two-crate workspace (plus the `xtask` build helper). The published
+`indusagi` crate is **both** the library and the binary; `indusagi-testkit` is dev-only and
+never published. So `cargo add indusagi` pulls the library and `cargo install indusagi`
+installs the binary.
+
+| Crate | Kind | Purpose |
+|-------|------|---------|
+| `indusagi` | `[lib]` (`name = "indusagi"`, `src/lib.rs`) **and** `[[bin]]` (`name = "indusagi"`, `src/main.rs`) | The single merged framework — every subsystem as a module — plus the only binary in the workspace (`main()` + `ExitCode`, reaching the whole pipeline through `indusagi::shell_app::run`). Published to crates.io. |
+| `indusagi-testkit` | lib, `publish = false` | Dev-only test helpers/fixtures (`ScriptedModel`, the wiremock helper, the render harness) shared across the test suites. Path-only, stripped from the published manifest. |
+
+```bash
+cargo build --release -p indusagi        # builds the `indusagi` binary
+./target/release/indusagi --version          # prints the version
+./target/release/indusagi -p "summarize this repo"
+./target/release/indusagi                    # interactive ratatui REPL (feature `tui`)
+./target/release/indusagi auth login         # OAuth + PKCE login
+```
+
+Back to the [Architecture overview](/rust/architecture), the
+[Runtime subsystem](/rust/subsystems/runtime), or the
+[CLI reference](/rust/reference/cli).

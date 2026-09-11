@@ -1,0 +1,253 @@
+# Context Compaction & Branch Archival
+
+> When a transcript nears the model's context window, the window-budget subsystem condenses the older head into a single structured digest message while keeping the most-recent turns verbatim. Branch archival is the same machinery, scoped to an abandoned branch.
+
+LLMs have finite context windows. The `window-budget` subsystem keeps a long-running session usable by *condensing* older history into one synthetic summary message and preserving a verbatim tail of the recent turns. It answers three questions: **when** are we over budget, **where** do we cut, and **how** do we compress the dropped portion.
+
+## Table of Contents
+
+- [Commands](#commands)
+- [Architecture](#architecture)
+- [Budget — When To Condense](#budget--when-to-condense)
+- [Slice — Where To Cut](#slice--where-to-cut)
+- [Condense — How To Compress](#condense--how-to-compress)
+- [The Condenser Factory](#the-condenser-factory)
+- [Branch Archival](#branch-archival)
+- [Token Estimation](#token-estimation)
+- [The Summary Prompt](#the-summary-prompt)
+- [Conductor Integration](#conductor-integration)
+- [Source Files](#source-files)
+
+## Commands
+
+| Command | Aliases | Effect |
+|---------|---------|--------|
+| `/summarize-context` | `/condense`, `/compact` | Run the conductor's condense path on the live transcript now. |
+
+`/compact [instructions]` accepts trailing guidance: the instructions are first recorded as a session note (so they re-enter the agent's context), then the parameterless condense runs. Auto-compaction also runs on its own when the conductor's `autoCompact` option is on (the default).
+
+## Architecture
+
+The subsystem is three pure pieces tied together by a condenser factory:
+
+| Stage | Question | Module |
+|-------|----------|--------|
+| **Budget** | Is the transcript large enough to condense? | `budget/gate.ts` (`isOverBudget`, `budgetLimit`) |
+| **Slice** | Where do we cut? | `budget/slice.ts` (`planSlice`) |
+| **Condense** | How do we compress the dropped head? | `summarize/condense.ts` (`summarize`) |
+
+The subsystem is exposed on the package's `windowBudget` barrel namespace (see [sdk.md](sdk.md)). Every member below is re-exported from `src/window-budget/index.ts`:
+
+```typescript
+import { windowBudget } from "indusagi-coding-agent";
+
+const {
+  createCondenser,   // factory → a conductor-consumable Condenser
+  condense,          // session-scope summarization of a slice
+  condenseScope,     // branch-scope summarization of a slice
+  isOverBudget,
+  budgetLimit,
+  planSlice,
+  estimateTokens,
+  estimateMessageTokens,
+  prefixTokens,
+  summarize,
+  buildSummaryPrompt,
+  flattenTranscript,
+  CONDENSER_BRIEF,
+} = windowBudget;
+```
+
+## Budget — When To Condense
+
+Thresholds are **configuration, not constants** — there are no baked-in token fingerprints. They come from a `BudgetPolicy`:
+
+```typescript
+interface BudgetPolicy {
+  readonly triggerRatio: number;    // (0, 1]: fraction of the window that triggers a condense
+  readonly keepRecent: number;      // tokens of recent transcript to keep verbatim
+  readonly reserveTokens?: number;  // optional headroom carved off the window first
+}
+```
+
+The trigger limit is computed window-relative:
+
+```
+limit = max(0, contextWindow - reserveTokens) * triggerRatio
+```
+
+`isOverBudget(messages, model, policy)` estimates the transcript's tokens and returns `true` once the estimate **strictly exceeds** that limit. `budgetLimit(model, policy)` returns the raw number for display.
+
+The factory's fallback policy (`DEFAULT_POLICY`), used when the caller supplies none:
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `triggerRatio` | `0.75` | Condense once ~three-quarters of the window is used. |
+| `keepRecent` | `6000` | Keep roughly the last 6k tokens of turns verbatim. |
+| `reserveTokens` | `2048` | Carve a little headroom off the window first. |
+
+## Slice — Where To Cut
+
+`planSlice(messages, policy)` partitions the transcript into a `dropped` prefix (older messages to summarize) and a `kept` suffix (the verbatim recent tail):
+
+```typescript
+interface CondensePlan {
+  readonly cut: number;             // dropped = messages.slice(0, cut)
+  readonly kept: AgentMessage[];    // messages.slice(cut) — verbatim tail
+  readonly dropped: AgentMessage[]; // messages.slice(0, cut) — folded into a summary
+}
+```
+
+The cut is found with a **forward prefix-sum + binary search** (not a backward accumulate-and-snap):
+
+1. Build the cumulative-token array `prefix` (`prefixTokens`), where `prefix[i]` is the token total of `messages[0..i)`.
+2. Binary-search the lower bound of `total - keepRecent` over `prefix` — the first index whose suffix has shrunk to `<= keepRecent` tokens.
+3. **Snap forward** to the nearest legal boundary: a cut may never land on a `toolResult`, because a tool result must stay glued to the assistant turn that issued its `toolCall`.
+
+If the whole transcript already fits within `keepRecent`, or snapping forward consumes everything, `cut` is `0` (nothing condensable — keep it all).
+
+## Condense — How To Compress
+
+`summarize(messages, deps)` is the single condensing primitive. It flattens the dropped messages, asks an injectable model completer to write a structured digest, and returns a synthetic `Summary`:
+
+```typescript
+interface Summary {
+  readonly message: AgentMessage;  // synthetic summary message to splice in
+  readonly coveredCount: number;   // how many source messages it replaces
+}
+```
+
+`SummarizeDeps` (all fields optional, so it is network-free-testable):
+
+| Field | Default | Meaning |
+|-------|---------|---------|
+| `complete` | framework `completeSimple` | The injectable model completer (`CompleteFn`). |
+| `model` | — | Summarization model. **When omitted, a deterministic local digest is used** (no model is guessed). |
+| `scope` | `"session"` | `"session"` (active checkpoint) or `"branch"` (archive). |
+| `priorDigest` | — | An earlier digest to refresh/extend (iterative-refresh / branch carry-in). |
+| `signal` | — | `AbortSignal` forwarded to the completer. |
+| `maxTokens` | — | Cap on the digest size, forwarded as the completer's `maxTokens`. |
+
+The synthetic summary is modeled as a plain `user`-role `AgentMessage` carrying the digest as text, prefixed with a header so a human (and the next condense pass) can tell it apart from a real turn:
+
+- Session digest: `[session digest — older turns condensed]`
+- Branch digest: `[branch digest — archived from a path not taken]`
+
+This is the simplest legal `AgentMessage`: it passes through `convertToLlm` natively, and the conductor splices it straight back into the message list with no special handling.
+
+When no `model` is bound, `summarize` returns a deterministic local fallback digest (a `# Carryover` note recording that N messages were elided, preserving any carried-in prior digest) rather than failing — so a bare/offline build never silently loses the marker.
+
+## The Condenser Factory
+
+`createCondenser(deps)` ties the three pieces into one function that drops straight into the conductor's auto-compaction seam:
+
+```typescript
+import { windowBudget } from "indusagi-coding-agent";
+
+const condenser = windowBudget.createCondenser({ model, complete, policy });
+
+const rebuilt = await condenser(messages);
+// over budget   → [summary.message, ...plan.kept]  (strictly smaller)
+// under budget  → messages  (unchanged — the conductor no-op)
+```
+
+`CondenserDeps`:
+
+```typescript
+interface CondenserDeps {
+  readonly complete?: CompleteFn;   // default: framework completeSimple
+  readonly model?: Model<Api>;      // omit → condensing is a no-op (identity)
+  readonly policy?: BudgetPolicy;   // default: DEFAULT_POLICY
+}
+```
+
+The returned `Condenser` is **structurally compatible** with the conductor's `CondenseFn` (`(messages) => AgentMessage[] | Promise<AgentMessage[]>`), so it plugs in with no adapter. Behavior:
+
+- No `model` bound (window unknown) → return `messages` unchanged.
+- Not over budget → return `messages` unchanged.
+- `planSlice` yields `cut === 0` (nothing to drop) → return `messages` unchanged.
+- Otherwise → `summarize` the dropped head (scope `"session"`) and return `[summary.message, ...plan.kept]`.
+
+## Branch Archival
+
+Branch summarization is **not a separate engine** — it collapses into the same `summarize` core behind a `CondenseScope` flag:
+
+```typescript
+type CondenseScope = "session" | "branch";
+```
+
+- `"session"` — condense the active transcript in place (keep a recent tail, summarize the head).
+- `"branch"` — archive an abandoned branch into one summary message so its context isn't lost on tree navigation; **no verbatim tail is retained**.
+
+`condenseScope(messages, deps)` (and the equivalent `condense(messages, deps)` for the session scope) are thin wrappers that pin the flag and delegate to `summarize`. The only difference between the two is the framing line in the prompt.
+
+## Token Estimation
+
+The meter is a cheap, deterministic heuristic — it does **not** call a tokenizer. `estimateMessageTokens(message)` walks a message's serialized content and applies a small weighting model:
+
+```
+cost = ceil(serialized_chars / 3.6) + framingTokens + images * 1024
+```
+
+The module's own tunables:
+
+| Constant | Value | Purpose |
+|----------|-------|---------|
+| `CHARS_PER_TOKEN` | `3.6` | Serialized chars per token (conservative, skews high). |
+| `IMAGE_TOKENS` | `1024` | Flat cost per inline image (the base64 `data` is never measured). |
+| `MESSAGE_FRAMING_TOKENS` | `4` | Per-message role/turn framing. |
+| `BLOCK_FRAMING_TOKENS` | `2` | Per structured content block. |
+| `TOOLCALL_ENVELOPE_TOKENS` | `6` | Per tool call / tool result envelope. |
+
+The estimator is intentionally conservative (rounds up, adds framing) so the gate fires a little early — overflowing the window is worse than condensing one turn sooner. `estimateTokens(messages)` sums every message; `prefixTokens(messages)` returns the forward cumulative array `planSlice` binary-searches.
+
+## The Summary Prompt
+
+The condenser model is framed as a **transcript recorder**, not a chat participant. The system brief (`CONDENSER_BRIEF`) instructs the model to distill the transcript as archival data — not to reply, continue, run tools, or ask questions.
+
+`buildSummaryPrompt(messages, scope, priorDigest?)` assembles the user turn: a scope framing line, the flattened transcript wrapped in `<scrollback>…</scrollback>`, an optional `<carried-digest>…</carried-digest>`, and the section template the model fills in:
+
+```markdown
+# Objective
+# Guardrails
+# Status (Shipped / Active / Stuck)
+# Rationale
+# Plan
+# Carryover
+```
+
+`flattenTranscript(messages)` renders each message as one-or-more `» role:` lines (`» you`, `» agent`, `» agent.plan`, `» agent.call <name>`, `» tool`, `» tool!err`, `» shell$`, `» note`, `» digest`). This serialization is what prevents the model from treating the input as a live conversation to continue.
+
+## Conductor Integration
+
+The conductor exposes a pluggable condense seam:
+
+```typescript
+type CondenseFn = (
+  messages: AgentMessage[],
+  force?: boolean,
+) => AgentMessage[] | Promise<AgentMessage[]>;
+```
+
+The factory's `Condenser` satisfies this type directly. Relevant `SessionConductorOptions` / `SessionConductor` surface:
+
+| Surface | Effect |
+|---------|--------|
+| `autoCompact` (option) | Condense automatically when the branch nears the window (default `true`). |
+| `condense()` (method) | Manually run the same condense path; emits a `compacted` signal. Safe to call when idle; a no-op when the hook returns the branch unchanged. |
+
+When a condense runs, the conductor emits a `{ kind: "compacted" }` `SessionSignal` so a subscribed UI can re-render. An auto-condense that fails surfaces a typed `ConductorFault` with `kind: "overflow"`.
+
+## Source Files
+
+Internal source (`indus-code-rebuild/src`):
+
+- `window-budget/contract.ts` — `BudgetPolicy`, `TokenEstimate`, `CondensePlan`, `CondenseScope`, `Summary`, `CompleteFn`, `Condenser`, `CondenserDeps`.
+- `window-budget/budget/estimate.ts` — `estimateTokens`, `estimateMessageTokens`, `prefixTokens` and the heuristic constants.
+- `window-budget/budget/gate.ts` — `isOverBudget`, `budgetLimit`.
+- `window-budget/budget/slice.ts` — `planSlice` (forward prefix-sum + binary search).
+- `window-budget/summarize/condense.ts` — `summarize`, `condenseScope`, `SummarizeDeps`.
+- `window-budget/summarize/prompt.ts` — `CONDENSER_BRIEF`, `buildSummaryPrompt`, `flattenTranscript`.
+- `window-budget/condenser.ts` — `createCondenser`, `condense`, `DEFAULT_POLICY`.
+- `conductor/conductor.ts` — the `CondenseFn` seam, `autoCompact`, and `condense()`.
+- `console/slash/commands/transcript.ts` — the `/summarize-context` (`/compact`) command.

@@ -1,0 +1,230 @@
+# Package Exports
+
+> `induscode` exposes two public surfaces: a lazy namespace barrel reached with
+> `import induscode` (re-exporting `VERSION` plus 17 subsystems), and the process
+> entry point `induscode.entry:run` — the function the `pindus` and `induscode`
+> console scripts launch. Real CLI runs go through `entry.run`; the barrel exists
+> for embedding and testing.
+
+## Table of Contents
+
+- [Overview](#overview)
+- [The entry module](#the-entry-module)
+- [The induscode barrel](#the-induscode-barrel)
+- [Subsystem barrels](#subsystem-barrels)
+- [Barrel discipline](#barrel-discipline)
+- [Usage](#usage)
+- [Key concepts](#key-concepts)
+
+## Overview
+
+The importable public surface of `induscode` is defined by exactly two files:
+
+| File | Role |
+| --- | --- |
+| `src/induscode/__init__.py` | Lazy meta-barrel: `VERSION`/`__version__` plus 17 subsystem packages exposed as lazily-imported attributes. |
+| `src/induscode/entry.py` | Process entry: `main()` / `run()` console-script shim that boots the agent. |
+
+`pyproject.toml` maps both console scripts to the entry shim:
+
+```toml
+[project.scripts]
+pindus = "induscode.entry:run"
+induscode = "induscode.entry:run"
+```
+
+The package requires **Python 3.11+** and is built on `indusagi[mcp,tui]`. The
+live binary path is `entry.run` → [`boot.boot`](/python-cli/subsystems/boot) →
+`run_stages` / `select_runner`. The barrel sits *above* the 17 subsystems and is
+the single import site for embedders and tests.
+
+## The entry module
+
+`induscode.entry` exports two names. `main()` does the work and returns an
+`int`; `run()` is the thin shim console scripts bind to.
+
+| Name | Kind | Purpose |
+| --- | --- | --- |
+| `main(argv=None)` | function | Process-level entry. Installs the one-shot `[MCP]` log-noise filter, lazily imports `boot`, and returns `asyncio.run(boot(args))`. Returns the exit code (does **not** raise `SystemExit`) so tests can call it directly. |
+| `run()` | function | The `[project.scripts]` shim. Calls `main()`, flushes stdout, and on `BrokenPipeError` parks stdout on `/dev/null` and treats the run as a clean exit 0; then `sys.exit(code)`. |
+
+```python
+def main(argv: Sequence[str] | None = None) -> int: ...
+def run() -> None: ...
+```
+
+`main()` resolves `argv` to `sys.argv[1:]` when omitted. The MCP-noise filter is
+a single idempotent `logging.Filter` installed on the root logger that drops any
+record carrying the `[MCP]` marker — and is a **no-op when `INDUSAGI_DEBUG` is
+set** (the brand's `env_debug`), so diagnostics are never hidden during
+debugging. The `boot` import is deferred to function scope so `import
+induscode.entry` stays side-effect-light.
+
+The `BrokenPipeError` handling matches the silent-EPIPE behavior expected of a
+Unix CLI: when the reader of stdout goes away (e.g. `pindus --list-models | head`
+closes the pipe), the interpreter's shutdown flush cannot re-raise and the
+process exits 0.
+
+## The induscode barrel
+
+`import induscode` is cheap and side-effect-free. The only eager import is
+`from induscode.workspace import VERSION`; every subsystem is loaded lazily on
+first attribute access via [PEP 562](#key-concepts) `__getattr__`.
+
+| Name | Kind | Source | Purpose |
+| --- | --- | --- | --- |
+| `VERSION` | const | `workspace/brand.py` | Single-sourced package version string, detected from package metadata. |
+| `__version__` | const | `induscode/__init__.py` | Alias of `VERSION` on the top-level module. |
+| `__getattr__` / `__dir__` | function | `induscode/__init__.py` | PEP-562 lazy loaders. `__getattr__` calls `importlib.import_module` for a subsystem from the `_SUBSYSTEMS` map on first access; `__dir__` advertises them. |
+
+`__all__` is computed as `["VERSION", "__version__", *sorted(_SUBSYSTEMS)]`:
+
+```python
+>>> import induscode
+>>> sorted(induscode.__all__)
+['VERSION', '__version__', 'addons', 'boot', 'briefing', 'capability_deck',
+ 'channels', 'conductor', 'console', 'console_slash', 'insight', 'kit',
+ 'launch', 'runtime_bridge', 'sessions', 'settings', 'transcript_export',
+ 'window_budget', 'workspace']
+```
+
+`_SUBSYSTEMS` is the single source of truth: a dict mapping the 17 public
+snake_case attribute names to their subpackage names under `induscode`. Because
+the console shell is loaded lazily, touching `induscode.console` is the only
+thing that pulls in the Textual / react_ink stack.
+
+## Subsystem barrels
+
+Each of the 17 attributes resolves to a subpackage whose own `__init__.py` is a
+barrel with an explicit `__all__`. The table lists each subsystem, a few
+representative public symbols, and the docs page describing it.
+
+| Attribute | Representative exports | Docs |
+| --- | --- | --- |
+| `workspace` | `VERSION`, `BRAND`, `Brand`, `create_workspace`, `Workspace`, `LAYOUT`, `ensure_dirs` | — |
+| `boot` | `boot`, `run_stages`, `STAGES`, `select_runner`, `RUNNERS`, `BootContext`, `create_auth_vault`, `apply_upgrades` | [Boot](/python-cli/subsystems/boot) |
+| `launch` | `read_invocation`, `Invocation`, `run_credential_command`, `start_oauth_login`, `print_model_catalog`, `FLAG_SPECS` | [Launch](/python-cli/subsystems/launch) |
+| `conductor` | `create_session_conductor`, `SessionConductor`, `ConductorState`, `reduce_state`, `TranscriptEntry`, `SessionHead` | [Conductor](/python-cli/subsystems/conductor) |
+| `console` | `mount_console`, `console_reducer`, `init_console_state`, `ConsoleApp`, `ConsoleState`, `ConsoleEvent` | [Console](/python-cli/console/overview) |
+| `console_slash` | `build_registry`, `resolve_slash`, `SlashRegistry`, `SlashCommand`, `Handled`, `Prompt`, `Unknown` | [Slash commands](/python-cli/console/slash-commands) |
+| `channels` | `create_link_server`, `run_oneshot`, `NdjsonFramer`, `define_ops` | [Channels](/python-cli/subsystems/channels) |
+| `capability_deck` | `provision_deck`, `ToolDeck`, `CAPABILITY_CARDS`, `reduce_ledger`, `Capability` | [Capability Deck](/python-cli/subsystems/capability-deck) |
+| `addons` | `create_addon_host`, `AddonManifest`, `EventDispatcher`, `InterceptorChain` | [Addons](/python-cli/subsystems/addons) |
+| `briefing` | `compose_briefing`, `BriefingSection`, `apply_macros`, `gather_skill_cards`, `SkillCard` | [Briefing](/python-cli/subsystems/briefing) |
+| `insight` | `create_recorder`, `InsightRecorder`, `Probe`, `create_collector_sink`, `replay_probes` | [Insight](/python-cli/subsystems/insight) |
+| `window_budget` | `create_condenser`, `condense`, `estimate_tokens`, `plan_slice`, `summarize` | [Window Budget](/python-cli/subsystems/window-budget) |
+| `transcript_export` | `publish_transcript`, `paint_sgr`, `ThemeBridge`, `PAGE_SHELL`, `fold_sgr` | [Transcript Export](/python-cli/subsystems/transcript-export) |
+| `runtime_bridge` | `create_runtime_broker`, `RuntimeBridge`, `claude_cli_bridge`, `codex_cli_bridge`, `NormalizedEvent` | [Runtime Bridge](/python-cli/subsystems/runtime-bridge) |
+| `settings` | `PreferenceStore`, `Preferences`, `DEFAULT_PREFERENCES`, `canonical_key`, `SETTING_KEYS` | [Settings](/python-cli/configuration/settings) |
+| `sessions` | `SessionLibrary`, `SavedSession`, `BranchNode`, `PriorTurn` | [Sessions](/python-cli/subsystems/sessions) |
+| `kit` | `plan_provision`, `build_download_request`, `quote_arg`, `sniff_image_format`, `open_in_external_editor` | — |
+
+A few subsystem relationships worth knowing:
+
+- `boot` re-exports the `workspace` surface (`BRAND`, `Brand`, `Workspace`,
+  `create_workspace`, `ensure_dirs`, `WorkspaceOverrides`), so `induscode.boot`
+  is a one-stop boot import site.
+- `console` re-exports `console_slash` types.
+- `conductor` is the largest barrel (~100 names); it wraps exactly one framework
+  [`Agent`](/python/facades/agent) and exposes the `SessionConductor` that the
+  console, oneshot, and JSON-RPC link all drive.
+- `window_budget` feeds the conductor's `CondenseFn` seam.
+- `capability_deck` builds the `ToolDeck` the conductor consumes; its
+  `Capability` aliases the framework `AgentTool`.
+- `insight` is a thin wrapper over the framework's
+  [tracing](/python/subsystems/tracing) layer (aliasing `Probe` / `Signal` onto
+  the framework `Segment` / `TraceSignal`), not a re-port.
+- `runtime_bridge` is a complete, fully-tested library layer that is **not yet
+  wired into the boot path**.
+
+## Barrel discipline
+
+Every subsystem `__init__.py` follows the same shape: top-of-file
+`from .module import ...` lines, then an explicit alphabetized `__all__`
+re-exporting that subsystem's frozen contract types (signals, faults, state
+dataclasses, schema constants) plus the behavior functions that act on them.
+Consumers import the type surface and behavior from the package — e.g.
+`from induscode.boot import boot, BootContext` — rather than reaching into
+individual modules.
+
+The smallest barrel is `sessions` (4 names: `SessionLibrary`, `SavedSession`,
+`BranchNode`, `PriorTurn`); the largest is `conductor`. Console sub-packages
+(`components`, `input`, `overlays`, `theme`, `slash_commands`) each carry their
+own `__all__` and are reached as `induscode.console.<sub>`.
+
+## Usage
+
+Run the agent through the console script:
+
+```bash
+pindus                     # interactive REPL (repl_runner)
+pindus --version           # short-circuits in boot(), prints VERSION
+pindus --list-models foo   # prints the model catalog filtered by 'foo', exits
+```
+
+Call the entry point from a test or embedder without exiting the process:
+
+```python
+from induscode.entry import main
+
+# main returns an int (does not raise SystemExit), so tests can assert on it.
+exit_code = main(["--version"])   # installs MCP-noise filter, asyncio.run(boot([...]))
+```
+
+Touch the lazy barrel — subsystems are imported only on first access:
+
+```python
+import induscode
+
+print(induscode.VERSION)                            # eager: from workspace import VERSION
+ws = induscode.workspace.create_workspace()         # first touch imports induscode.workspace
+reg = induscode.console_slash.build_registry([])    # console_slash imported lazily here
+# induscode.console is only imported (pulling react_ink / Textual) when first accessed
+```
+
+Mount the interactive console around a conductor:
+
+```python
+from induscode.conductor import create_session_conductor, SessionConductorOptions
+from induscode.console import mount_console
+
+conductor = create_session_conductor(SessionConductorOptions(...))
+exit_code = await mount_console(conductor, scheme="midnight")  # async; returns exit code
+```
+
+For the full flag table behind `read_invocation` see the
+[CLI reference](/python-cli/reference/cli); for how `boot` dispatches a parsed
+invocation to a runner see [Boot](/python-cli/subsystems/boot).
+
+## Key concepts
+
+**Barrel (namespace re-export).** An `__init__.py` whose only job is to import
+from sibling modules and list them in `__all__`, giving consumers one import
+site. The top-level `induscode/__init__.py` is the lazy meta-barrel over 17
+subsystem barrels.
+
+**PEP-562 lazy loading.** Module-level `__getattr__` / `__dir__` in
+`induscode/__init__.py` defer the `importlib.import_module` of each subsystem
+until its attribute is first accessed, keeping `import induscode` cheap and
+avoiding eager Textual / react_ink loads.
+
+**`_SUBSYSTEMS` map.** The dict mapping the 17 public snake_case attribute names
+to their subpackage names — the single source of truth for what `import
+induscode` exposes (plus `VERSION` / `__version__`).
+
+**Console-script shim (`run`).** `entry.run` is the function `pyproject
+[project.scripts]` binds `pindus` and `induscode` to; it wraps `entry.main`
+(which returns an `int`) into a `sys.exit` with silent-EPIPE handling.
+
+**Frozen contract surface.** Each subsystem barrel re-exports a stable set of
+typed contract objects (signals, faults, state dataclasses, schema constants)
+labeled FROZEN in docstrings, plus the behavior functions that act on them — the
+seam other subsystems and the framework integrate against.
+
+`induscode` is the terminal-first AI coding agent built on the
+[indusagi framework](/python/README). State lives under `~/.pindusagi/`; the
+package shares the framework's flat profile directory and the `INDUSAGI`
+environment prefix. See the [architecture overview](/python-cli/architecture)
+for how the importable surface maps onto the runtime, and the
+[parity reference](/python-cli/reference/parity) for its relationship to the TS
+lineage.

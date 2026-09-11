@@ -1,0 +1,565 @@
+# Facade (Public API)
+
+> `indusagi::facade` is the thin compatibility layer that re-exports the legacy
+> `indusagi/{ai,agent,mcp,memory}` subpath vocabulary as ergonomic shims over the
+> already-green core modules. It owns **no** second engine: every shim keeps the
+> old `type`/`role` string tags and camelCase wire fields exactly, while projecting
+> all real work onto [`llmgateway`](/rust/subsystems/llm-gateway),
+> [`runtime`](/rust/subsystems/runtime), [`capabilities`](/rust/subsystems/capabilities),
+> and [`interop`](/rust/subsystems/interop). It also hosts the single shared model
+> catalog and the v3 JSONL session store.
+
+The TypeScript package shipped four subpath exports — `indusagi/ai`,
+`indusagi/agent`, `indusagi/mcp`, `indusagi/memory` — whose entry files were pure
+re-export barrels (`facade/ai.ts` is literally `export * from "./ml/index"`)
+fronting ~28.7k LOC of a *second*, hand-written engine. Per the scoping decision
+that engine is **not** re-ported. The Rust `facade` crate-module is instead a thin
+**translation layer**: it keeps the old public names byte-identical and projects
+everything else onto the green core modules. It is the inverse of the UI bridge —
+where the bridge maps core → old-vocabulary for the renderer, the facade maps
+old-vocabulary ↔ core for callers of the legacy subpaths.
+
+This is the Rust edition of the facades documented for Python
+([ai](/python/facades/ai), [agent](/python/facades/agent),
+[mcp](/python/facades/mcp), [memory](/python/facades/memory)); the two share the
+same projection strategy and the same public name set (the Python port proves
+106 / 97 / 65 names across `ai`/`agent`/`mcp`), but the Rust shims are synchronous,
+`serde`-typed, and carry no async runtime of their own.
+
+## Table of Contents
+
+- [Module map](#module-map)
+- [Where the facade is reached](#where-the-facade-is-reached)
+- [The ai shim](#the-ai-shim)
+- [The agent shim](#the-agent-shim)
+- [The mcp shim](#the-mcp-shim)
+- [The memory shim](#the-memory-shim)
+- [The shared catalog](#the-shared-catalog)
+- [The v3 session store](#the-v3-session-store)
+- [The event stream](#the-event-stream)
+- [Faithfulness boundary](#faithfulness-boundary)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Module map
+
+Defined in `crate::facade` (`facade/mod.rs`), each module fronts exactly one core
+subsystem (or a cross-cutting concern):
+
+| TS subpath        | Rust module                  | Projects onto |
+|-------------------|------------------------------|---------------|
+| `indusagi/ai`     | `facade::ai`                 | [`llmgateway`](/rust/subsystems/llm-gateway) |
+| `indusagi/agent`  | `facade::agent`              | [`runtime`](/rust/subsystems/runtime) + [`capabilities`](/rust/subsystems/capabilities) |
+| `indusagi/mcp`    | `facade::mcp` (feature `mcp`)| [`interop`](/rust/subsystems/interop) |
+| `indusagi/memory` | `facade::memory`             | — (intentionally **empty**) |
+| —                 | `facade::catalog`            | the single shared model catalog ([`llmgateway::catalog`](/rust/subsystems/llm-gateway)) |
+| —                 | `facade::session_v3`         | the append-only v3 JSONL session vocabulary |
+| —                 | `facade::event_stream`       | the multi-cursor producer/consumer event stream |
+
+```rust
+// crate::facade (facade/mod.rs)
+pub mod agent;
+pub mod ai;
+pub mod catalog;
+pub mod event_stream;
+#[cfg(feature = "mcp")]
+pub mod mcp;
+pub mod memory;
+pub mod session_v3;
+
+pub use crate::core::VERSION;
+```
+
+The `mcp` shim sits behind the default-on `mcp` Cargo feature, so a build without
+the protocol bridge drops it; everything else compiles unconditionally.
+
+## Where the facade is reached
+
+The crate root (`lib.rs`) re-surfaces each shim under the legacy subpath name a
+TypeScript consumer reached for, so code written against the old package keeps
+resolving through the single `indusagi` dependency:
+
+```rust
+// crate::lib root barrel
+pub use crate::facade::ai;       // indusagi/ai
+pub use crate::facade::agent;    // indusagi/agent
+#[cfg(feature = "mcp")]
+pub use crate::facade::mcp;      // indusagi/mcp
+pub use crate::facade::memory;   // indusagi/memory
+```
+
+The umbrella version constant is exposed both on the crate root (`indusagi::VERSION`,
+single-sourced from `Cargo.toml`) and re-exported on the facade module
+(`indusagi::facade::VERSION = crate::core::VERSION`) so a caller reaching for the
+legacy package's version constant finds it where the barrel used to put it.
+
+## The ai shim
+
+`facade::ai` (`facade/ai.rs`) re-implements the public surface of the old `ml/`
+engine as thin shims over [`llmgateway`](/rust/subsystems/llm-gateway), keeping the
+TS export names exactly — camelCase wire fields, `type`/`role` string tags. The
+`Model` descriptor is always **derived** from a gateway `ModelCard` via
+`Model::from_card`, so the facade can never stand up a second catalog.
+
+### Vocabulary tables
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `PROVIDER_NAMES` | `&[&str]` | The 24 provider identifiers the catalog recognizes, in source order. |
+| `API_NAMES` | `&[&str]` | The 11 wire-api identifiers wired up by the built-in adapters. |
+| `STOP_REASONS` | `&[&str]` | `["stop", "length", "toolUse", "error", "aborted"]`. |
+| `Provider` / `KnownProvider` / `Api` / `KnownApi` / `StopReason` / `JsonSchema` / `ThinkingLevel` | `type` alias | Vocabulary aliases (`String` / `Value`). |
+
+### Content parts and messages
+
+| Type | Discriminant | Notes |
+|------|--------------|-------|
+| `TextContent` | `type:"text"` | `text`, optional `textSignature`; `TextContent::new`. |
+| `ThinkingContent` | `type:"thinking"` | `thinking`, optional `thinkingSignature`; `ThinkingContent::new`. |
+| `ImageContent` | `type:"image"` | base64 `data` + `mimeType`. |
+| `ToolCall` | `type:"toolCall"` | `id`, `name`, `arguments`, optional `thoughtSignature`. |
+| `UserMessage` | `role:"user"` | `content` (string or parts) + `timestamp`. |
+| `AssistantMessage` | `role:"assistant"` | `content`, `api`, `provider`, `model`, `usage`, `stopReason`, optional `errorMessage`, `timestamp`. |
+| `ToolResultMessage` | `role:"toolResult"` | `toolCallId`, `toolName`, `content`, `isError`, `timestamp`. |
+| `Message` / `AgentMessage` | `Value` | The untyped `role`-tagged JSON union the old barrel exposed. |
+
+### Usage, cost, model, and request shapes
+
+`Usage` (with nested `UsageCost`), `ModelCost`, the derived `Model` descriptor
+(`id`/`name`/`api`/`provider`/`baseUrl`/`reasoning`/`input`/`cost`/`contextWindow`/
+`maxTokens`), the request `Tool` (`name`/`description`/`parameters`) and `Context`
+(`systemPrompt`/`messages`/`tools`) shapes, plus the `Value`-aliased option bags
+(`ThinkingBudgets`, `StreamOptions`, `ProviderStreamOptions`, `SimpleStreamOptions`,
+`OpenAICompletionsCompat`, `OpenAIResponsesCompat`, `OpenRouterRouting`).
+
+`Model::from_card` is the single bridge keeping the registry and the gateway
+catalog in lockstep: cost rates carry through, the core `ApiKind` becomes the old
+`Api` spelling (`facade_api_for`), the vendor `ProviderId` becomes the old
+`Provider` spelling (`facade_provider_for`), and modalities are filtered to the
+`text`/`image` set the old `Model.input` allowed.
+
+### The provider registry
+
+```rust
+pub struct ProviderRegistry { /* … */ }
+impl ProviderRegistry {
+    pub fn new() -> Self;
+    pub fn register(&mut self, provider: ApiProvider, options: RegisterApiProviderOptions);
+    pub fn get(&self, api: &str) -> Option<ApiProviderInternal>;
+    pub fn get_with_metadata(&self, api: &str) -> Option<RegisteredApiProvider>;
+    pub fn list(&self, include_disabled: bool) -> Vec<ApiProviderInternal>;
+    pub fn enable(&mut self, api: &str) -> bool;
+    pub fn disable(&mut self, api: &str) -> bool;
+    pub fn unregister_by_source(&mut self, source_id: &str);
+    pub fn clear(&mut self);
+}
+```
+
+A process-global registry mirrors the same surface as free functions:
+`register_api_provider`, `get_api_provider`, `get_api_provider_with_metadata`,
+`get_api_providers`, `enable_api_provider`, `disable_api_provider`,
+`unregister_api_providers`, `clear_api_providers`, `register_builtin_api_providers`,
+`reset_api_providers`. Supporting records: `ApiProviderMetadata`,
+`RegisterApiProviderOptions`, `ApiProviderInternal` (aliased `ApiProvider`),
+`RegisteredApiProvider`.
+
+### The model registry
+
+```rust
+pub struct ModelRegistry { /* … */ }
+impl ModelRegistry {
+    pub fn new() -> Self;
+    pub fn register_custom_model(&mut self, model: Model);
+    pub fn load_custom_models(&mut self, models: Vec<Model>);
+    pub fn get_model(&self, provider: &str, model_id: &str) -> Result<Model, String>;
+    pub fn try_get_model(&self, provider: &str, model_id: &str) -> Option<Model>;
+    pub fn get_providers(&self) -> Vec<Provider>;
+    pub fn get_models(&self, provider: &str) -> Vec<Model>;
+    pub fn find_models(&self, filters: &ModelSearchFilters) -> Vec<Model>;
+    pub fn estimate_cost(&self, model: &Model, estimate: CostEstimateInput) -> UsageCost;
+    pub fn calculate_cost(&self, model: &Model, usage: &mut Usage) -> UsageCost;
+}
+```
+
+`get_model`/`get_models`/`get_providers`/`try_get_model`/`find_models`/
+`estimate_cost`/`calculate_cost`/`register_custom_model`/`load_custom_models` are
+also exposed as free functions over a global registry. `supports_xhigh` and
+`models_are_equal` round out the helpers; search inputs are `ModelSearchFilters`
+and `CostEstimateInput`.
+
+### Streaming and completion
+
+| Function | Returns | Delegates to |
+|----------|---------|--------------|
+| `stream(model, context)` | `Result<GatewayEventChannel, String>` | `llmgateway::stream_with_card` |
+| `stream_by_api(api, model, context)` | `Result<GatewayEventChannel, String>` | guards `model.api == api`, then `stream` |
+| `complete(model, context).await` | `Result<AssistantMessage, String>` | `llmgateway::complete_with_card` |
+
+`GatewayEventChannel` is `crate::llmgateway::Channel` — the thin shim does not
+re-port the TS streaming adapters, so `stream` hands back the gateway's re-iterable
+channel directly. The `AssistantMessageEvent` / `StreamFunction` / `StreamLogger`
+event-union types are `Value` aliases; a missing backend fails with the
+byte-identical `No streaming backend has been registered for the "<api>" API`.
+
+### Credentials and validators
+
+Environment-key probing: `get_env_api_key`, `resolve_env_api_key`,
+`is_likely_valid_api_key`, `rotate_env_api_key`, the `EnvApiKeyResolution` record,
+and the `SDK_CREDENTIALS_MARKER` sentinel (`"<sdk-managed-credentials>"`) returned
+when a provider authenticates through an SDK credential chain (AWS profiles,
+Google ADC). Type guards and validators: `is_text_content`, `is_thinking_content`,
+`is_image_content`, `is_tool_call`, `is_user_message`, `is_assistant_message`,
+`is_tool_result_message`, `is_message`, `validate_tool`, `validate_message`,
+`validate_context`. Constructors: `create_assistant_message`
+(`CreateAssistantMessageParams`), `create_zero_usage`.
+
+```rust
+use indusagi::ai::{get_model, complete, Context, UserMessage};
+
+let model = get_model("anthropic", "claude-sonnet-4-5")?;
+let ctx = Context {
+    system_prompt: Some("You are helpful.".into()),
+    messages: vec![serde_json::to_value(UserMessage {
+        role: "user".into(),
+        content: serde_json::json!("hello"),
+        timestamp: 0,
+    })?],
+    tools: None,
+};
+let reply = complete(&model, &ctx).await?;
+```
+
+## The agent shim
+
+`facade::agent` (`facade/agent.rs`) is the high-level Agent surface over
+[`runtime`](/rust/subsystems/runtime) + [`capabilities`](/rust/subsystems/capabilities).
+It keeps the facade's mutable `AgentState`, a queue policy, an event bus, the
+message constructors/guards/`convert_to_llm` translator, the message-type registry,
+and the tool factories.
+
+### The Agent handle
+
+```rust
+pub struct Agent { /* … */ }
+impl Agent {
+    pub fn new(options: AgentOptions) -> Self;
+    pub fn state(&self) -> &AgentStateData;
+    pub fn subscribe(&mut self, listener: Box<dyn FnMut(&AgentEvent)>) -> usize;
+    pub fn unsubscribe(&mut self, index: usize);
+
+    pub fn set_system_prompt(&mut self, v: impl Into<String>);
+    pub fn set_model(&mut self, m: Value);
+    pub fn set_thinking_level(&mut self, l: impl Into<ThinkingLevel>);
+    pub fn set_tools(&mut self, tools: Vec<AgentTool>);
+    pub fn set_steering_mode(&mut self, mode: impl Into<QueueMode>);
+    pub fn set_follow_up_mode(&mut self, mode: impl Into<QueueMode>);
+    pub fn replace_messages(&mut self, ms: Vec<AgentMessage>);
+    pub fn append_message(&mut self, m: AgentMessage);
+    pub fn clear_messages(&mut self);
+
+    pub async fn prompt(&mut self, input: impl Into<Value>) -> Result<(), String>;
+    pub async fn continue_run(&mut self) -> Result<(), String>;
+    pub fn steer(&mut self, m: AgentMessage);
+    pub fn follow_up(&mut self, m: AgentMessage);
+    pub async fn wait_for_idle(&self);
+    pub fn abort(&mut self);
+    pub fn reset(&mut self);
+    pub fn clear_steering_queue(&mut self);
+    pub fn clear_follow_up_queue(&mut self);
+    pub fn clear_all_queues(&mut self);
+}
+```
+
+`Agent::default` constructs with `AgentOptions::default`; the model defaults to
+`{ provider: "google", id: "gemini-2.5-flash" }` until swapped. `AgentOptions`
+fields: `initial_state`, `steering_mode`, `follow_up_mode`, `session_id`,
+`thinking_budgets`, `stream_fn` (stored for API parity). `QueueMode` is a `String`
+(`"all"` / `"one-at-a-time"`); the default for both queues is `"one-at-a-time"`.
+
+`AgentStateData` (aliased `AgentState`) is a `Serialize`/`Deserialize` struct with
+the old camelCase wire fields: `systemPrompt`, `model` (a `Value`), `thinkingLevel`,
+`tools`, `messages`, `isStreaming`, `streamMessage`, `pendingToolCalls`, `error`.
+`AgentContext` (`systemPrompt`/`messages`/`tools`) is the request-shape sibling.
+
+### Events
+
+`AgentEvent` is a `#[serde(tag = "type")]` enum with the camelCase payloads the TS
+bus emitted: `AgentStart`, `AgentEnd { messages }`, `TurnStart`,
+`TurnEnd { message, toolResults }`, `MessageStart`, `MessageUpdate`, `MessageEnd`,
+`ToolExecutionStart`, `ToolExecutionUpdate`, `ToolExecutionEnd`. Per-variant type
+aliases (`AgentStartEvent`, `MessageUpdateEvent`, `ToolExecutionEndEvent`, …) keep
+the TS interface names addressable. `AGENT_EVENT_GROUPS` is the grouped name table
+(`agent`/`turn`/`message`/`toolExecution`). The agent-level tool aliases
+`AgentTool`, `AgentToolResult`, `AgentToolUpdateCallback`, `Message`, `StreamFn`
+are `Value`.
+
+### Guards, message kinds, and convert_to_llm
+
+Runtime guards: `is_thinking`, `is_tool_call`, `is_user_message`,
+`validate_message`. The four built-in session-only kinds are `Value` aliases
+(`CustomMessage`, `BranchSummaryMessage`, `CompactionSummaryMessage`,
+`BashExecutionMessage`) with constructors `create_branch_summary_message`,
+`create_compaction_summary_message`, `create_custom_message`, and
+`bash_execution_to_text`, plus the summary delimiter constants
+(`COMPACTION_SUMMARY_PREFIX`/`_SUFFIX`, `BRANCH_SUMMARY_PREFIX`/`_SUFFIX`).
+`convert_to_llm(message)` reduces one facade message to the LLM vocabulary
+(`user`/`assistant`/`toolResult` pass through; `bashExecution` → user text
+respecting the `excludeFromContext` opt-out; `custom` → user message; the two
+summaries are wrapped in their delimiters; everything else is dropped), and
+`default_convert_to_llm(&[AgentMessage]) -> Vec<Message>` is the batch form.
+
+The message-type registry replaces the TS `CustomAgentMessages` declaration-merge:
+`register_message_type`, `unregister_message_type`, `get_message_type`,
+`registered_message_types` (the four built-ins are pre-registered).
+
+### Tool factories and collections
+
+The twelve `create_*_tool` factories bind a [`capabilities`](/rust/subsystems/capabilities)
+built-in to a working directory and project it into the facade `AgentTool` JSON
+surface (`name`/`label`/`description`/`parameters`/`cwd`):
+
+| Factory | Core tool | Singleton |
+|---------|-----------|-----------|
+| `create_read_tool` | `read` | `read_tool` |
+| `create_write_tool` | `write` | `write_tool` |
+| `create_edit_tool` | `edit` | `edit_tool` |
+| `create_ls_tool` | `ls` | `ls_tool` |
+| `create_grep_tool` | `grep` | `grep_tool` |
+| `create_find_tool` | `find` | `find_tool` |
+| `create_bash_tool` | `bash` | `bash_tool` |
+| `create_process_tool` | `process` | `process_tool` |
+| `create_todo_read_tool` | `todo_read` | `todo_read_tool` |
+| `create_todo_write_tool` | `todo_set` | `todo_write_tool` |
+| `create_web_fetch_tool` | `webfetch` | `web_fetch_tool` |
+| `create_web_search_tool` | `websearch` | `web_search_tool` |
+
+Curated collections: `create_coding_tools(root)` (read/bash/edit/write/process/
+todo*/web*), `create_read_only_tools(root)` (read/grep/find/ls/todoread/web*),
+`create_all_tools(root)` (all twelve), plus the cwd-bound `coding_tools()`,
+`read_only_tools()`, `all_tools()` singletons. `create_tool_registry(cwd)` returns a
+`ToolRegistry` with `list_metadata`/`create`/`try_create`/`create_many`; `ToolMetadata`,
+`TOOL_METADATA` (the static `(name, category)` table), `ToolCategory`, `ToolName`,
+`FacadeAgentTool`, and `TodoStore` complete the catalog. `Agent`, the `ThinkingLevel`/
+`ThinkingBudgets` aliases, and the entire `SessionManager` vocabulary are re-exported
+on this module too.
+
+```rust
+use indusagi::agent::{Agent, AgentOptions, AgentEvent, create_coding_tools};
+
+let mut agent = Agent::new(AgentOptions::default());
+agent.set_system_prompt("You are a helpful coding assistant.");
+agent.set_tools(create_coding_tools("/path/to/project"));
+agent.subscribe(Box::new(|ev: &AgentEvent| {
+    let tag = serde_json::to_value(ev).unwrap()["type"].clone();
+    println!("{tag}");
+}));
+agent.prompt("explain this repository").await?;
+```
+
+## The mcp shim
+
+`facade::mcp` (`facade/mcp.rs`, feature `mcp`) connects to MCP servers and uses
+their tools as AgentTools, or exposes this agent's tools as an MCP server — each
+connection a thin shim over the [`interop`](/rust/subsystems/interop) protocol
+bridge (one `MCPClient` per core `ServerEndpointImpl`, one `MCPServer` over the
+provider host). The TS names are kept exactly, camelCase and all.
+
+### Error vocabulary
+
+`MCPErrorCode` is a copy enum whose variants serialize to the exact TS
+screaming-snake strings (`as_str`/`Display`). `MCPError` carries
+`message` + `code` + optional `Value` `details` + server/tool attribution
+(`new`/`with_details`/`with_server`/`with_tool`/`to_json`). Type guards
+`isMCPError`/`isSessionError` and the factory functions `createConnectionError`,
+`createTimeoutError`, `createToolNotFoundError`, `createInvalidParametersError`,
+`createServerError`, `createNotConnectedError`, `createConfigError`,
+`createSchemaConversionError` keep the TS camelCase spellings.
+
+### Client side
+
+```rust
+pub struct MCPClient {
+    pub server_name: String,        // the TS `serverName`
+    pub config: MCPServerConfig,    // the config as supplied
+    pub timeout: f64,               // request timeout in ms
+    /* private: log_handler, roots, endpoint … */
+}
+impl MCPClient {
+    pub fn new(options: MCPClientOptions) -> Self;
+    pub fn from_connection(options: MCPConnectionOptions) -> Self;
+    pub fn connected(&self) -> bool;
+    pub fn roots(&self) -> Vec<MCPRoot>;
+    pub async fn connect(&self) -> Result<(), MCPError>;
+    pub async fn disconnect(&self);
+    pub async fn list_tools(&self) -> Result<Vec<MCPToolDefinition>, MCPError>;
+    pub async fn call_tool(&self, name: &str, args: Value) -> Result<MCPToolCallResult, MCPError>;
+    pub fn set_roots(&self, roots: Vec<MCPRoot>);
+}
+```
+
+`MCPClientPool` manages many clients: `connect_all`, `disconnect_all`,
+`get_client`, `get_all_clients`, `is_connected`, `add_server`, `remove_server`,
+`reload` (over `MCPClientPoolOptions` / `MCPServerStatus`). Config + protocol types:
+`StdioServerConfig`, `HttpServerConfig`, `MCPServerConfig` (with a `to_core`
+translator to `interop`'s `ServerConfig`), `MCPConnectionOptions`,
+`MCPToolDefinition`, `MCPResource`, `MCPPrompt`, `MCPInitializeResult`,
+`MCPClientState`, `MCPToolCallRequest`, `MCPToolCallResult`, `MCPContentBlock`,
+`MCPServerConfigEntry`, `MCPConfigFile`, the logging/progress/elicitation handler
+aliases, `MCPRoot`, `BaseServerOptions`, `MCPClientOptions`.
+
+### Config loaders and schema converters
+
+`loadMCPConfig`, `getUserConfigPath`, `getProjectConfigPath`, `ensureUserConfigDir`,
+`ensureProjectConfigDir`, `saveConfig`, `saveUserConfig`, `saveProjectConfig`,
+`createDefaultConfig`, `EXAMPLE_CONFIG`. TypeBox-equivalent schema converters:
+`jsonSchemaToTypeBox`, `applyPassthrough`, `convertMCPInputSchema`,
+`convertMCPOutputSchema`.
+
+### Server side and tool bridging
+
+The `MCPToolClient` trait, `MCPAgentTool` plus `createMCPAgentToolFactory`,
+`registerMCPToolsInRegistry`, `createMCPToolsMap`, `createMCPToolsRecord` adapt
+remote MCP tools into AgentTools. The provider direction is `MCPServer`
+(`new`/`add_tool`/`remove_tool`/`list_tools`/`descriptors`, returning
+`ToolDescriptor`s from [`capabilities`](/rust/subsystems/capabilities)) built by
+`createMCPServer` over `MCPServerOptions` / `MCPConvertedTool`. `initializeMCP`
+(returning `InitializedMCP`) wires a config into a live fleet.
+
+## The memory shim
+
+`facade::memory` (`facade/memory.rs`) is intentionally **empty**. The TS
+`facade/memory.ts` is exactly `export {};` — a documentation-only phantom — and the
+Python mirror sets `__all__ = []`. The Rust module declares no `pub` items; it is
+re-exported from the crate root only so code written against the legacy
+`indusagi/memory` subpath keeps importing. The agent's actual conversational memory
+lives in the core [`runtime`](/rust/subsystems/runtime), not here.
+
+## The shared catalog
+
+`facade::catalog` (`facade/catalog.rs`) owns **no** card data. It re-exports the
+gateway's one catalog so the `ai` registry and the core agree by construction:
+
+```rust
+pub use crate::llmgateway::catalog::{CardSelection, estimate_cost, get_card, model_cards, models};
+pub use crate::llmgateway::contract::ModelCard;
+```
+
+A drift gate (`#[cfg(test)]`) asserts `facade::catalog::model_cards()` returns the
+*same `&'static` pointer* the gateway hands out — eliminating the silent-drift class
+of bug the TS tree had with two hand-maintained catalogs. See the
+[LLM Gateway](/rust/subsystems/llm-gateway) for the catalog and `ModelCard` details.
+
+## The v3 session store
+
+`facade::session_v3` (`facade/session_v3.rs`) is the append-only v3 JSONL
+`SessionManager` vocabulary, read-compatible byte-for-byte with real TS-written
+session files. The storage model is one JSON object per line: the first line is the
+`SessionHeader` (`{"type":"session","version":3,...}`); every later line is a
+`SessionEntry` carrying `id`/`parentId`/`timestamp`, whose links give the log its
+tree shape. Records are kept as plain `serde_json::Value` maps in the exact TS JSON
+shape (camelCase keys preserved via the `preserve_order` feature), so unknown
+fields survive load → migrate → rewrite losslessly.
+
+```rust
+pub const CURRENT_SESSION_VERSION: u32 = 3;
+
+pub struct SessionManager { /* … */ }
+impl SessionManager {
+    pub fn open(path: &str) -> Self;
+    pub fn create(cwd: &str, parent_session: Option<&str>) -> Self;
+    pub fn in_memory(cwd: &str) -> Self;
+    pub fn continue_recent(cwd: &str, session_dir: Option<&str>) -> Self;
+    pub fn append_message(&mut self, message: Value) -> String;
+    pub fn append_model_change(&mut self, provider: &str, model_id: &str) -> String;
+    pub fn append_thinking_level_change(&mut self, thinking_level: &str) -> String;
+    pub fn append_compaction(/* … */) -> String;
+    pub fn append_custom_entry(&mut self, custom_type: &str, data: Option<Value>) -> String;
+    pub fn append_label_change(/* … */) -> String;
+    pub fn branch_with_summary(/* … */);
+    pub fn context(&self) -> SessionContext;
+    pub fn get_tree(&self) -> Vec<SessionTreeNode>;
+    pub fn get_branch(&self, from_id: Option<&str>) -> Vec<Value>;
+    pub fn get_leaf_id(&self) -> Option<&str>;
+    // open/in_memory/branch/reset_leaf/get_entry/get_children/get_label/… too
+}
+```
+
+Supporting types: `SessionHeader`, `SessionEntryBase`, the `#[serde(tag = "type")]`
+`SessionEntry` enum (`message`/`model_change`/`thinking_level_change`/`compaction`/
+`branch_summary`/`custom`/`custom_message`/`label`/`session_info`), `FileEntry`,
+`SessionTreeNode`, `SessionContext`, `SessionModel`, `SessionInfo`, and the
+`SessionListProgress` callback alias. Free functions rebuild context from raw logs:
+`parse_session_entries`, `load_entries_from_file`, `migrate_session_entries`,
+`get_latest_compaction_entry`, `build_session_context` (with the `LeafSelector`
+enum), `find_most_recent_session`. The default state directory keys off
+`INDUSAGI_AGENT_DIR` / `INDUSAGI_CODING_AGENT_DIR` (checked first, in that order)
+then `INDUSAGI_DIR` (falling back to `.indusvx` under `$HOME`). The session
+vocabulary is re-exported through `facade::agent` — `SessionManager`,
+`CURRENT_SESSION_VERSION`, `SessionHeader`, `SessionEntry`, `FileEntry`,
+`SessionContext`, `SessionInfo`, `SessionTreeNode`, `SessionListProgress`, plus the
+five free functions (`parse_session_entries`, `load_entries_from_file`,
+`migrate_session_entries`, `get_latest_compaction_entry`, `build_session_context`,
+`find_most_recent_session`) — matching where the TS barrel put it. (`SessionEntryBase`,
+`SessionModel`, and the `LeafSelector` enum stay on `facade::session_v3` only.)
+
+## The event stream
+
+`facade::event_stream` (`facade/event_stream.rs`) ports `ml/kit/event-stream.ts`:
+a **multi-cursor** producer/consumer stream. Several consumers (the UI renderer plus
+result awaiters) read the same stream **from the start**, so an `mpsc` would
+silently drop replay; the faithful design is a single shared FIFO buffer plus a
+per-cursor read position, using a `Condvar` so a reader (or a `result()` awaiter)
+blocks with no busy-wait and no executor dependency.
+
+```rust
+pub struct EventStream<T: Clone, R: Clone> { /* … */ }
+impl<T: Clone, R: Clone> EventStream<T, R> {
+    pub fn new<C, E>(is_complete: C, extract_result: E, options: EventStreamOptions) -> Self;
+    pub fn push(&self, event: T);
+    pub fn end(&self, result: Option<R>);
+    pub fn error(&self, reason: impl Into<String>);
+    pub fn cursor(&self) -> EventStreamCursor<T, R>;
+    pub fn result(&self) -> Result<R, String>;
+    pub fn result_with_timeout(&self, timeout_ms: u64) -> Result<R, String>;
+    pub fn history(&self) -> Vec<T>;
+    pub fn is_closed(&self) -> bool;
+}
+```
+
+`EventStreamCursor` (`drain_ready`/`collect_all`) replays from offset `0`;
+`EventStreamOptions` carries the `history_limit` ring-eviction cap. The typed wrapper
+`AssistantMessageEventStream` (built by `create_assistant_message_event_stream`)
+exposes the streaming pump as `push_start`/`push_text_*`/`push_thinking_*`/
+`push_tool_call_*`/`push_done`/`push_error`, with `result`/`result_with_timeout`
+settling the final `AssistantMessage`. All five names (`EventStream`,
+`EventStreamCursor`, `EventStreamOptions`, `AssistantMessageEventStream`, and the
+`create_assistant_message_event_stream` constructor) are re-exported under the `ai`
+barrel (`facade::ai`), where the TS `ml/index` put them.
+
+## Faithfulness boundary
+
+The facade crate-module is a deliberately **thin** layer that does not pull in a
+tokio executor (the event stream and agent loop use `std::sync` primitives). The
+`Agent`'s async methods (`prompt`, `continue_run`, `wait_for_idle`) reproduce the
+synchronous, deterministic surface in full — the mutable `AgentState`, the queue
+policy, event-bus framing, idle signalling, and queue draining — but the live model
+round-trip (the gateway call inside the run loop) is the single recorded async
+parity gap; every observable value-level surface is faithful. Similarly, `ai`'s
+`stream` returns the gateway `Channel` directly rather than re-porting the TS
+streaming adapters, and `mcp` maps every core `ProtocolFault` onto the facade's
+`MCPError` rather than re-porting the hand-rolled JSON-RPC transport.
+
+## Relationship to neighbors
+
+The facade sits one layer above the core. `ai` projects onto
+[`llmgateway`](/rust/subsystems/llm-gateway) (`stream_with_card`,
+`complete_with_card`, the catalog, `ModelCard`/`ApiKind`/`ProviderId`); `agent`
+projects onto [`runtime`](/rust/subsystems/runtime) +
+[`capabilities`](/rust/subsystems/capabilities) (the twelve built-in `DefinedTool`s
+it wraps 1:1); `mcp` projects onto [`interop`](/rust/subsystems/interop)
+(`ServerEndpoint`, `create_provider_host`, `ProtocolFault`). `catalog` re-exports the
+one gateway catalog, and the session/event-stream modules are consumed by the agent
+shim. `memory` is empty by design. The CLI shell
+([`shell_app`](/rust/subsystems/runtime)) and the broader crate layering are
+covered in the [Architecture overview](/rust/architecture).
+
+Back to the [Architecture overview](/rust/architecture).

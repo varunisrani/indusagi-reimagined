@@ -1,0 +1,190 @@
+# Transcript Export
+
+> `induscode`'s self-contained-HTML transcript publisher. It renders a session's messages into a single standalone HTML file — markdown through markdown-it-py, fenced code through Pygments, terminal-styled tool output painted to safe spans, all baked into a base64 payload at publish time so the page opens with zero external dependencies. Reach it with `from induscode.transcript_export import publish_transcript`, or from a live session with the [`/export`](/python-cli/console/slash-commands) slash command.
+
+The transcript-export subsystem turns a coding-session transcript — a list of framework messages — into one HTML document that can be written to disk and opened directly in a browser with nothing else loaded. It owns three concerns end to end: **painting** terminal-styled (ANSI/SGR) tool output into HTML spans, **computing** export colors from a theme token bag via a precomputed WCAG relative-luminance lookup table, and **assembling** a themed page-shell template whose `{{TOKEN}}` slots are filled at publish time. The page ships fully rendered — all markdown, highlighting, SGR spans, and tool widgets are already built and stored as a base64 JSON payload, so the embedded client script only decodes and injects HTML rather than parsing anything in the browser.
+
+## Table of Contents
+
+- [What This Owns](#what-this-owns)
+- [The Public Surface](#the-public-surface)
+- [Publishing a Transcript](#publishing-a-transcript)
+- [The Table-Driven SGR Painter](#the-table-driven-sgr-painter)
+- [The Theme Bridge](#the-theme-bridge)
+- [The Page Shell and Slots](#the-page-shell-and-slots)
+- [Content-Part Dispatch](#content-part-dispatch)
+- [The /export Slash Command](#the-export-slash-command)
+- [Faults](#faults)
+- [Source Layout](#source-layout)
+
+## What This Owns
+
+Publishing is a pure, synchronous render: in goes a `Sequence[PublishEntry]` (each a narrow view of a framework message), out comes one `<!doctype html>` string. There is no I/O inside the subsystem — the single file write belongs to the caller. Five modules layer cleanly:
+
+| Module | Concern |
+|--------|---------|
+| `contract.py` | The **frozen type surface** — dataclasses and inert constants only; no string assembly, no theme math. Every behavior module is written against names declared here. |
+| `sgr.py` | The **ANSI/SGR painter** — a three-stage pipeline (`tokenize_sgr` → `fold_sgr` → `paint_sgr`) that converts a terminal byte stream into HTML-escaped text and styled `<span>` runs. |
+| `theme_bridge.py` | The **export color service** — parses CSS colors, reads WCAG luminance from a 256-entry LUT, reports light/dark mode, derives surface variants, and projects tokens to `--x-*` CSS custom properties. |
+| `template.py` | The **standalone page** — `PAGE_SHELL`, `PAGE_STYLES`, the JS `CLIENT_SCRIPT`, and `fill()` which substitutes only the known `{{TOKEN}}` slots. |
+| `publish.py` | The **orchestrator** — `publish_transcript` wires the markdown + Pygments pipeline, renders each entry, base64-encodes the turns, resolves the theme, and fills the shell. |
+
+It builds on the [indusagi framework](/python/README) only through [`indusagi.ai`](/python/facades/ai): `contract.py` imports `TextContent` and `ImageContent` and aliases them as `TranscriptPart` / `MessagePart`, so a persisted transcript node round-trips into the publisher without a parallel content type. The publisher never imports the framework message union — it reads `role` / `content` / `toolCallId` / `toolName` structurally through its own `PublishMessage` view and dispatches on each content part's `type` tag.
+
+## The Public Surface
+
+Everything is re-exported from `induscode.transcript_export.__all__` — import from the package root, never from individual files.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `publish_transcript` | function | `publish.py` | Top-level entry: render a `Sequence[PublishEntry]` (+ optional `PublishOptions`) to a complete standalone HTML document string. |
+| `paint_sgr` | function | `sgr.py` | Convert a raw ANSI/terminal byte stream into HTML-escaped text and styled `<span>` runs; drives `tokenize_sgr` + `fold_sgr` end to end. |
+| `tokenize_sgr` | function | `sgr.py` | Split a terminal stream into an ordered `list[SgrToken]` of text runs and SGR command sequences; drops non-SGR CSI sequences. |
+| `fold_sgr` | function | `sgr.py` | Fold one SGR numeric parameter list into a running `SgrState` via `SGR_CODE_TABLE`; handles the parametric 38/48 introducers inline. Pure. |
+| `SGR_CODE_TABLE` | const | `sgr.py` | Read-only `MappingProxyType[int, SgrMutation]` — the fixed-meaning SGR dispatch table. |
+| `create_theme_bridge` | function | `theme_bridge.py` | Factory the publisher calls; builds a `DefaultThemeBridge` over an optional `ExportTheme` (falls back to `FALLBACK_EXPORT_THEME`). |
+| `DefaultThemeBridge` | class | `theme_bridge.py` | Concrete `ThemeBridge`: methods `luminance` / `mode` / `derive_surface` / `readable_ink` / `to_css_vars` resolve export colors. |
+| `build_luminance_lut` | function | `theme_bridge.py` | Build the 256-entry sRGB→linear lookup table for the per-channel step of the WCAG luminance formula. |
+| `parse_color` / `format_color` | function | `theme_bridge.py` | Parse a CSS color (`#rgb`/`#rrggbb`/`#rgba`/`#rrggbbaa`, `rgb()`/`rgba()`) into an `Rgb`, or render an `Rgb` back to `#rrggbb`. |
+| `PAGE_SHELL` / `PAGE_STYLES` / `CLIENT_SCRIPT` | const | `template.py` | The page shell string with `{{TOKEN}}` markers, the inlined stylesheet (reads `--x-*` properties), and the JS client renderer. |
+| `fill` | function | `template.py` | Replace each known `{{TOKEN}}` in a template with its supplied `SlotValues` value (walks `SHELL_SLOTS`, not an open scan). |
+| `MARKDOWN_LICENSE` / `HIGHLIGHT_LICENSE` | const | `publish.py` | Verbatim MIT (markdown-it-py) and BSD-2-Clause (Pygments) notices, inlined into the `MARKED_LIB` / `HIGHLIGHT_LIB` slots. |
+
+The contract module also exports the type surface: `SgrState` / `SGR_INITIAL_STATE`, `SgrTextToken` / `SgrCommandToken` / `SgrToken`, `SgrMutation`, `ExportTheme` / `FALLBACK_EXPORT_THEME`, `Rgb`, `LuminanceLut`, `ThemeMode`, the `ThemeBridge` protocol, `TranscriptPart` / `MessagePart` / `ThinkingPart` / `ToolCallPart`, `PublishRole` / `PublishMessage` / `PublishEntry`, `PublishOptions`, `WidgetRender`, `SHELL_SLOTS` / `ShellSlot`, and the re-exported `BriefingFault` / `BriefingFaultKind` / `briefing_fault`.
+
+## Publishing a Transcript
+
+`publish_transcript(entries, opts=None)` is synchronous. It builds a `ThemeBridge`, configures the markdown renderer once, renders every entry to a turn, serializes the turns into a base64 payload, projects the theme into the `THEME_VARS` block, and returns `fill(PAGE_SHELL, slots)`.
+
+```python
+from induscode.transcript_export import (
+    publish_transcript, PublishEntry, PublishMessage, PublishOptions,
+)
+
+entries = [
+    PublishEntry(role="user", message=PublishMessage(role="user", content="Fix the **bug** in `app.py`")),
+    PublishEntry(role="assistant", message=PublishMessage(role="assistant", content="Done:\n```python\nprint('ok')\n```")),
+]
+html = publish_transcript(entries, PublishOptions(title="Session Transcript"))
+open("transcript.html", "w", encoding="utf-8").write(html)
+```
+
+`PublishOptions` is fully optional — every field defaults:
+
+| Field | Default | Purpose |
+|-------|---------|---------|
+| `theme` | `FALLBACK_EXPORT_THEME` | Override the export color palette. |
+| `title` | `"Session Transcript"` | Document title for the published page. |
+| `out_dir` | `None` | Directory hint for the file (the write itself is the caller's). |
+| `widgets` | `()` | Pre-rendered custom-tool blocks (`WidgetRender`), keyed by `callId` and spliced in by tool-call id. |
+
+Prose runs through a `MarkdownIt("commonmark")` instance with the `table` and `strikethrough` rules enabled; fenced code is routed through Pygments by a custom `fence` / `code_block` render rule (`_highlight_code` → `_emit_xhl`), which maps the `String` / `Number` / `Comment` / `Keyword` / `Literal` token families onto the page's `xhl-*` classes (`String` / `Number` are matched before their `Literal` parent). An unrecognized language is guessed; a highlighting failure falls back to plain escaped code so a published page never breaks on an exotic snippet.
+
+## The Table-Driven SGR Painter
+
+ANSI styling is treated as **data, not control flow**. Each handled SGR code maps to an `SgrMutation` (a partial `SgrState`) in `SGR_CODE_TABLE`; extending the machine means adding a table row, never editing a switch. The pipeline is three stages:
+
+1. `tokenize_sgr` splits the raw terminal stream into an alternation of text runs (`SgrTextToken`) and SGR parameter lists (`SgrCommandToken`), dropping any CSI sequence whose final byte is not `m`.
+2. `fold_sgr` folds one SGR parameter list over a running `SgrState` via the dispatch table. The 30–37 / 40–47 / 90–97 / 100–107 color ranges resolve from a built-in 16-color palette; the parametric 38/48 extended-color introducers (24-bit and 256-index) are read inline by a small reader, not from the table.
+3. `paint_sgr` wraps each text run in a `<span>` carrying `sgr-*` classes and inline color styles, resolving inverse-swap and hidden-conceal at render time, and emits plain runs bare.
+
+```python
+from induscode.transcript_export import paint_sgr
+
+# bold red 'error' then reset
+print(paint_sgr("\x1b[1;31merror\x1b[0m: build failed"))
+# -> '<span class="sgr-bold" style="color:#c14a4a">error</span>: build failed'
+```
+
+Palette colors are concrete CSS strings (e.g. ANSI red is `#c14a4a`), so the emitted spans are self-contained — the page never needs to ship an ANSI palette to render them. A reset (`SGR 0`) returns the machine to `SGR_INITIAL_STATE`.
+
+## The Theme Bridge
+
+`DefaultThemeBridge` holds a resolved `ExportTheme` (a frozen 10-token color bag — `pageSurface` / `cardSurface` / `noteSurface` / `ink` / `inkMuted` / `accent` / `border` / `userRole` / `agentRole` / `toolRole`, all camelCase, wire-facing) and a `LuminanceLut`. Its methods resolve every color query the publisher makes:
+
+| Method | Purpose |
+|--------|---------|
+| `luminance(color)` | WCAG relative luminance (0–1) of a CSS color; unparseable input reads 0. |
+| `mode()` | `'light'` if the page surface luminance is at or above the fixed midpoint threshold, else `'dark'`. |
+| `derive_surface(base, amount)` | Step every channel of a base color by a signed amount (positive lightens, negative darkens); unparseable bases fall through to the card surface. |
+| `readable_ink(background)` | Pick whichever of `ink` / `inkMuted` has the higher WCAG contrast against a background. |
+| `to_css_vars()` | Project the theme to its CSS custom properties, keyed by token name. |
+
+The luminance read is fast because the per-channel sRGB→linear step is precomputed once by `build_luminance_lut()` into a 256-entry table — a read is three table lookups plus the weighted sum (`0.2126 R + 0.7152 G + 0.0722 B`), never a `pow` per channel.
+
+```python
+from induscode.transcript_export import create_theme_bridge, FALLBACK_EXPORT_THEME
+
+bridge = create_theme_bridge(FALLBACK_EXPORT_THEME)
+bridge.mode()                        # -> 'dark'
+bridge.luminance("#13161c")          # WCAG relative luminance, 0..1
+bridge.derive_surface("#1b1f27", 12) # lighten card surface by 12
+bridge.to_css_vars()                 # {'pageSurface': '#13161c', ...}
+```
+
+When the active UI supplies no export colors, `FALLBACK_EXPORT_THEME` — this rebuild's own deep-slate dark palette — is used.
+
+## The Page Shell and Slots
+
+`PAGE_SHELL` is the standalone HTML page string, carrying closed `{{TOKEN}}` placeholders. `SHELL_SLOTS` is a frozen `MappingProxyType` of slot key → `{{TOKEN}}` name; `fill()` does literal `str.replace` only over those known slot names, so any stray `{{...}}` in user content is left untouched:
+
+| Slot key | Token | Filled with |
+|----------|-------|-------------|
+| `themeVars` | `THEME_VARS` | The `--x-*` CSS custom-property block, hyphenated from the theme (`pageSurface` → `--x-page-surface`). |
+| `pageSurface` / `cardSurface` / `noteSurface` | `PAGE_SURFACE` / `CARD_SURFACE` / `NOTE_SURFACE` | Resolved surface colors. |
+| `styles` | `STYLES` | `PAGE_STYLES` — the inlined stylesheet (`.turn` / `.tool-frame` / `.aside-note` / `sgr-*` / `xhl-*` class families). |
+| `script` | `SCRIPT` | `CLIENT_SCRIPT` — the JS that decodes the payload and injects each turn into `#xscript-root`. |
+| `payload` | `PAYLOAD` | The base64-encoded JSON of rendered turns. |
+| `markedLib` / `highlightLib` | `MARKED_LIB` / `HIGHLIGHT_LIB` | The markdown-it-py and Pygments license notices, verbatim. |
+
+The turns are rendered to HTML *at publish time*, JSON-serialized, and base64-encoded into the `PAYLOAD` slot. The embedded `CLIENT_SCRIPT` only decodes and injects the already-built HTML — it parses no markdown and highlights no code in the browser. This is what makes the file parser-free and dependency-free.
+
+## Content-Part Dispatch
+
+`_render_entry` dispatches each `PublishEntry`'s content parts on their `type` tag:
+
+- **text** — markdown for user/assistant turns; for `tool` turns, ANSI-bearing text is SGR-painted inside a `<pre class="tool-frame">`, plain text is escaped into the same frame.
+- **image** — an inline `data:` URI `<img>` from an `ImageContent` part.
+- **thinking** — a `ThinkingPart` is rendered as a muted `aside-note`, not prose.
+- **toolCall** — a `ToolCallPart` (structurally compatible with the framework's `ToolCall`) renders as a labeled invocation frame showing the call name and pretty-printed arguments.
+
+A tool-result entry is first checked against the `WidgetRender` index keyed by `toolCallId`; if a pre-rendered custom-tool block exists, it is spliced in whole. `system` and `condense` roles become standalone notes; all other roles become styled turn cards. The published `PublishRole` set is `user` / `assistant` / `tool` / `system` / `condense` / `note`.
+
+## The /export Slash Command
+
+The primary in-app consumer is `induscode.console.slash_commands.integrations`, which backs `/export [path]`. It reads the live messages from the [conductor](/python-cli/subsystems/conductor), projects them onto `PublishEntry` / `PublishMessage` via `_to_publish_entries`, calls `publish_transcript(..., PublishOptions(title="Session Transcript"))`, and writes the result to disk.
+
+```bash
+# induscode REPL
+/export                    # writes transcript-<timestamp>.html into the workspace
+/export docs/session.html  # writes to an explicit (relative-to-cwd) path
+```
+
+With no argument the command writes a timestamped `transcript-<stamp>.html` into the working directory; an explicit `path` is resolved relative to the current directory. Exporting an empty transcript returns a typed "Nothing to export yet" report rather than writing a file. See [Slash Commands](/python-cli/console/slash-commands) for the full command surface.
+
+## Faults
+
+Faults are shared with the [briefing](/python-cli/subsystems/briefing) subsystem and stay briefing-owned: `BriefingFault` / `BriefingFaultKind` / `briefing_fault` are imported from `induscode.briefing.contract` and re-exported here, so the closed fault set (which includes the `publish` and `theme` kinds) lives in exactly one place. `publish_transcript` wraps any assembly failure as `briefing_fault("publish", ...)` and raises it:
+
+```python
+from induscode.transcript_export import publish_transcript, BriefingFault
+
+try:
+    html = publish_transcript(entries)
+except BriefingFault as fault:
+    print(fault.kind)   # 'publish'
+```
+
+## Source Layout
+
+```
+src/induscode/transcript_export/
+├── __init__.py        # public barrel — import the surface from here
+├── contract.py        # frozen types + inert constants (SgrState, ExportTheme, PublishEntry, SHELL_SLOTS, ...)
+├── sgr.py             # the table-driven SGR painter (tokenize_sgr / fold_sgr / paint_sgr / SGR_CODE_TABLE)
+├── theme_bridge.py    # the export color service (DefaultThemeBridge, build_luminance_lut, parse_color)
+├── template.py        # PAGE_SHELL / PAGE_STYLES / CLIENT_SCRIPT / fill
+└── publish.py         # publish_transcript orchestrator + license notices
+```
+
+Related reading: the [conductor](/python-cli/subsystems/conductor) (which owns the live transcript this subsystem renders), [sessions](/python-cli/subsystems/sessions) (on-disk transcript persistence), [briefing](/python-cli/subsystems/briefing) (the shared fault contract), and the framework [AI facade](/python/facades/ai) (the `TextContent` / `ImageContent` content parts).

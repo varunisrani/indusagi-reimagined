@@ -1,0 +1,27 @@
+# Windows Notes
+
+> The console runs on Windows; a couple of features that shell out to platform tools are reduced.
+
+The interactive console itself is cross-platform. The notes below cover where Windows behaves differently from macOS / Linux.
+
+## Shell escape
+
+A `!`/`!!` line runs through Node's `spawn(command, { shell: true })`, so it uses the operating system's default shell — `cmd.exe` on Windows. There is no `shellPath` preference and no bundled bash; the command you type is interpreted by the default Windows shell. Write commands accordingly (for example, `dir` rather than `ls`), or run the console inside a bash-providing environment (Git Bash, MSYS2, or WSL) whose shell becomes the default for that process.
+
+## Clipboard image paste
+
+`Ctrl+V` clipboard image paste is not available on Windows. The capture path only implements macOS (`pngpaste` / `osascript`) and Linux (`wl-paste` / `xclip`); on Windows the capture returns nothing and the console shows "No image on the clipboard." See [terminal-setup.md](terminal-setup.md) for the supported platforms.
+
+## Managed native helpers
+
+When the console downloads a managed native helper, it resolves the binary name with the `.exe` suffix on Windows automatically — no configuration needed.
+
+## External editor
+
+`Ctrl+G` resolves the editor from `$VISUAL`, then `$EDITOR`, then `vi`. On Windows set one of these to an editor available on your `PATH`, for example:
+
+```
+set EDITOR=code --wait
+```
+
+A bare `vi` fallback may not exist on a stock Windows install, so setting `$EDITOR` is recommended there.

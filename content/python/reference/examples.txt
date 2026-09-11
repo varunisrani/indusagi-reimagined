@@ -1,0 +1,272 @@
+# Examples
+
+> `examples/` is a suite of fifteen self-contained, live-running demo programs (plus a
+> `run_all.py` harness) that exercise every public surface of the `indusagi` Python
+> framework. Each demo is a single `asyncio.run(main())` program — run one with
+> `.venv/bin/python examples/01_basic_agent.py`, or the whole suite with
+> `.venv/bin/python examples/run_all.py`.
+
+The demos are pure consumers: they import only from the public top-level packages
+(`indusagi.agent`, `indusagi.ai`, `indusagi.runtime`, `indusagi.llmgateway`,
+`indusagi.capabilities`, `indusagi.interop`, `indusagi.tracing`, `indusagi.swarm`,
+`indusagi.smithy`) and never reach into private modules. Each script prints its
+progress, asserts what it claims, and ends with `DEMO PASS: <name>` on success.
+
+## Table of Contents
+
+- [The fifteen demos](#the-fifteen-demos)
+- [Running the suite](#running-the-suite)
+- [Two agent APIs](#two-agent-apis)
+- [Live vs offline](#live-vs-offline)
+- [Smallest agent (01)](#smallest-agent-01)
+- [Custom tool (03)](#custom-tool-03)
+- [Gateway floor (15)](#gateway-floor-15)
+- [Conventions and gotchas](#conventions-and-gotchas)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## The fifteen demos
+
+Every script is a numbered `NN_*.py` next to `run_all.py`. The subsystem column
+links to the page that documents the surface each demo drives.
+
+| # | Script | Demonstrates | Subsystem |
+|---|--------|--------------|-----------|
+| 01 | `01_basic_agent.py` | Smallest agent: resolve a model, send one prompt, read the settled `AssistantMessage` and its token/cost accounting. | [Agent](/python/facades/agent) |
+| 02 | `02_streaming_events.py` | Agent-less direct streaming via `indusagi.ai.stream()`; watch the typed event framing (`start`→`text_start`→`text_delta`→`text_end`→`done`), multi-cursor replay, then `await stream.result()`. | [AI](/python/facades/ai) |
+| 03 | `03_custom_tool_agent.py` | Author a custom tool with `ToolSpec`/`define_tool`, register it, and let the model call it mid-run. | [Capabilities](/python/subsystems/capabilities) |
+| 04 | `04_steering_and_abort.py` | Mid-run steering and abort+salvage; steering-queued-at-start runs live, mid-run steering and abort run offline via a scripted gateway seam. | [Agent](/python/facades/agent) |
+| 05 | `05_coding_agent.py` | Full-privilege coding agent (`create_coding_tools`) writing and running `calc.py` in a sandbox; event stream proves `write` + `bash` ran. | [Agent](/python/facades/agent) |
+| 06 | `06_readonly_researcher.py` | Least-privilege researcher (`create_read_only_tools`) that answers from planted files but is structurally incapable of mutating them. | [Agent](/python/facades/agent) |
+| 07 | `07_mcp_agent.py` | MCP in both directions — an in-memory provider host/endpoint and a stdio bridge (`mount_protocol_bridge`) grafting a FastMCP server into a runtime agent. | [Interop](/python/subsystems/interop) |
+| 08 | `08_traced_agent.py` | Tracing a live run to NDJSON: `Recorder`/`SignalChannel`/`FileSink` + `trace_agent_run`, then parsing the trace back and asserting `run`/`inference` segments. | [Tracing](/python/subsystems/tracing) |
+| 09 | `09_orchestrator_workers.py` | Orchestrator/workers fan-out/fan-in: one orchestrator decomposes a task, three workers run concurrently, an aggregator synthesizes. | [Agent](/python/facades/agent) |
+| 10 | `10_pipeline_agents.py` | Sequential pipeline of role-specialized agents (Writer → Critic → Editor), each stage feeding the next. | [Agent](/python/facades/agent) |
+| 11 | `11_debate_judge.py` | Adversarial panel: two debaters argue concurrently, a judge picks the winner with a content-overlap check on the verdict. | [Agent](/python/facades/agent) |
+| 12 | `12_swarm_crew.py` | The real swarm engine network-free: `create_crew`, dep-gated `TaskDraft`s, atomic `TicketBoard.claim` races, `Channel` cursors, state persisted to disk. | [Swarm](/python/subsystems/swarm) |
+| 13 | `13_large_swarm_mapreduce.py` | LLM map-reduce: 10 workers summarize seeded files concurrently behind an `asyncio.Semaphore(5)`, one reducer merges the results. | [Swarm](/python/subsystems/swarm) |
+| 14 | `14_smithy_agent_builder.py` | Smithy builds an agent: scripted `create_forge` interview, `define_agent` persona, blueprint serialize/validate round-trip + `BlueprintError`, then the minted agent runs live. | [Smithy](/python/subsystems/smithy) |
+| 15 | `15_gateway_direct.py` | Zero-SDK floor: `llmgateway.stream()`/`complete()` raw emissions, `get_card`/`models`/`full_catalog` queries, and `estimate_cost` of real usage. | [LLM Gateway](/python/subsystems/llm-gateway) |
+
+> Note: the bundled `README.md` lists a few historical filenames (`03_custom_tool.py`,
+> `04_steering_abort.py`, `10_pipeline.py`, `13_large_swarm_map_reduce.py`) that drift
+> from disk. The on-disk names in the table above are authoritative.
+
+## Running the suite
+
+All live demos make real Anthropic calls (model `claude-haiku-4-5`, tiny prompts), so a
+valid key is required and runs cost real (tiny) cents.
+
+```bash
+# required by the live demos
+export ANTHROPIC_API_KEY="sk-ant-..."
+
+# recommended: point the package state dir at a throwaway sandbox so
+# demos never touch your real ~/.pindusagi (demos 09-13 setdefault it)
+export INDUSAGI_HOME=/tmp/pindusagi-demos
+
+# run one demo
+.venv/bin/python examples/14_smithy_agent_builder.py
+
+# or the whole suite, in order
+.venv/bin/python examples/run_all.py
+```
+
+`run_all.py` globs `examples/[0-9][0-9]_*.py`, runs each via `sys.executable` (inheriting
+stdout and the current environment), streams output live, **stops at the first failure**,
+and prints a PASS/FAIL summary table. Its exit code is `0` (all run scripts passed) or `1`
+(a script failed). A non-zero exit from any demo — an `AssertionError` or `RuntimeError` —
+counts as `FAIL`; the suite halts and lists the not-run scripts.
+
+| Symbol | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `main` | async function | every `NN_*.py` | The demo's single entry point; runs the scenario, asserts, prints `DEMO PASS: <name>`. |
+| `run_all.main` | function | `run_all.py` | Globs the numbered scripts, runs each in a subprocess, stops at first failure, prints the summary; returns the process exit code. |
+
+## Two agent APIs
+
+The demos deliberately mix the two coexisting agent surfaces. They are **not**
+interchangeable — the message shapes differ, which is why each script reimplements its own
+text-extraction helper.
+
+| Surface | Entry | Drive | Read result |
+|---------|-------|-------|-------------|
+| Facade `indusagi.agent.Agent` | `Agent()` + `set_model`/`set_system_prompt`/`set_tools` | `await agent.prompt(text)` | `agent.state.messages[-1]` — an `AssistantMessage` with `.content` (parts where `type=='text'`), `.stopReason`, `.usage` (`.input`/`.output`/`.totalTokens`/`.cost.total`) |
+| Core `indusagi.runtime` | `create_agent(AgentConfig(model=..., system=..., tools=box))` | `await agent.submit(text)` → `RunSnapshot` | `snapshot.phase=='settled'`, `snapshot.messages` of `UserTurn`/`AssistantTurn` with `.blocks` (where `kind=='text'`), `snapshot.usage_total`, `snapshot.error` |
+
+Facade demos (01, 03, 04, 05, 06, 09, 10, 11, 13) read facade message dataclasses; core
+demos (07, 08, 14) read `RunSnapshot` turns/blocks. The streaming/gateway demos (02, 15)
+skip agents entirely and fold the raw event/emission stream themselves.
+
+## Live vs offline
+
+Roughly eleven demos make real model calls; three regimes run fully offline by replacing
+the gateway/spawn seam with a deterministic in-process script.
+
+| Mode | Demos | How |
+|------|-------|-----|
+| Live Anthropic (`claude-haiku-4-5`) | 01, 02, 03, 05, 06, 07-B, 08, 09, 10, 11, 13, 14 | Real wire calls; assert against planted *assertable tokens* (`pong`, `6`, `XYZZY`, `Mara Voss`/`1987`, `FORGED`, all-caps codewords). |
+| In-memory MCP | 07-A | `create_provider_host` + `create_server_endpoint` over `mcp.shared.memory` streams — no subprocess, no network. |
+| Scripted gateway | 04 (mid-run + abort), 12 | The `gateway_stream` seam (or an injected `spawn_agent`/fake `submit`) is replaced with hand-built `Emission`s / canned `RunSnapshot`s. |
+
+Demo 04 documents that live mid-run steering and live abort-mid-tool currently break
+against the real Anthropic wire (a mid-run splice clears the pending tool calls — a later
+settling tool faults the run with "tool_settled for unknown call" — and re-invokes without
+cancelling the in-flight stream or supplying a `tool_result`). Only steering queued at run
+start is exercised live; the other regimes are pinned via the in-process mock, mirroring
+`tests/agent/test_agent_steering.py` and `tests/agent/test_agent_abort_salvage.py`.
+
+## Smallest agent (01)
+
+The canonical "hello agent": resolve a model from the catalog, build a facade `Agent`, send
+one prompt, and read the settled reply with its token and USD accounting.
+
+```python
+import asyncio
+from indusagi.agent import Agent
+from indusagi.ai import get_model
+
+
+async def main() -> None:
+    agent = Agent()
+    agent.set_model(get_model("anthropic", "claude-haiku-4-5"))
+    agent.set_system_prompt("You are a terse assistant. Follow instructions exactly.")
+    await agent.prompt("Reply with exactly one word: pong")
+
+    # The run settled and the agent is quiet again.
+    assert agent.state.isStreaming is False
+    assert agent.state.error is None
+
+    reply = agent.state.messages[-1]            # the AssistantMessage
+    assert reply.stopReason == "stop"
+    usage = reply.usage
+    print(usage.input, usage.output, usage.totalTokens, f"${usage.cost.total:.6f}")
+
+
+asyncio.run(main())
+```
+
+The `pong` token is asserted exactly, and the demo asserts `usage.input`, `usage.output`,
+and `usage.totalTokens` are all positive.
+
+## Custom tool (03)
+
+Author a tool with `ToolSpec`/`define_tool`, register it, hand it to a facade `Agent`, and
+let the model call it mid-run. The `dice_roll` body returns `(sides % 7) + 1` so a 12-sided
+roll is deterministically `6` — an assertable result for a live model.
+
+```python
+import asyncio
+from typing import Any
+from indusagi.agent import Agent
+from indusagi.ai import get_model
+from indusagi.capabilities import (
+    TextContentBlock, ToolContext, ToolRegistry, ToolResult, ToolSpec, define_tool,
+)
+
+
+async def roll(input: dict[str, Any], ctx: ToolContext) -> ToolResult:
+    v = (int(input["sides"]) % 7) + 1
+    return ToolResult(content=[TextContentBlock(text=f"rolled {v}")])
+
+
+tool = define_tool(ToolSpec(
+    name="dice_roll",
+    description="roll a dice",
+    parameters={"type": "object",
+                "properties": {"sides": {"type": "integer"}},
+                "required": ["sides"]},
+    run=roll,
+))
+
+
+async def main() -> None:
+    reg = ToolRegistry().register(tool)
+    agent = Agent()
+    agent.set_model(get_model("anthropic", "claude-haiku-4-5"))
+    agent.set_tools([reg.get("dice_roll")])
+
+    events: list = []
+    agent.subscribe(events.append)
+    await agent.prompt("Roll a 12-sided dice with dice_roll and report the number.")
+
+    started = [e.toolName for e in events if getattr(e, "type", None) == "tool_execution_start"]
+    print(started)  # ['dice_roll']
+
+
+asyncio.run(main())
+```
+
+## Gateway floor (15)
+
+The lowest layer, no agent and no AI facade: drive `indusagi.llmgateway` directly over a
+`Conversation`, fold the raw `Emission` union, then query the catalog and price the usage.
+
+```python
+import asyncio
+from indusagi.llmgateway import (
+    Conversation, UserTurn, TextBlock, DoneEmission, TextEmission,
+    complete, estimate_cost, get_card, models, stream,
+)
+from indusagi.llmgateway.catalog import full_catalog
+
+
+async def main() -> None:
+    card = get_card("claude-haiku-4-5")
+    conv = Conversation(turns=(UserTurn(blocks=(TextBlock(text="Write a haiku."),)),))
+
+    reply = None
+    async for em in stream("claude-haiku-4-5", conv):
+        if isinstance(em, TextEmission):
+            print(em.delta, end="")
+        elif isinstance(em, DoneEmission):
+            reply = em.reply
+
+    print("\nmodels:", len(list(models())),
+          "providers:", len({r.provider for r in full_catalog()}),
+          "cost:", estimate_cost(card, reply.usage))
+
+
+asyncio.run(main())
+```
+
+Demo 15 also runs `complete()` as a one-shot folded reply and asserts that the text deltas
+land strictly between stream start and the terminal `DoneEmission`, and that
+`estimate_cost(...)` of the real usage is positive.
+
+## Conventions and gotchas
+
+- **`DEMO PASS` sentinel.** A script prints `DEMO PASS: <name>` only after every assert
+  succeeds; `run_all.py` treats a non-zero exit (an `AssertionError`/`RuntimeError`) as
+  `FAIL` and stops there.
+- **Per-file text helpers.** `message_text`/`assistant_text`/`final_text`/`reply_text` are
+  local helpers, not framework API. They differ between the facade shape (`.content` parts,
+  `type=='text'`) and the core shape (`.blocks`, `kind=='text'`) — copy the one that matches
+  the API the demo uses.
+- **Abort resolves, never raises.** `prompt()`/`submit()` resolve even on abort; the failure
+  lives in `state.error` (it mentions "abort"), the partial is salvaged into history with
+  `stopReason=='aborted'` plus a zero-usage stand-in error message, and the agent stays
+  reusable.
+- **Costs real cents.** Live demos hardcode `claude-haiku-4-5` and assert
+  `usage.cost.total`/`estimate_cost(...) > 0`, so they need a valid key.
+- **First-failure stop.** `run_all.py` halts at the first failing script rather than running
+  the rest; the summary lists how many were skipped.
+- **Sandbox the state dir.** `export INDUSAGI_HOME=/tmp/pindusagi-demos` keeps runs off
+  `~/.pindusagi`; demos 09–13 `os.environ.setdefault` it.
+- **`calc.py` is detritus.** The `calc.py` file beside the demos is written by demo 05's
+  sandbox run (the file it asks the model to create), not a demo of its own.
+
+## Relationship to neighbors
+
+The suite mirrors the `tests/` tree: 04 follows the agent steering and abort-salvage tests,
+07 follows the interop test, and 12 follows the swarm test — each demo is the runnable,
+narrated companion to a pinned test. Through them the examples exercise every public layer:
+the [AI](/python/facades/ai) facade and [Agent](/python/facades/agent) facade, the
+[Capabilities](/python/subsystems/capabilities) tool kernel, the
+[Runtime](/python/subsystems/runtime) conductor, the
+[LLM Gateway](/python/subsystems/llm-gateway) floor, [Interop](/python/subsystems/interop),
+[Tracing](/python/subsystems/tracing), [Swarm](/python/subsystems/swarm), and
+[Smithy](/python/subsystems/smithy).
+
+For the broader layering, see the [Architecture overview](/python/architecture); to run the
+shipped binary instead, see the [CLI](/python/reference/cli) and
+[Getting Started](/python/getting-started).

@@ -1,0 +1,463 @@
+# Addons
+
+> The addons layer is `induscode`'s loadable-extension contract — it discovers, loads, registers, and folds locally-authored extensions under a workspace's `.indus/addons` directory into one conflict-resolved runtime of lifecycle hooks, tool-boundary interceptors, contributed slash commands, and contributed tools, with every fault isolated so one broken addon never aborts the others. Reach it as `induscode::addons`. The big port delta: the TypeScript layer compiled arbitrary TypeScript in-process (jiti); Rust has no analogue, so the [`ModuleLoader`](#discovery-and-loading) seam survives but its default implementation is **tiered** — declarative TOML now (Tier 0, data not code), a subprocess JSON-RPC host next (Tier 1, feature-gated), WASM components deferred (Tier 2).
+>
+> An addon records, never mutates. Its single `register` entry point describes intent onto a per-addon [`AddonApi`] surface; the [`AddonHost`](#hosting-addons) reads each [`RegisteredManifest`] back out and folds the four contribution streams — subscriptions, interceptors, commands, tools — into one shared registry, then builds the [`EventDispatcher`](#the-event-dispatcher) and [`InterceptorChain`](#the-tool-interceptor-chain) over it. Every failure path is captured as a typed [`AddonFault`] routed to listeners rather than raised.
+
+## Table of Contents
+
+- [Layout and Reachability](#layout-and-reachability)
+- [The Tiered Loading Story](#the-tiered-loading-story)
+- [Authoring a Tier-0 Addon](#authoring-a-tier-0-addon)
+- [The Registration Surface](#the-registration-surface)
+- [The Manifest and the Declarative Loader](#the-manifest-and-the-declarative-loader)
+- [Discovery and Loading](#discovery-and-loading)
+- [Hosting Addons](#hosting-addons)
+- [The Event Dispatcher](#the-event-dispatcher)
+- [The Tool Interceptor Chain](#the-tool-interceptor-chain)
+- [Slash Commands and Framework Handles](#slash-commands-and-framework-handles)
+- [The Sandbox](#the-sandbox)
+- [Subagents](#subagents)
+- [Faults](#faults)
+- [Public Surface](#public-surface)
+- [Parity Notes](#parity-notes)
+
+## Layout and Reachability
+
+The subsystem is the Rust port of `indus-code-rebuild/src/addons` (PLAN/75). It lives in the `induscode` crate under `src/addons/` and is built in layers, all written against one frozen type seam (`contract.rs`):
+
+| Module | Role |
+|--------|------|
+| `contract` | The frozen type surface every other module is written against — [`Addon`], [`AddonManifest`], the [`AddonApi`] limited-surface trait, the [`HookEvent`] taxonomy, the interceptor enter/exit types, [`SubagentProfile`], [`AddonFault`], the [`ModuleLoader`] trait. Declares *only* shapes plus a handful of inert minters ([`AddonId::new`], [`AddonFault::new`], [`RegisteredManifest::empty`]) — no I/O, no loading, no dispatch. Composes (never re-declares) framework anchors: `indusagi::capabilities::{Tool, ToolResult}`. |
+| `host` | The assembly point — discovery (`discover_addons`/`discover_sources`), the per-addon [`RecordingSurface`], and the fold into an [`AddonBundle`] carrying the dispatcher + chain. |
+| `manifest` | The Tier-0 declarative `manifest.toml` schema ([`AddonDescriptor`]) and the v1 default [`DeclarativeLoader`]. |
+| `dispatch` | The two runtimes: the [`EventDispatcher`] (observe/transform/gate fan-out) and the [`InterceptorChain`] (tool-boundary enter/exit), plus the `subscription`/`interceptor` minters. |
+| `sandbox` | The capability policy ([`SandboxPolicy`], FS denied by default) plus the runtime-agnostic path-hygiene helpers (`scrub_invisible`/`expand_path`/`resolve_path`). |
+| `subagents` | Subagent profiles + crew/ticket-board coordination over [`indusagi::swarm`](/rust/subsystems/swarm) (feature `swarm`). |
+
+`mod.rs` is the public face of the crate's addon surface — the contract types and the runtime entry points are re-exported through it:
+
+```rust
+pub use contract::{
+    ADDON_MANIFEST_FIELD, ADDONS_DIR, Addon, AddonApi, AddonCommand, AddonDiscovery, AddonFault,
+    AddonFaultKind, AddonFaultListener, AddonId, AddonManifest, AddonSource, AddonTool,
+    CommandContext, DispatchOutcome, EnterOutcome, EventSubscription, ExecOutcome, ExitOutcome,
+    FrameworkHandles, GateDecision, HookEvent, HookHandler, HookKind, InterceptResult,
+    ModuleLoader, Payload, RegisteredManifest, SubagentProfile, ToolEnterContext, ToolExitContext,
+    ToolInterceptor, ToolMatch,
+};
+
+pub use dispatch::{EventDispatcher, InterceptorChain};
+pub use host::{AddonBundle, AddonHost, AddonHostDeps, AddonRegistry};
+pub use manifest::{AddonDescriptor, ManifestError};
+
+#[cfg(feature = "swarm")]
+pub use subagents::SubagentCrew;
+```
+
+`induscode` ships the `indusr` (and `indusagir`) binary; for the product overview see the [induscode CLI README](/rust-cli). The framework workspace (`indusagi`) is **frozen** — the addon layer composes it, never modifies it.
+
+## The Tiered Loading Story
+
+The one thing that does **not** survive the port verbatim is `ModuleLoader.load` = "compile arbitrary TypeScript". Rust runs no JS — there is no jiti, no virtual-module bridge, no `alias` injection of host namespace objects. The [`ModuleLoader`] trait stays; its default implementation is tiered (PLAN/75 §4):
+
+- **Tier 0** — the declarative TOML loader ([`DeclarativeLoader`], the v1 default). *Data, not code:* a `manifest.toml` is parsed into contributions; nothing third-party executes in-process, so there is no escape surface. This is the only tier shipped today.
+- **Tier 1** — a subprocess JSON-RPC host (behind a feature; a typed stub at present). The fault seams in [`EventDispatcher`] and [`InterceptorChain`] (`report` / `handler_fault`) are retained precisely for this tier, whose handler RPC *can* fail.
+- **Tier 2** — WASM components: explicitly **deferred**.
+
+This is a strict *upgrade* over the TS lineage, which ran addon code in the host process with full ambient authority. Because Tier 0 executes no third-party closure, a `register` "throw" (the TS `Register` fault) cannot occur for it — the host's `Register` fault kind is reserved for the in-proc tiers.
+
+## Authoring a Tier-0 Addon
+
+A Tier-0 addon is a directory holding a `manifest.toml`, dropped under `<workspace>/.indus/addons/`. The manifest declares an `id`, an optional `version`, declarative slash-command aliases, and declarative event gate policies. There is **no executable body** — a command's effect is a shell `exec` string run through the session's [`FrameworkHandles::exec`] (the same gate the native `bash` tool goes through), and a gate is a *rule*, not a closure.
+
+```toml
+# <workspace>/.indus/addons/safety/manifest.toml
+id = "safety"
+version = "1.0.0"
+
+[[command]]
+name = "deploy"
+summary = "run the project deploy script"
+exec = "./scripts/deploy.sh"
+
+[[gate]]
+event = "tool:before"
+match-tool = "bash"
+reason = "blocked by safety addon"
+```
+
+The host loads this with the [`DeclarativeLoader`], whose produced [`AddonManifest::register`] is *the agent's own replay closure* — it captures the parsed (cloned) contributions and records them onto whatever surface the host hands it. It holds no third-party code, so it cannot throw.
+
+## The Registration Surface
+
+The host hands each addon a fresh surface (concrete: [`RecordingSurface`]) scoped to that addon's [`AddonId`] and the session's [`FrameworkHandles`]. The surface is the trait [`AddonApi`] — the deliberately-narrow "limited API surface" an addon reaches the framework through. Each method *records* a contribution; nothing dispatches, loads, or resolves conflicts at this stage.
+
+```rust
+pub trait AddonApi: Send {
+    fn id(&self) -> &AddonId;
+    fn on(&mut self, event: HookEvent, handler: HookHandler);
+    fn intercept_tool(&mut self, match_: ToolMatch, enter: Option<EnterFn>, exit: Option<ExitFn>);
+    fn add_command(&mut self, name: String, summary: String, run: CommandFn);
+    fn add_tool(&mut self, card: AddonTool);
+    fn handles(&self) -> &FrameworkHandles;
+    fn manifest(self: Box<Self>) -> RegisteredManifest;
+}
+```
+
+| Method | Records |
+|--------|---------|
+| `on(event, handler)` | An [`EventSubscription`] — a [`HookHandler`] bound to a [`HookEvent`], stamped with the owning [`AddonId`]. |
+| `intercept_tool(match_, enter, exit)` | A [`ToolInterceptor`] — an enter/exit stage pair for a [`ToolMatch`] (a named tool or `Any`). The `match_`/`addon` provenance fields are filled by the surface. |
+| `add_command(name, summary, run)` | An [`AddonCommand`] (no leading slash, a one-line summary, a `run` callback). The `addon` field is filled by the surface. |
+| `add_tool(card)` | An [`AddonTool`] — an `Arc<dyn Tool>` from [`indusagi::capabilities`](/rust/subsystems/capabilities), supplied directly, not wrapped. |
+| `handles()` | Read-only access to the [`FrameworkHandles`] the addon may act through at registration time. |
+| `manifest()` | Consumes the surface (`self: Box<Self>`) and returns the accumulated [`RegisteredManifest`] for the host to fold. |
+
+[`RecordingSurface`] realizes the central stance: each `on` / `intercept_tool` / `add_command` / `add_tool` call appends to the accumulating [`RegisteredManifest`] (seeded by [`RegisteredManifest::empty`]), stamping every shape with the owning [`AddonId`] so a later fault is attributable.
+
+## The Manifest and the Declarative Loader
+
+`manifest.rs` owns the *schema* of a Tier-0 addon plus the v1 default [`ModuleLoader`]. The canonical filename a directory must hold is `MANIFEST_FILENAME = "manifest.toml"`.
+
+[`AddonDescriptor`] is the parsed shape — `id`, optional `version`, and the two data-only contribution kinds:
+
+```rust
+pub struct AddonDescriptor {
+    pub id: String,
+    pub version: Option<String>,
+    pub commands: Vec<CommandDescriptor>,  // TOML [[command]]
+    pub gates: Vec<GateDescriptor>,        // TOML [[gate]]
+}
+```
+
+- [`CommandDescriptor`] — `name` (no leading slash), `summary`, an optional `exec` shell string. `AddonDescriptor::into_manifest` records each as a real [`AddonCommand`] whose `run` invokes the declared `exec` through `ctx.handles.exec` (the raw `args` are appended so the command can take arguments). A command with no `exec` (or no exec handle) is an inert no-op that still lists in the palette.
+- [`GateDescriptor`] — an `event` ([`HookEvent`]), an optional `match-tool` name, and a `reason`. Each is recorded as a [`HookHandler::Gate`]: for a `tool:before` gate carrying `match-tool`, the gate returns `{ stop: true, reason }` *only* when the running tool's name matches the [`Payload::Tool`]; an unconditional gate (no `match-tool`) stops the event whenever it fires; a tool-scoped gate against a non-tool payload never fires.
+
+`AddonDescriptor::parse` deserializes the TOML and validates: the `id` must be non-empty (the host attributes faults to it) and every `[[command]]` must declare a non-empty `name`. Failures surface as [`ManifestError`] (`Toml` for malformed TOML, `Invalid` for an empty id / name).
+
+[`DeclarativeLoader`] is the stateless v1 [`ModuleLoader`]. Given an entry path that is either a directory holding `manifest.toml` or the manifest file itself, it reads + parses + validates and returns the [`AddonManifest`]. A bare `.ts`/`.js` path is **not** loadable here (it has no runtime to compile it) — the loader rejects it with [`LoaderError::Unsupported`] naming the tier the author must pick. There is **no code execution**: a parse / I/O failure is the only failure mode, surfaced as a [`LoaderError`] the host turns into an [`AddonFault`] of kind [`Load`](#faults).
+
+## Discovery and Loading
+
+`discover_sources(&AddonDiscovery)` walks `<workspace>/.indus/addons` one level deep via `discover_addons`, then concatenates any `explicit_paths`, collapses duplicate paths (first wins), and stamps each surviving path with a derived [`AddonId`] into an [`AddonSource`].
+
+```rust
+pub struct AddonDiscovery {
+    pub workspace: Option<PathBuf>,     // the root whose .indus/addons is scanned
+    pub dir: Option<String>,            // override the per-workspace dir (defaults to ADDONS_DIR)
+    pub explicit_paths: Vec<PathBuf>,   // additional absolute entry paths, loaded as-is
+}
+
+pub const ADDONS_DIR: &str = ".indus/addons";          // verbatim from the lineage
+pub const ADDON_MANIFEST_FIELD: &str = "indusAddon";   // package.json entry pointer (back-compat)
+```
+
+`discover_addons(dir)` recognizes three top-level shapes, skipping hidden (dot-prefixed) entries and sorting results for a deterministic load order; a missing/unreadable directory yields an empty list rather than an error:
+
+1. A **directory holding `manifest.toml`** → the Tier-0 canonical shape; resolves to the directory itself (the [`DeclarativeLoader`] reads the manifest from it).
+2. A **bare module file** carrying one of `ENTRY_EXTENSIONS` (`.ts`/`.tsx`/`.mts`/`.cts`/`.js`/`.mjs`/`.cjs`) → resolved to its path for the loader to *decide the tier* (the [`DeclarativeLoader`] rejects it; a future tier resolves it).
+3. A **package directory** declaring an entry via the `indusAddon` field in `package.json`, or holding a conventional `index.*` — recognized for back-compat; resolves to a Tier-1 subprocess, never an in-proc import.
+
+`derive_addon_id` stamps the id: a directory entry uses its own folder name; a conventional `index.*` uses the enclosing folder name; otherwise the file's own stem. The full path is the ultimate uniqueness guarantee.
+
+Loading is abstracted behind the injectable [`ModuleLoader`] trait — `async fn load(&self, path) -> Result<AddonManifest, LoaderError>`. The default is the [`DeclarativeLoader`]; a test injects a scripted fake with no disk and no compilation:
+
+```rust
+use induscode::addons::{AddonManifest, ModuleLoader};
+use induscode::addons::contract::LoaderError; // LoaderError lives in `contract`, not re-exported at `addons`
+use std::path::Path;
+
+struct FakeLoader { table: std::collections::HashMap<std::path::PathBuf, AddonManifest> }
+
+#[async_trait::async_trait]
+impl ModuleLoader for FakeLoader {
+    async fn load(&self, path: &Path) -> Result<AddonManifest, LoaderError> {
+        self.table.get(path).cloned().ok_or_else(|| LoaderError::Unsupported {
+            path: path.to_path_buf(), detail: "no scripted addon".into(),
+        })
+    }
+}
+```
+
+## Hosting Addons
+
+[`AddonHost`] is the assembly point. Build one with `create_addon_host(AddonHostDeps)`; the loader is the seam a test overrides, the [`FrameworkHandles`] are threaded into every surface and command context, and the reserved-action set defaults to `RESERVED_ACTION_NAMES`.
+
+```rust
+pub struct AddonHostDeps {
+    pub loader: Box<dyn ModuleLoader>,
+    pub handles: Arc<FrameworkHandles>,
+    pub reserved_actions: Option<Vec<String>>,
+}
+
+pub const RESERVED_ACTION_NAMES: &[&str] = &["help", "quit", "exit", "clear", "model", "compact"];
+```
+
+`load_all(discovery)` discovers, loads, registers, and folds every addon, then returns the wired [`AddonBundle`]. `load_one(source)` is public so a host can graft an explicitly-resolved addon (e.g. an always-on bundled one) without directory discovery. `on_fault(listener)` registers a fault listener and returns an idempotent unsubscribe.
+
+```rust
+use induscode::addons::{AddonDiscovery, AddonHostDeps, FrameworkHandles};
+use induscode::addons::host::create_addon_host; // `create_addon_host` lives in `host`
+use std::sync::Arc;
+
+let mut host = create_addon_host(AddonHostDeps {
+    loader: Box::new(induscode::addons::manifest::DeclarativeLoader::new()),
+    handles: Arc::new(FrameworkHandles::default()),
+    reserved_actions: None,
+});
+
+let _unsub = host.on_fault(Arc::new(|f| eprintln!("addon fault: {f}")));
+
+let bundle = host.load_all(AddonDiscovery {
+    workspace: Some("/abs/path/to/workspace".into()),
+    dir: None,
+    explicit_paths: vec![],
+}).await;
+
+// Wire bundle.dispatch into the agent's event points,
+// bundle.interceptors into the tool boundary,
+// surface bundle.commands + bundle.tools.
+```
+
+The per-source pipeline isolates each step:
+
+1. **Load** — resolve the source path through the injected loader. A load failure becomes an [`AddonFault`] (`kind: Load`, attributed to the source id, carrying the [`LoaderError`] as `cause`) and the source is skipped.
+2. **Register** — mint a [`RecordingSurface`] scoped to the addon's id (the manifest's declared `id` wins; the source-derived id is the fallback) and the host's handles, then `register` against it.
+3. **Fold** — read the surface's [`RegisteredManifest`] and merge its four streams into the host registry.
+
+The fold preserves registration order across addons, so the dispatcher's middleware order and the chain's onion order equal load order. Subscriptions and interceptors append unconditionally. Commands and tools are name-checked against the claimed sets — `claimed_commands` is *seeded with the reserved names*, so an addon command named `help` is rejected with a `Conflict` fault distinct from a duplicate-command conflict; tools dedupe on `Tool::name()`. First claimant wins.
+
+```rust
+pub struct AddonRegistry {
+    pub subscriptions: Vec<EventSubscription>,  // load order = dispatch order
+    pub interceptors: Vec<ToolInterceptor>,     // load order = onion order
+    pub commands: Vec<AddonCommand>,            // name-deduped, first-claimant-wins
+    pub tools: Vec<AddonTool>,                  // name-deduped
+}
+
+pub struct AddonBundle {
+    pub dispatch: EventDispatcher,
+    pub interceptors: InterceptorChain,
+    pub commands: Vec<AddonCommand>,
+    pub tools: Vec<AddonTool>,
+    pub loaded: Vec<AddonId>,
+}
+```
+
+`host.registry()` exposes the merged registry at any point before bundling consumes it. The dispatcher and chain built by `bundle()` are wired to the host's *same* fault sink, so a later dispatch/chain runtime fault reaches the listeners registered before `load_all` ran. The fault sink guards every listener with `catch_unwind` so a panicking listener cannot break fan-out to the others.
+
+## The Event Dispatcher
+
+[`EventDispatcher`] is one fan-out / transform / veto engine over the unified colon-named taxonomy. It is built once from the host's folded [`EventSubscription`]s; per `dispatch` it walks an event's subscriptions in registration order. The handler kind selects behavior:
+
+- **`HookHandler::Observe`** — fire-and-forget; sees a clone of the live payload, returns nothing, cannot alter or veto.
+- **`HookHandler::Transform`** — returns a replacement [`Payload`] threaded forward into every later handler and back to the caller.
+- **`HookHandler::Gate`** — returns a [`GateDecision`]; the first `stop: true` short-circuits the walk into [`DispatchOutcome::gate`]. A non-stopping decision continues the chain.
+
+The [`HookEvent`] vocabulary is a real exhaustive enum that (de)serializes to the colon-segmented wire names (`tool:before`, `chat:params`, …) for manifest parity:
+
+| Event | Gate-bearing (`guards`) | Meaning |
+|-------|-------------------------|---------|
+| `session:start` / `session:end` | — | A session opened / closed. |
+| `turn:start` / `turn:end` | — | An assistant turn began / settled. |
+| `tool:before` / `tool:after` | `tool:before` | Straddle a single tool execution. |
+| `chat:params` | — | The model request options being built. |
+| `chat:message` | — | An assistant message was assembled. |
+| `shell:env` | — | The environment for a shell action being prepared. |
+| `input:submit` | yes | User input entering the loop. |
+| `context:build` | — | The message context being assembled. |
+| `compact:build` | — | The condensed summary being built. |
+| `compact:before` | yes | The transcript about to be condensed. |
+
+Unlike the TS layer, which dispatched `unknown` and re-narrowed in each handler, the Rust [`Payload`] is a checked enum keyed by event group (`Tool { name, args }`, `Chat { params }`, `Message`, `Shell { env }`, `Input { text }`, `Context { messages }`, `Compact { reason }`, `Lifecycle`) — so a handler can't be wired to the wrong shape and the transform fold is type-checked. This is additive parity, not a divergence — same events, same observe/transform/gate semantics.
+
+The **gate-bearing** set is data-sourced from `HookEvent::guards()` — a single `matches!` on the enum (the Rust analogue of the TS `EVENT_TRAITS` table). Reclassifying an event is a one-line edit. The dispatcher exposes the derived set as `EventDispatcher::reserved()`; a gate decision is *reported* for any event, but only the reserved set (`tool:before`, `input:submit`, `compact:before`) are the ones the host is *expected* to act on.
+
+```rust
+use induscode::addons::dispatch::{subscription, EventDispatcher};
+use induscode::addons::{AddonId, HookEvent, HookHandler, Payload};
+
+let disp = EventDispatcher::new(vec![
+    subscription(AddonId::new("demo"), HookEvent::ChatParams,
+        HookHandler::Transform(Box::new(|p| Box::pin(async move {
+            match p {
+                Payload::Chat { .. } => Payload::Chat { params: serde_json::json!({ "temperature": 0 }) },
+                other => other,
+            }
+        })))),
+]);
+
+let out = disp.dispatch(HookEvent::ChatParams,
+    Payload::Chat { params: serde_json::json!({ "temperature": 1 }) }).await;
+// out.payload is the transformed Chat; out.gate is None.
+```
+
+The in-proc boxed closures return infallible futures, so the Tier-0 reduce cannot synthesize a handler fault — the fault seam (`report` / `handler_fault`) is retained for the Tier-1 subprocess loader, whose handler RPC *can* fail. `dispatch.has(event)` queries whether any addon subscribed.
+
+## The Tool Interceptor Chain
+
+[`InterceptorChain`] folds the matching [`ToolInterceptor`] stages around a single tool execution as a reduce. A stage's `match_` is `ToolMatch::Named(name)` or `ToolMatch::Any`:
+
+1. **enter, forward.** Each matching stage's `enter` runs in registration order, returning an [`EnterOutcome`]: `Continue` (leave args unchanged), `Rewrite(Value)` (replace the decoded args), or `Block(GateDecision)` (veto the call). A block short-circuits — no later enter runs, the tool never executes, and the [`InterceptResult`] carries `blocked` with `result == None`.
+2. **execute, once.** With the final (possibly rewritten) args, the real tool runner is invoked exactly once.
+3. **exit, reverse.** Each matching stage's `exit` runs in *reverse* order (onion: the first-entered stage wraps outermost), returning an [`ExitOutcome`]: `Continue` or `Rewrite(ToolResult)`. A rewrite threads into the next earlier stage.
+
+When no stage matches, `execute` runs directly with the original args.
+
+```rust
+use induscode::addons::dispatch::{interceptor, InterceptorChain};
+use induscode::addons::{AddonId, EnterOutcome, ToolEnterContext, ToolMatch};
+use induscode::addons::contract::ToolResultProducer; // `ToolResultProducer` lives in `contract`
+
+let chain = InterceptorChain::new(vec![
+    interceptor(AddonId::new("demo"), ToolMatch::Named("bash".into()),
+        Some(Box::new(|_ctx| Box::pin(async {
+            EnterOutcome::Rewrite(serde_json::json!({ "safe": true }))
+        }))),
+        None),
+]);
+
+let exec: ToolResultProducer = Box::new(|args| Box::pin(async move {
+    indusagi::capabilities::ToolResult::text(format!("ran with {args}"))
+}));
+
+let out = chain.run(
+    ToolEnterContext { tool: "bash".into(), call_id: "1".into(), args: serde_json::json!({}) },
+    exec,
+).await;
+// out.result is Some(...), out.blocked is None.
+```
+
+The chain ships two run variants. `run(ctx, execute)` takes a `'static` [`ToolResultProducer`] — the host-level boundary, where the executor owns everything it touches. `run_with(ctx, execute)` threads the *identical* enter→execute→exit reduce but lets the `execute` closure return any (non-`'static`) future — the variant the [capability deck](/rust-cli/subsystems/capability-deck)'s tool-boundary wrapper needs, so a wrapper can call `|args| inner.run(args, ctx)` without lifting the borrowed `&ToolContext` to `'static`. `chain.matches(tool)` answers whether any interceptor applies.
+
+In the Tier-0 path the [`ToolResultProducer`] resolves a [`ToolResult`] (using its `is_error` flag for failures rather than a throw), so `ToolExitContext::error` is left `None`; the Tier-1 subprocess loader — whose tool RPC can fail — will populate it.
+
+## Slash Commands and Framework Handles
+
+Addon commands describe an **effect**, not a console state transition; the model never calls a command, the user does, by name. An [`AddonCommand`] carries a `name` (no leading slash), a one-line `summary`, the owning `addon`, and a `run: CommandFn` over a [`CommandContext`]:
+
+```rust
+pub struct CommandContext {
+    pub args: String,                  // raw argument string after the command name
+    pub cwd: PathBuf,                  // absolute working directory
+    pub handles: Arc<FrameworkHandles>,
+}
+```
+
+The [`FrameworkHandles`] bag is the controlled channel an addon acts through instead of importing agent internals. Every handle is optional — a print/JSON run mode supplies fewer than an interactive TUI; absent handles are `None`:
+
+| Handle | Effect |
+|--------|--------|
+| `send_message(String)` | Inject an assistant-visible message into the active turn. |
+| `set_model(String)` | Switch the active model by canonical id. |
+| `set_thinking(String)` | Adjust the reasoning-effort level for subsequent turns. |
+| `exec(String)` | Run a shell command and resolve its captured [`ExecOutcome`] (`stdout` / `stderr` / `code: Option<i32>`). |
+
+These handles and the colon [`HookEvent`] taxonomy are the intended integration seams with the [conductor](/rust-cli/subsystems/conductor) session, the [capability deck](/rust-cli/subsystems/capability-deck) tool boundary, and the console command registry. (Note the TS layer's `render(component)` handle is dropped from this bag — interactive rendering is not part of the Rust handle set.)
+
+## The Sandbox
+
+`sandbox.rs` ports the *non-jiti* half of the TS `addons/sandbox.ts` — the parts that are runtime-agnostic and survive the jiti drop. The TS module compiled arbitrary TypeScript and handed addons the host's live namespace objects with full ambient authority; there is no analogue here. What survives is the *policy* a future loader tier enforces and the *path-input hygiene* every loader entry funnels through.
+
+[`SandboxPolicy`] is deny-by-default — an addon reaches the filesystem and environment only through capabilities the host explicitly grants:
+
+```rust
+pub struct SandboxPolicy {
+    pub allow_fs: bool,                     // default false
+    pub workspace_root: Option<PathBuf>,    // the confinement root
+    pub timeout_ms: u64,                    // per-call wall-clock (Tier-1 subprocess), default 30_000
+    pub env_allowlist: Vec<String>,         // env names passed to a Tier-1 subprocess; empty = none
+}
+```
+
+- `SandboxPolicy::deny_all()` (also `Default`) grants nothing — FS denied, no env inherited.
+- `SandboxPolicy::confined_to(root)` grants FS access *confined to* `root`: paths at or under it become permitted, everything else stays denied.
+- `permits_path(path)` enforces deny-by-default in order: FS-denied → never; no confinement root → never (a grant flag without a root is no grant); otherwise the path, once resolved and **lexically normalized** so `..` cannot climb out, must lie at or under the root. The classic escape `<root>/../etc/passwd` is correctly rejected rather than slipping through a naive `starts_with`. Symlinks are not resolved (no I/O); the normalization is purely lexical and deterministic.
+- `permits_env(name)` honors the allowlist; an empty allowlist inherits nothing.
+
+The path-hygiene helpers are the single normalizer every loader / policy entry funnels through, so input hygiene is applied in exactly one place:
+
+| Helper | Behavior |
+|--------|----------|
+| `scrub_invisible(raw)` | Strip invisible / non-standard whitespace (an explicit, auditable `INVISIBLE_CODE_POINTS` list: NBSP, zero-width space/joiner/non-joiner, LTR/RTL marks, word joiner, BOM, the fixed-width typographic spaces, narrow/medium/ideographic spaces) and trim ordinary ASCII edges. Astral characters (emoji) survive intact. |
+| `expand_path(raw, home)` | Scrub, then expand a *leading* `~` (or `~/`) to the home directory (a `~` mid-path is an ordinary character); falls back to the literal on an unresolvable home, mirroring the TS behavior. |
+| `resolve_path(raw, base, home)` | Scrub + expand-home + anchor against `base` (default: the process cwd) when not already absolute. |
+
+## Subagents
+
+`subagents.rs` (feature `swarm`) hosts the addon subsystem's *coordination* half. There is **no TS source** for this half — per PLAN/75 §4.3 it is a Rust-design adapter that maps directly onto the already-complete [`indusagi::swarm`](/rust/subsystems/swarm) and [`indusagi::smithy`](/rust/subsystems/smithy) crates; crew coordination is never rebuilt.
+
+A [`SubagentProfile`] (declared in `contract.rs`, ungated, so it is visible to the host fold regardless of the feature) is the `.indus/agents/<name>.toml` shape — `name` (defaults to the file stem), optional `model`, optional `tool_collection`, optional `prompt`. `AGENTS_DIR = ".indus/agents"` is the discovery directory (a sibling of `ADDONS_DIR`). `discover_profiles(workspace)` walks it one level deep, deserializing each `*.toml` into a profile and isolating a malformed file (returning its `Err` alongside the parsed profiles) — the same isolation stance the host takes for an addon load fault.
+
+The adapter bridges a profile onto framework types:
+
+| Function | Maps a profile onto |
+|----------|---------------------|
+| `to_agent_spec(profile)` | an `indusagi::smithy::AgentSpec` (partial spec merged by `define_agent`). |
+| `to_blueprint(profile)` | a validated `indusagi::smithy::AgentBlueprint` via smithy's single validation gate (a non-kebab/empty `name` surfaces the framework's `BlueprintError`). |
+| `to_member_draft(profile)` | an `indusagi::swarm::MemberDraft` (the crew mints the id; `name` is the member's `role`). |
+
+`DelegateRunner` is the handle the deck/boot delegate-runner wiring calls (the `DeckFramework.delegate` handle deferred from the deck milestone). Given the discovered profiles and a crew directory, `run(tasks)` enrolls a crew over `indusagi::swarm::create_crew`, posts the tasks, and drives `Crew::run_round` until the board quiesces or the `DEFAULT_MAX_ROUNDS = 64` cap is hit, returning a flattened `DelegationReport` (`crew_id`, `completed`, `failed`, `rounds`). Per-teammate git-worktree isolation is framework-given (via `with_base_repo`); every swarm coordination guarantee — the mkdir-lock + atomic-rename JSONL board, dep-gated readiness, cursor-exact mailbox — is the framework's, and the adapter only *calls* them. `SubagentCrew` is the standing-roster view (the member drafts computed up front).
+
+## Faults
+
+[`AddonFault`] is a typed record (not an `Error`-only path raised into the loop) — faults are always routed to `on_fault` listeners and swallowed. It is a struct carrying a `kind` discriminant ([`AddonFaultKind`]), a one-line `message`, an optional originating `addon`, and an optional `cause`. The closed set of kinds:
+
+| Kind | Raised when |
+|------|-------------|
+| `Load` | Resolving / loading an addon module failed (the [`LoaderError`] rides as `cause`). |
+| `Register` | An addon's `register` entry point threw (reserved for the in-proc Tier-1+ loaders; impossible for Tier-0, whose `register` is the agent's own replay closure). |
+| `Handler` | An event handler or interceptor stage threw at runtime (the Tier-1 RPC seam). |
+| `Command` | A slash command handler threw. |
+| `Conflict` | Two addons claimed the same command name or tool name, or an addon claimed a reserved action name. |
+
+Construct one with `AddonFault::new(kind, message)`, attributing with `.with_addon(id)` and `.with_cause(err)`. [`AddonFault`] implements `std::error::Error` (exposing the `cause`) and `Display` (`[Kind] message (addon: id)`). [`AddonFaultListener`] is `Arc<dyn Fn(&AddonFault) + Send + Sync>`.
+
+## Public Surface
+
+The **Source** column is the defining module. `mod.rs` re-exports the *contract types* plus the runtime entry points directly at `induscode::addons` (see [Layout and Reachability](#layout-and-reachability)); the remaining items — the host's `create_addon_host` / `discover_addons` / `discover_sources` / `RecordingSurface` / `RESERVED_ACTION_NAMES`, the `dispatch` minters `subscription` / `interceptor`, the `manifest` `DeclarativeLoader` / `MANIFEST_FILENAME`, the function/type aliases `RegisterFn` / `ToolResultProducer` / `EnterFn` / `ExitFn` / `CommandFn` / `LoaderError`, and the whole `sandbox` and `subagents` surfaces — are reached through their full module path (e.g. `induscode::addons::host::create_addon_host`, `induscode::addons::contract::ToolResultProducer`).
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `AddonHost` / `create_addon_host` | struct / fn | `host` | The assembly point — `load_all` / `load_one` / `on_fault` / `registry`. |
+| `AddonHostDeps` | struct | `host` | Host construction deps (loader / handles / reserved actions). |
+| `AddonRegistry` | struct | `host` | The merged, conflict-resolved registry (subscriptions / interceptors / commands / tools). |
+| `AddonBundle` | struct | `host` | The wired runtime `load_all` produces (`dispatch`, `interceptors`, `commands`, `tools`, `loaded`). |
+| `RecordingSurface` | struct | `host` | The concrete per-addon [`AddonApi`] the host hands one addon's `register`. |
+| `discover_addons` / `discover_sources` | fn | `host` | Scan one directory; fold an [`AddonDiscovery`] into id-stamped sources. |
+| `RESERVED_ACTION_NAMES` | const | `host` | The 6 core command names addon commands may not shadow. |
+| `AddonApi` | trait | `contract` | The limited registration API `register` receives (`on` / `intercept_tool` / `add_command` / `add_tool` / `handles` / `manifest`). |
+| `AddonManifest` / `Addon` / `RegisterFn` | struct / struct / type | `contract` | What a loader produces; the id-stamped pairing the host folds; the async register-fn type. |
+| `RegisteredManifest` | struct | `contract` | The frozen read-back of recorded contributions (`empty` seed minter). |
+| `ModuleLoader` / `LoaderError` | trait / enum | `contract` | The injectable load seam and its error type. |
+| `AddonDiscovery` / `AddonSource` / `ADDONS_DIR` / `ADDON_MANIFEST_FIELD` | structs / consts | `contract` | Discovery config, one discovered source, the dir + `package.json` field defaults. |
+| `HookEvent` / `HookKind` / `HookHandler` | enums | `contract` | The event vocabulary (`guards`), the middleware kinds, the discriminated handler union. |
+| `Payload` / `GateDecision` / `DispatchOutcome` / `EventSubscription` | enums / structs | `contract` | The typed payload, a veto, a dispatch result, one recorded subscription. |
+| `ToolInterceptor` / `ToolMatch` / `EnterFn` / `ExitFn` | struct / enum / types | `contract` | The interceptor, its matcher, the boxed enter/exit closures. |
+| `ToolEnterContext` / `ToolExitContext` / `EnterOutcome` / `ExitOutcome` | structs / enums | `contract` | The enter/exit contexts and the stage outcomes. |
+| `InterceptResult` / `ToolResultProducer` | struct / type | `contract` | The chain's run result; the real-tool invocation type. |
+| `AddonCommand` / `CommandContext` / `CommandFn` | structs / type | `contract` | Slash-command types and the command handler closure. |
+| `FrameworkHandles` / `ExecOutcome` | structs | `contract` | The framework-handles bag and the captured `exec` outcome. |
+| `AddonTool` | type | `contract` | Alias of `Arc<dyn indusagi::capabilities::Tool>` — supplied directly, not wrapped. |
+| `AddonId` | newtype | `contract` | Branded addon identifier (`new` minter). |
+| `AddonFault` / `AddonFaultKind` / `AddonFaultListener` | struct / enum / type | `contract` | The typed failure record, its kinds, the listener type. |
+| `SubagentProfile` | struct | `contract` | The `.indus/agents/<name>.toml` profile shape. |
+| `EventDispatcher` / `InterceptorChain` | structs | `dispatch` | The dispatch runtime and the tool-boundary runtime. |
+| `subscription` / `interceptor` | fn | `dispatch` | The subscription / interceptor minters. |
+| `AddonDescriptor` / `ManifestError` / `DeclarativeLoader` / `MANIFEST_FILENAME` | structs / enum / const | `manifest` | The Tier-0 descriptor schema, parse error, v1 loader, manifest filename. |
+| `SandboxPolicy` / `scrub_invisible` / `expand_path` / `resolve_path` | struct / fn | `sandbox` | The deny-by-default capability policy + path-hygiene helpers. |
+| `SubagentCrew` / `DelegateRunner` / `discover_profiles` / `AGENTS_DIR` | struct / struct / fn / const | `subagents` | Subagent coordination over the swarm crate (feature `swarm`). |
+| `DelegationReport` / `DelegationTask` | structs | `subagents` | The flattened delegation result (`crew_id` / `completed` / `failed` / `rounds`) and one unit of work handed to a crew (feature `swarm`). |
+| `to_agent_spec` / `to_blueprint` / `to_member_draft` | fns | `subagents` | Map a [`SubagentProfile`] onto an `indusagi::smithy::AgentSpec` / validated `AgentBlueprint` / `indusagi::swarm::MemberDraft` (feature `swarm`). |
+
+## Parity Notes
+
+- **Built on the framework, not duplicating it.** `contract.rs` composes (never re-declares) `indusagi::capabilities::{Tool, ToolResult}` from the [framework capabilities](/rust/subsystems/capabilities) kernel; `AddonTool` is a plain alias of `Arc<dyn Tool>`, so the [deck](/rust-cli/subsystems/capability-deck) merges a contributed tool like any native/MCP tool. The subagent half composes [`indusagi::smithy`](/rust/subsystems/smithy) + [`indusagi::swarm`](/rust/subsystems/swarm) rather than rebuilding crew coordination. The framework workspace is frozen.
+- **The jiti loader does not survive.** The TS `ModuleLoader` compiled arbitrary TypeScript; the trait stays, the default is tiered (declarative TOML now, subprocess next, WASM later). A Tier-0 `register` is the agent's own replay closure (data, not code), so the `Register` fault kind is structurally impossible for it.
+- **The payload is type-checked.** Where the TS dispatcher passed `unknown` and re-narrowed in each handler, the Rust `Payload` is a checked enum keyed by event group — the `transform` fold is type-checked and a handler can't be wired to the wrong shape. Same events, same semantics.
+- **Closed enums and the data-sourced gate set.** `HookEvent`, `HookKind`, `AddonFaultKind`, `ToolMatch`, `EnterOutcome`, `ExitOutcome` are real exhaustive enums (the TS structural guards `readEnter`/`isGate`/`isArgsRewrite` vanish — the enum *is* the discriminant). The gate-bearing set is derived from `HookEvent::guards()` (one `matches!`), the analogue of the TS `EVENT_TRAITS` table.
+- **A stronger sandbox.** The Rust layer ships a deny-by-default `SandboxPolicy` with lexical `..`-traversal containment, where the TS layer had no sandbox at all (addon code ran in-process with full ambient authority). See the [TS](/cli) and [Python](/python-cli/subsystems/addons) editions for the lineage's surface map.
+- **Built-but-unwired.** As checked in, the layer has a standalone test suite across its modules but is the *contract + runtime*; the [`FrameworkHandles`] bag, the `HookEvent` taxonomy, and the `InterceptorChain::run_with` deck seam mark the intended integration points with the [conductor](/rust-cli/subsystems/conductor), the [deck](/rust-cli/subsystems/capability-deck), and the console.
+
+For the product that hosts it, see the [induscode CLI README](/rust-cli) and [Boot](/rust-cli/subsystems/boot); for the framework underneath, see [capabilities](/rust/subsystems/capabilities), [swarm](/rust/subsystems/swarm), and [smithy](/rust/subsystems/smithy).

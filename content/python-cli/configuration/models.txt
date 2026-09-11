@@ -1,0 +1,231 @@
+# Models
+
+> How `induscode` selects which model a run talks to. Pick one with `--model`/`-m`, browse the full catalog with `--list-models`, or scope a query down to a provider, a capability, or a glob. The catalog is the framework model registry — 849 models across 24 providers — normalized once by the conductor and shared by every code path.
+
+## Table of Contents
+
+- [Selecting a model](#selecting-a-model)
+- [How a selector resolves](#how-a-selector-resolves)
+- [Scoped and capability selectors](#scoped-and-capability-selectors)
+- [Listing the catalog](#listing-the-catalog)
+- [Default model precedence](#default-model-precedence)
+- [Reasoning effort](#reasoning-effort)
+- [The catalog programmatically](#the-catalog-programmatically)
+- [Public API](#public-api)
+- [See also](#see-also)
+
+## Selecting a model
+
+Pass a model selector with `--model` (short alias `-m`). The value is a catalog
+model identifier: either the canonical `provider/modelId` form, a bare
+provider-scoped model id, a bare provider slug, or a glob / substring.
+
+```bash
+pindus -m anthropic/claude-sonnet-4-5 -p "summarize this repo"
+pindus -m claude-sonnet-4-5 "refactor the auth module"   # bare model id
+pindus -m anthropic "..."                                # provider -> its default
+pindus --model "claude-*" -p "hi"                        # glob
+```
+
+`--model` is one row in the single declarative flag table (`FLAG_SPECS`) — a
+`string`-kind flag whose canonical name is `--model` with the alias `-m`. The
+reader folds the value into `Invocation.model`; the boot session runner then
+resolves it to a concrete catalog card. When `--model` is omitted, a default is
+chosen (see [Default model precedence](#default-model-precedence)).
+
+| Flag | Aliases | Kind | Purpose |
+|------|---------|------|---------|
+| `--model` | `-m` | string | Select the model — `provider/modelId`, bare id, provider slug, or glob/substring |
+| `--list-models` | — | string | Print the model catalog (optionally filtered by a substring) and exit |
+| `--account` | — | string | Authenticate the run with a named stored credential account |
+| `--thinking` | — | string | Set reasoning effort (`off`/`minimal`/`low`/`medium`/`high`/`xhigh`) |
+
+## How a selector resolves
+
+A selector is not a literal lookup — it runs through the conductor's
+`ModelMatcher`, a scored-candidate resolver over the `ModelCatalog`. Every card
+that survives the hard capability gates is scored by a set of strategy probes,
+tried strongest-first; the highest scorer wins, with deterministic tie-breaks.
+
+| Strategy | Weight | Fires when the selector is… |
+|----------|--------|-----------------------------|
+| Explicit pin | 1000 | a structured `provider` + `modelId` query |
+| Exact canonical | 900 | exactly `provider/modelId` |
+| Exact model id | 800 | exactly a provider-scoped `modelId` |
+| Provider-scoped | 600 | `provider/` or a bare provider slug |
+| Glob | 400 | a glob (`*`, `?`, `[set]`) matching the id |
+| Alias substring | 200 | a case-folded substring of the id or name |
+
+Strategies do not stack — a card's score is the single best strategy that fires,
+and the tier gaps are wide enough that a weaker probe never out-ranks a stronger
+one. Ties are broken by a small bonus (a tighter id-length match, plus a `+3`
+nudge toward reasoning-capable cards), then by canonical id, so equal scores
+never depend on catalog iteration order.
+
+Globs are anchored and case-folded; a `/` is matched literally, so
+`anthropic/*` scopes a glob to one provider while `*sonnet*` searches all of
+them. A bare provider slug like `anthropic` matches the provider-scoped tier and
+falls back to that provider's leading card.
+
+## Scoped and capability selectors
+
+`ModelCatalog.get(id)` resolves a bare model id when it is unambiguous across
+providers — if exactly one provider carries that `modelId`, the canonical id is
+unnecessary. When more than one provider offers the same bare id, qualify it
+(`anthropic/claude-sonnet-4-5`) to disambiguate.
+
+The structured `MatchQuery` (used internally by the conductor and the matcher)
+also gates on capability: `reasoning=True` keeps only models that advertise a
+reasoning budget, and `supportsImageInput=True` keeps only models that accept
+image input. These are hard gates — a card that fails one is removed from the
+field entirely rather than down-ranked. The same two capability flags surface on
+the command line indirectly via `--list-models` filtering and `--thinking`.
+
+## Listing the catalog
+
+`--list-models` prints the catalog as an aligned text table and exits without
+starting a session. It takes an optional substring argument; when present it
+becomes the case-insensitive `search` field of a `CatalogFilter`.
+
+```bash
+pindus --list-models                 # the whole catalog
+pindus --list-models claude          # only ids matching "claude" (substring)
+pindus --list-models gpt             # only ids matching "gpt"
+```
+
+The boot layer short-circuits `--list-models` before any stage runs and calls
+`print_model_catalog(filter=CatalogFilter(search=...))`. The printer re-derives
+its rows from the conductor `ModelCatalog` (the same normalized view the matcher
+uses), applies the filter, sorts by provider then model id, and lays out six
+columns:
+
+| Column | Meaning |
+|--------|---------|
+| Provider | Owning provider slug |
+| Model | Provider-scoped model id |
+| Context | Context-window size (`128K`, `1.0M`, or `-` when unknown) |
+| Max Output | Maximum output tokens, same compact format |
+| Thinking | `yes` when the model advertises a reasoning budget |
+| Images | `yes` when the model accepts image input |
+
+`CatalogFilter` carries more than the CLI substring exposes: programmatic
+callers can also narrow by `provider`, `thinking_only`, and `images_only`. An
+absent field matches everything; `search` is a plain case-insensitive substring
+test over `"provider/modelId"` — no fuzzy matcher, no external ranking. When a
+filter matches nothing, the printer emits a single `No models match the given
+filter.` line instead of an empty table.
+
+```python
+from induscode.launch import print_model_catalog, CatalogFilter
+
+# Anthropic reasoning models whose id contains "claude":
+print_model_catalog(
+    filter=CatalogFilter(provider="anthropic", thinking_only=True, search="claude"),
+)
+```
+
+The catalog deliberately excludes the framework's `mock` echo provider from the
+live source, so `mock-default` never surfaces as a row or as an auto-selected
+default. Tests that want it inject their own catalog source.
+
+## Default model precedence
+
+When `--model` is omitted, `resolve_model_id` in the boot session runner picks
+one in this order:
+
+1. **Explicit `--model`** — an explicit, non-empty selector always wins.
+2. **An authenticated provider's current model** — for each provider the user
+   has stored credentials for, the runner picks that provider's preferred
+   current model (so a fresh launch lands on a model the stored key can actually
+   call). The preferred-default table is, by bare id:
+   - `anthropic`: `claude-sonnet-4-5`, `claude-haiku-4-5`, `claude-sonnet-4-6`,
+     `claude-sonnet-4-0`, `claude-opus-4-5`
+   - `openai`: `gpt-5.1`, `gpt-4.1`, `gpt-4o`
+   - If none of the preferred ids are in the catalog, the provider's newest
+     catalog entry (last by scan order) is used.
+3. **Catalog default** — otherwise `ModelMatcher.resolve(MatchQuery())` returns
+   the leading surviving card, nudged toward a reasoning model when the field
+   offers one.
+
+This keeps an unauthenticated, no-flag launch from defaulting to a model the
+caller has no key for. See [Auth](/python-cli/configuration/auth) for how
+credentials are stored and [Boot](/python-cli/subsystems/boot) for where in the
+pipeline `resolve_model_id` runs.
+
+## Reasoning effort
+
+`--thinking` sets the reasoning-effort rung for the run. The accepted vocabulary
+is an ordered superset of the framework's `ThinkingLevel`, adding an explicit
+`off`:
+
+```
+off  minimal  low  medium  high  xhigh
+```
+
+`off` disables extended reasoning entirely; the remaining rungs ascend in
+effort. The launch contract validates the value against `THINKING_EFFORTS` via
+`is_thinking_effort` before the run starts. Callers that hand a level to the
+framework drop `off`.
+
+```bash
+pindus -m claude-sonnet-4-5 --thinking high "design the migration"
+pindus -m claude-sonnet-4-5 --thinking off  "just answer briefly"
+```
+
+## The catalog programmatically
+
+The catalog and the matcher are reusable outside the CLI. `ModelCatalog` builds
+a normalized, validated, de-duplicated view of the framework model list in its
+constructor; `ModelMatcher` resolves selectors against it.
+
+```python
+from induscode.conductor import ModelCatalog
+from induscode.conductor.matcher import ModelMatcher
+from induscode.conductor.contract import MatchQuery
+
+catalog = ModelCatalog()                 # eager build over the live framework registry
+print(catalog.size)                      # total cards
+print(catalog.providers())               # contributing provider slugs
+
+matcher = ModelMatcher(catalog)
+ref = matcher.resolve("claude-sonnet-4-5")          # -> ModelCardRef | None
+best = matcher.resolve(MatchQuery(provider="anthropic", reasoning=True))
+field = matcher.resolve_all("gpt")                  # ranked "did you mean" list
+```
+
+`ModelCatalog` is itself a normalized view over the framework's
+`get_providers()` / `get_models()`; each card retains the full framework `Model`
+record so the conductor can bind a model to the agent without a second registry
+round-trip. For how the framework resolves a model id to a `ModelCard`, routes
+to the right wire connector, and exposes the generated catalog, see the
+[LLM Gateway](/python/subsystems/llm-gateway).
+
+The `--list-models` printer reads through the same catalog via a `CatalogModelSource`
+seam, so there is exactly one catalog path in the app — the picker, the printer,
+the resolver, and a session bind all see the same normalized cards.
+
+## Public API
+
+These are exported from `induscode.launch` (the catalog printer) and
+`induscode.conductor` (the catalog and matcher).
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `print_model_catalog` | function | `launch/catalog.py` | Render the aligned model table over the conductor catalog |
+| `CatalogFilter` | dataclass | `launch/contract.py` | `--list-models` filter: `provider`, `thinking_only`, `images_only`, `search` |
+| `CatalogIo` / `default_catalog_io` | Protocol / function | `launch/catalog.py` | The line sink the table prints onto (stdout by default; injectable for tests) |
+| `CatalogModelSource` / `catalog_source` | Protocol / function | `launch/catalog.py` | The seam the printer sources raw models from (the conductor catalog by default) |
+| `ModelCatalog` | class | `conductor/catalog.py` | Normalized, validated view of the framework model list; `.all()`, `.by_provider()`, `.get()`, `.size` |
+| `CatalogCard` | dataclass | `conductor/catalog.py` | One normalized catalog entry (id, provider, modelId, capabilities, retained framework `model`) |
+| `ModelMatcher` | class | `conductor/matcher.py` | Scored-candidate resolver: `.resolve()`, `.resolve_card()`, `.resolve_all()` |
+| `MatchQuery` | dataclass | `conductor/contract.py` | Structured selector with `pattern`, `provider`, `modelId`, `reasoning`, `supportsImageInput` |
+| `THINKING_EFFORTS` / `is_thinking_effort` | const / function | `launch/contract.py` | The `--thinking` vocabulary and its validator |
+
+## See also
+
+- [Auth](/python-cli/configuration/auth) — stored credentials and `--account`
+- [Settings](/python-cli/configuration/settings) — persisted defaults under `~/.pindusagi/`
+- [Conductor](/python-cli/subsystems/conductor) — the catalog/matcher owner and session binding
+- [Boot](/python-cli/subsystems/boot) — where `--list-models` and model resolution run
+- [CLI reference](/python-cli/reference/cli) — the complete flag and mode table
+- [LLM Gateway](/python/subsystems/llm-gateway) — the framework model registry and wire routing

@@ -1,0 +1,100 @@
+# Keybindings
+
+> Run `/keys` in the console to print this map live, grounded in the actual keymap.
+
+The console's keyboard shortcuts are fixed, not user-configurable: each raw key event is classified by the pure keymap in `src/console/input/keymap.ts` (`readKey`) into a console intent, and the surface's input handler (`src/console/components/TerminalConsole.tsx`) maps that intent to an effect. There is no `keybindings.json` file. The live `/keys` command renders the same map from the `HOTKEYS` table in `src/console/slash/commands/workbench.ts`.
+
+## Table of Contents
+
+- [Editing and navigation](#editing-and-navigation)
+- [Submitting and flow](#submitting-and-flow)
+- [Completion](#completion)
+- [Models and reasoning](#models-and-reasoning)
+- [Overlays and views](#overlays-and-views)
+- [Chords](#chords)
+- [Shell escape](#shell-escape)
+- [Notes on key delivery](#notes-on-key-delivery)
+
+## Editing and navigation
+
+| Key | Action |
+|-----|--------|
+| `Left` / `Right` | Move the caret one column |
+| `Up` / `Down` | Recall older / newer history (or move the completion highlight when one is open) |
+| `Ctrl+A` | Jump to the start of the line |
+| `Ctrl+E` | Jump to the end of the line |
+| `Page Up` | Jump to buffer start |
+| `Page Down` | Jump to buffer end |
+| `Backspace` | Delete the character before the caret |
+| `Ctrl+U` | Clear the composer line |
+| `Ctrl+J` | Insert a newline |
+| `Shift+Enter` | Insert a soft newline |
+
+## Submitting and flow
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Submit the current turn |
+| `Esc` | Dismiss an open overlay; otherwise abort the in-flight turn; otherwise clear the completion highlight |
+| `Ctrl+C` | Abort a running turn; else clear the composer; a second press on an already-empty buffer within ~500 ms exits |
+| `Ctrl+Z` | Suspend the process to the background (job control) |
+| `Ctrl+G` | Hand the composer buffer to your external editor (`$VISUAL`, then `$EDITOR`, then `vi`) and read it back |
+| `Ctrl+V` | Attach an image from the clipboard (macOS / Linux) |
+
+## Completion
+
+| Key | Action |
+|-----|--------|
+| `Tab` | Accept the highlighted completion; with none offered, insert a two-space indent |
+| `Up` / `Down` | Move the completion highlight (when the completion window is open) |
+| `Enter` | With a `/`-command completion open, run the highlighted command; otherwise submit the line as typed |
+
+## Models and reasoning
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+L` | Open the model picker overlay |
+| `Ctrl+N` / `Ctrl+P` | Cycle the active model |
+| `Shift+Tab` | Step the reasoning-effort (thinking) level |
+| `Ctrl+T` | Toggle the reasoning / thinking rows |
+
+## Overlays and views
+
+| Key | Action |
+|-----|--------|
+| `Ctrl+R` | Open the session resume list |
+| `Ctrl+O` | Expand or collapse full tool output |
+| `Alt+Up` | Pull the newest queued input back into the composer |
+
+## Chords
+
+Two double-tap chords are latched across keystrokes (the second tap must land within ~600 ms):
+
+| Chord | Action |
+|-------|--------|
+| `Esc Esc` | Double-escape — its effect is set by the `doubleEscapeAction` preference (see below) |
+| `Ctrl+U` `Ctrl+U` | A second `Ctrl+U` within the chord window requests exit (the chord does not check whether the buffer is empty) |
+
+`doubleEscapeAction` controls what `Esc Esc` does:
+
+| Value | Effect |
+|-------|--------|
+| `tree` (or legacy `branch`) | Open the transcript-tree navigator |
+| `fork` (or legacy `rewind`) | Open the prior-turn fork picker |
+| `clear` | Wipe the composer buffer (the default) |
+
+An unreadable or unknown value falls back to `clear`.
+
+## Shell escape
+
+| Prefix | Action |
+|--------|--------|
+| `! <cmd>` | Run a shell command and keep its output in the conversation context |
+| `!! <cmd>` | Run a shell command but exclude its output from context |
+
+## Notes on key delivery
+
+- `Backspace` is folded across several deliveries: terminals report it as `key.backspace`, `key.delete` (macOS), or a raw `DEL` (`0x7f`) / `BS` (`0x08`) byte — all map to erase-backward.
+- A real `Escape` press arrives with an empty `input` and the meta flag set; bracketed-paste delimiters (`ESC[200~` / `ESC[201~`) are stripped before classification so a paste is never mistaken for an Escape.
+- Control bytes that also ride in the typed `input` are dropped, so `Ctrl+U` never also types "u".
+- Printable text accumulates into a short-debounce burst (12 ms) so a character-by-character paste lands whole.

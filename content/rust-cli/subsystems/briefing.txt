@@ -1,0 +1,670 @@
+# Briefing
+
+> `induscode::briefing` is the budget-aware system-prompt assembler of the Rust agent:
+> four pure, synchronous engines that fold a read-only [`BriefingInput`] into the single
+> system-prompt `String` fed to the model as `AgentConfig.system`. The prompt is a
+> declarative recipe of `SectionFn` pointers (not a `{{TOKEN}}` template), self-gating on
+> the tools and data present; alongside it live the `CLAUDE.md`/`AGENTS.md` context-doc
+> loader with `@import` expansion, the single-pass `$arg` / `{{arg.…}}` macro engine, and
+> the Agent-Skills `SKILL.md` card loader. Reach it as `induscode::briefing::*`; it stands
+> on the framework's [`indusagi::core::time`](/rust/subsystems/core) clock and consumes the
+> [deck](/rust-cli/subsystems/capability-deck)'s tool schemas as input data — never the
+> deck crate itself.
+
+The system prompt is **not** a string template with holes. It is an ordered list of
+`SectionFn` function pointers ([`BRIEFING_SECTIONS`]), each of which gates *and* renders
+itself in one call: it inspects the [`BriefingInput`], returns `None` when it does not
+apply (or renders empty), and `Some(fragment)` otherwise. [`compose_with`] is a tiny
+reducer over that recipe. Reshaping the prompt is a data edit to [`BRIEFING_SECTIONS`] —
+never a change to the composer.
+
+The crate is five modules with no I/O in the type seam: `contract.rs` (frozen shapes +
+faults + limits), `compose.rs` (the reducer, the default recipe, the section renderers,
+the footer clock), `context_docs.rs` (the ancestor-chain `CLAUDE.md`/`AGENTS.md` walk with
+`@import` expansion), `macros.rs` (the single-pass scanner, resolver, loader, and the
+shared frontmatter reader), and `skills.rs` (the `SKILL.md` walker/validator). It is the
+100%-Rust rebuild of `indus-code-rebuild/src/briefing/{compose,context-docs,macros,skills,contract}.ts`
+— authored from scratch, never transliterated from the [TypeScript](/cli) or
+[Python](/python-cli/subsystems/briefing) editions.
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [The Public Surface](#the-public-surface)
+- [The Declarative Section Pipeline](#the-declarative-section-pipeline)
+- [The Default Recipe](#the-default-recipe)
+- [BriefingInput](#briefinginput)
+- [Tool Docs and Summaries](#tool-docs-and-summaries)
+- [The Footer Clock](#the-footer-clock)
+- [Compose Overrides](#compose-overrides)
+- [Context Docs](#context-docs)
+- [Slash Macros](#slash-macros)
+- [Skill Cards](#skill-cards)
+- [Faults](#faults)
+- [The Live Call Site](#the-live-call-site)
+- [Framework Anchors](#framework-anchors)
+- [Source Layout](#source-layout)
+
+## Architecture
+
+```
+crates/induscode/src/briefing/
+├── mod.rs           # the public barrel re-exporting the contract vocabulary
+├── contract.rs      # FROZEN type seam: ToolDoc, BriefingInput, SectionFn, Macro*, Skill*, BriefingFault, limits
+├── compose.rs       # compose_briefing(+_with_options), BRIEFING_SECTIONS, the section renderers, TOOL_SUMMARIES, the footer clock
+├── context_docs.rs  # gather_context_docs: ancestor-chain CLAUDE.md/AGENTS.md walk + @import expansion
+├── macros.rs        # single-pass {{arg.…}}/$arg scanner + resolver + loader + split_frontmatter
+└── skills.rs        # SKILL.md / *.md walk, validate, project, gather into SkillCards
+```
+
+`contract.rs` is the single typed seam. It declares every `struct`/`enum`/`type` alias and
+the closed `BriefingFault`, and `mod.rs` re-exports the whole briefing-owned vocabulary so
+consumers import from `induscode::briefing`, never from individual modules. Per the
+architecture DAG the briefing depends only on `induscode::core`, the framework
+[`indusagi::smithy`](/rust/subsystems/smithy), and [`indusagi::core`](/rust/subsystems/core)
+— it receives tool schemas as **input data** ([`ToolDoc`]), so there is no edge to the
+[capability deck](/rust-cli/subsystems/capability-deck).
+
+The four engine modules are pure and synchronous. The composer touches no disk; the three
+loaders use blocking `std::fs` and run once at boot. Naming note: the milestone roadmap
+names the primary types `BriefingInput`, `ToolDoc`, `MacroDef`, and `ComposeOptions`; the
+TS source called these `BriefingContext`, an `AgentTool` projection, `Macro`, and the
+override half of `BriefingInputs`. The TS names are retained as documented `type` aliases
+([`BriefingContext`](#briefinginput) for `BriefingInput`, `Macro` for `MacroDef`). Only
+`Macro` is re-exported from `mod.rs`; `BriefingContext` lives on `contract.rs` and is reached
+as `induscode::briefing::contract::BriefingContext`.
+
+## The Public Surface
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `compose_briefing` | `fn` | `compose.rs` | Fold the default recipe + a `BriefingInput` into the system-prompt string (the common case). |
+| `compose_briefing_with_options` | `fn` | `compose.rs` | As above, honouring the `--system` / `--append-system` / `prelude` overrides on `ComposeOptions`. |
+| `compose_with` | `fn` | `compose.rs` | The bare reducer: fold a `&[SectionFn]` recipe + context + optional prelude/append. |
+| `BRIEFING_SECTIONS` | `const &[SectionFn]` | `compose.rs` | The default 10-entry recipe, in render order. |
+| `BRIEFING_SECTION_IDS` | `const &[&str]` | `compose.rs` | The stable section ids, parallel to `BRIEFING_SECTIONS`, for recipe introspection. |
+| `SectionFn` | `type` alias | `contract.rs` | `fn(&BriefingInput) -> Option<String>` — one section that gates AND renders. |
+| `BriefingSection` | `type` alias | `contract.rs` | Alias of `SectionFn`; an ordered recipe is `&[BriefingSection]`. |
+| `BriefingInput` | `struct` | `contract.rs` | The all-defaulted read-only data bag every section reads. |
+| `BriefingContext` | `type` alias | `contract.rs` | TS-name alias of `BriefingInput`. Defined in `contract.rs` but NOT in the `mod.rs` re-export — reach it as `induscode::briefing::contract::BriefingContext`, not `induscode::briefing::BriefingContext`. |
+| `ComposeOptions` | `struct` | `contract.rs` | The `--system` / `prelude` / `--append-system` override hooks for one compose call. |
+| `ToolDoc` | `struct` | `contract.rs` | A tool the model may invoke this turn (`name` + `description` + `parameters`), as the briefing sees it. |
+| `ContextDoc` | `struct` | `contract.rs` | A project-context document (`path` heading + verbatim `body`) inlined under `# Project context`. |
+| `SubagentBrief` | `struct` | `contract.rs` | A named delegate role (`name`, `purpose`, optional `when`) advertised in the delegates section. |
+| `Macro` / `MacroDef` | `struct` | `contract.rs` | A loaded slash macro: `name`, `description`, `body`, `origin`, `source`. |
+| `MacroScope` | `struct` | `contract.rs` | The argument environment: `args` vector, joined `all`, verbatim `raw`. |
+| `MacroToken` | `enum` | `contract.rs` | `Literal` / `Positional(u32)` / `All` / `Slice { start, length }`. |
+| `MacroOrigin` | `enum` | `contract.rs` | `User` / `Project` / `Path` / `Builtin`, with a `.label()`. |
+| `SkillCard` | `struct` | `contract.rs` | A validated `SKILL.md` card — documentation the model reads, not a callable. |
+| `SkillFrontmatter` | `struct` | `contract.rs` | Parsed `SKILL.md` header (name, description, license, compatibility, metadata, allowed_tools, disable_model_invocation). |
+| `SkillLoad` | `struct` | `contract.rs` | Aggregate load result: deduped `cards` vec + per-candidate `diagnostics` vec. |
+| `SkillDiagnostic` | `struct` | `contract.rs` | One per-candidate outcome: `kind` / `location` / `detail`. |
+| `SkillOutcomeKind` | `enum` | `contract.rs` | `Loaded` / `Skipped` / `Invalid` / `Collision`. |
+| `SkillRoot` | `struct` | `contract.rs` | One skill directory root with its `MacroOrigin`, fed to `gather_skill_cards`. |
+| `SKILL_NAME_LIMIT` / `SKILL_DESCRIPTION_LIMIT` | `const usize` | `contract.rs` | Agent-Skills format limits: `64` and `1024`. |
+| `BriefingFault` | `enum` | `contract.rs` | The closed `thiserror::Error` set: `MacroInvalid` / `SkillInvalid`. |
+| `scan_macro_body` | `fn` | `macros.rs` | Single left-to-right scan of a body into a flat `Vec<MacroToken>`. |
+| `resolve_tokens` | `fn` | `macros.rs` | Concatenate a token stream resolved against a `MacroScope`. |
+| `build_macro_scope` | `fn` | `macros.rs` | Quote-aware split of a raw argument line into a `MacroScope`. |
+| `apply_macros` / `apply_macros_reporting` | `fn` | `macros.rs` | One-shot scan + scope + resolve (with/without a legacy reporter). |
+| `expand_invocation` | `fn` | `macros.rs` | Expand a `/<name> rest…` line against loaded macros (first name match wins). |
+| `load_macros` | `fn` | `macros.rs` | Load the direct `*.md` children of a dir (non-recursive) into deduped `MacroDef`s. |
+| `read_macro_file` | `fn` | `macros.rs` | Parse one macro file; `Err(MacroInvalid)` on read failure. |
+| `split_frontmatter` | `fn` | `macros.rs` | Minimal `---`-fenced YAML-ish reader returning `(Vec<(String, String)>, String)`. |
+| `gather_context_docs` | `fn` | `context_docs.rs` | Walk the cwd ancestor chain + home for context files, expand `@import`s, into `Vec<ContextDoc>`. |
+| `GatherContextDocsOptions` | `struct` | `context_docs.rs` | Per-walk tuning: `max_import_depth`, `max_bytes_per_doc`. |
+| `gather_skill_cards` | `fn` | `skills.rs` | Load + merge `SkillCard`s from several `SkillRoot`s, dedup by name (first wins). |
+| `load_skill_cards` | `fn` | `skills.rs` | Walk one root, validate every candidate into a `SkillLoad` (no cross-root dedup). |
+| `model_invocable_cards` | `fn` | `skills.rs` | Filter out cards flagged `disable-model-invocation`. |
+
+## The Declarative Section Pipeline
+
+A section is a plain function pointer, not a trait object. Where the TS carried an optional
+`applies` predicate plus a `render` method on a `BriefingSection` object, the Rust port
+collapses both into one `fn` returning `Option<String>` — a `Box<dyn …>` registry of unit
+structs would be needless boilerplate for a static recipe:
+
+```rust
+/// One declarative section: it **gates AND renders** in a single call.
+/// `None` means it does not apply (or rendered empty) and contributes nothing;
+/// `Some(frag)` is its fragment (an empty/whitespace `frag` is also dropped).
+pub type SectionFn = fn(&BriefingInput) -> Option<String>;
+
+/// An ordered briefing recipe — the sections, in render order.
+pub type BriefingSection = SectionFn;
+```
+
+[`compose_with`] is the reducer. It walks the recipe in order, calls each `section(ctx)`,
+trims the returned fragment, drops empties, and joins survivors with blank-line gaps. A
+trimmed `prelude` is prepended and a trimmed `append` is appended when supplied:
+
+```rust
+pub fn compose_with(
+    sections: &[SectionFn],
+    ctx: &BriefingInput,
+    prelude: Option<&str>,
+    append: Option<&str>,
+) -> String
+```
+
+`compose_briefing(ctx)` is the wrapper for the common case — it calls
+`compose_with(BRIEFING_SECTIONS, ctx, None, None)`. Each section is pure with respect to
+the input: it reads, never mutates, and performs no I/O. Blocks are joined by `join_blocks`,
+which filters whitespace-only fragments and joins the rest with `\n\n`.
+
+## The Default Recipe
+
+[`BRIEFING_SECTIONS`] is a module-level 10-entry array of `SectionFn` pointers, in render
+order. A parallel `BRIEFING_SECTION_IDS` array carries the stable ids (the Rust analogue of
+each TS section's `id` field). Each row lists its gate; ungated sections always render.
+
+| Section | id | Gate | What it renders |
+|---------|----|------|-----------------|
+| `section_role` | `role` | always | `You are a terminal-based software engineering assistant…` — the agent's purpose and stance. |
+| `section_tools` | `tools` | `!ctx.tools.is_empty()` | `# Tools` + each advertised tool as `` `name` — summary `` from `TOOL_SUMMARIES` (fallback: the tool's own `description`). |
+| `section_guidelines` | `guidelines` | always (each bullet gated) | `# Working guidance`; each tool-specific bullet is gated on the matching tool (`read`/`edit`/`write`/`grep`/`find`/`ls`/`bash`); two always-on bullets close it. |
+| `section_task` | `tasks` | `todo_set` or `todo_read` present | `# Task tracking` — how to keep the shared checklist current. |
+| `section_subagents` | `subagents` | `!ctx.subagents.is_empty()` | `# Delegates` — each `SubagentBrief` as `**name** — purpose. Use it when …`. |
+| `section_plan` | `plan-mode` | `enter_plan_mode` or `exit_plan_mode` present | `# Plan mode` — the read-only research-then-propose loop. |
+| `section_connectors` | `connectors` | any tool name starts `connector_`/`saas_` | `# Connectors` — guidance for external-service connector tools. |
+| `section_project_context` | `project-context` | `!ctx.context_docs.is_empty()` | `# Project context` — inlines each `ContextDoc` under `## {path}` (body trimmed) as standing instructions. |
+| `section_skills` | `skills` | `!ctx.skills.is_empty()` | `# Skills` — XML-escapes each card into an `<available_skills>` block of 2-space-indented `<skill>` entries. |
+| `section_footer` | `footer` | always | Stamps `Working directory: {cwd ?? workspace}` (omitted when neither is set) and `Current time: {iso}`. |
+
+```rust
+pub const BRIEFING_SECTIONS: &[SectionFn] = &[
+    section_role, section_tools, section_guidelines, section_task, section_subagents,
+    section_plan, section_connectors, section_project_context, section_skills, section_footer,
+];
+
+pub const BRIEFING_SECTION_IDS: &[&str] = &[
+    "role", "tools", "guidelines", "tasks", "subagents",
+    "plan-mode", "connectors", "project-context", "skills", "footer",
+];
+```
+
+Every heading and guideline sentence is reproduced byte-for-byte from the TS source so the
+assembled prompt is golden-identical (the TS `*.test.ts` asserts on the exact headings and
+sentences, and the milestone Verify diffs the whole prompt against the TS output). Adding,
+removing, or reordering a section is a data edit to these two arrays; the composer never
+changes. Note the Rust recipe carries a `plan-mode` section that the Python edition does
+not — it gates on the deck's `enter_plan_mode`/`exit_plan_mode` tools.
+
+With an empty `BriefingInput::default()`, only `role`, `guidelines` (its no-tool branch —
+the two always-on bullets), and `footer` survive: no `# Tools`, `# Task tracking`,
+`# Skills`, `# Connectors`, or `# Delegates` appear.
+
+## BriefingInput
+
+`BriefingInput` is the all-defaulted, immutable bag a section reads. Every field has a
+`Default`, so a caller composes a partial briefing (no skills, no project docs) without
+populating the whole shape.
+
+```rust
+#[derive(Clone, Debug, Default)]
+pub struct BriefingInput {
+    pub workspace: Option<String>,      // absolute working directory (footer fallback)
+    pub tools: Vec<ToolDoc>,            // capabilities advertised this turn (deck input data)
+    pub cwd: Option<String>,            // display path; preferred over workspace in the footer
+    pub skills: Vec<SkillCard>,         // model-invocable cards for the skills block
+    pub subagents: Vec<SubagentBrief>,  // delegate roles for the # Delegates section
+    pub context_docs: Vec<ContextDoc>,  // CLAUDE.md/AGENTS.md docs for # Project context
+    pub now_ms: Option<u64>,            // injectable footer clock (epoch millis); None ⇒ wall clock
+}
+```
+
+| Field | Read by |
+|-------|---------|
+| `workspace` | footer (fallback after `cwd`) |
+| `tools` | tools + guidelines + task + plan + connectors gates |
+| `cwd` | footer (preferred over `workspace`) |
+| `skills` | skills block |
+| `subagents` | delegates block |
+| `context_docs` | project-context block |
+| `now_ms` | footer timestamp (`None` reads `indusagi::core::time::now_ms()` at render time) |
+
+```rust
+use induscode::briefing::{BriefingInput, ContextDoc, SubagentBrief, ToolDoc, compose_briefing};
+
+let ctx = BriefingInput {
+    workspace: Some("/repo".to_string()),
+    cwd: Some("/repo".to_string()),
+    tools: vec![ToolDoc { name: "read".into(), description: String::new(), parameters: serde_json::Value::Null }],
+    context_docs: vec![ContextDoc { path: "AGENTS.md".into(), body: "Use two-space indent.".into() }],
+    subagents: vec![SubagentBrief { name: "reviewer".into(), purpose: "review diffs".into(), when: Some("a PR is ready".into()) }],
+    ..Default::default()
+};
+let system = compose_briefing(&ctx);   // emits # Tools, # Working guidance, # Project context, # Delegates, footer
+```
+
+## Tool Docs and Summaries
+
+A [`ToolDoc`] is the deck's tool schema as the briefing sees it. Only `name` + `description`
+carry prompt meaning; the JSON-schema `parameters` are retained verbatim for richer doc
+derivation but unused by the default sections.
+
+```rust
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ToolDoc {
+    pub name: String,            // wire id, e.g. "read", "bash", "connector_slack"
+    pub description: String,     // the deck's one-liner (the tools-section fallback)
+    pub parameters: serde_json::Value,  // Null when the tool takes no arguments
+}
+```
+
+`section_tools` renders each tool via `describe_tool`, which mirrors the TS
+`summary ?? description?.trim() ?? ""` chain: a `TOOL_SUMMARIES` hit wins; otherwise the
+tool's own trimmed `description`; otherwise just the back-ticked name (no em-dash trailer).
+The `TOOL_SUMMARIES` table is the briefing's own re-authored one-liner per built-in:
+
+| Tool name | Summary |
+|-----------|---------|
+| `read` | Open a file's contents for inspection. |
+| `write` | Create a new file or overwrite an existing one wholesale. |
+| `edit` | Apply a precise in-place change by matching exact existing text. |
+| `bash` | Run a shell command in the workspace. |
+| `grep` | Search file contents by pattern across the tree. |
+| `find` | Locate files and directories by name or glob. |
+| `ls` | List the entries of a directory. |
+| `task` | Hand a self-contained sub-task to a delegate agent. |
+| `todo_read` | Read back the current task checklist. |
+| `todo_set` | Record or revise the task checklist. |
+| `webfetch` | Retrieve and read the contents of a URL. |
+| `websearch` | Query the web for current information. |
+
+> **Parity-critical wire names.** The checklist keys are the framework's real Rust wire
+> names `todo_read` / `todo_set` — NOT the TS `todoread` / `todowrite`. The Rust deck
+> advertises the renamed built-ins, so keying off the TS names would silently drop the
+> summaries (the tools would fall back to the framework description) and the `# Task
+> tracking` section would never render, since no deck tool carries `todowrite`/`todoread`.
+> The guidance gates (`read`/`edit`/`write`/`grep`/`find`/`ls`/`bash`) and the connector
+> prefixes (`connector_` / `saas_`) match the deck's real [capability](/rust/subsystems/capabilities)
+> names. See the [capability deck](/rust-cli/subsystems/capability-deck) page for the live tool set.
+
+## The Footer Clock
+
+`section_footer` stamps `Working directory:` (preferring `ctx.cwd`, falling back to
+`ctx.workspace`, omitted when neither is set) and `Current time:`. The timestamp matches
+JavaScript `new Date(ms).toISOString()` byte-for-byte — always UTC, always millisecond
+precision, always a trailing `Z`, e.g. `2026-06-04T12:00:00.000Z`. When `ctx.now_ms` is
+`None`, `iso_now` reads `indusagi::core::time::now_ms()`; passing an explicit `now_ms` makes
+renders deterministic for tests.
+
+The conversion is hand-rolled (Howard Hinnant's public-domain `civil_from_days`) so the
+crate needs no `chrono`/`time` dependency and the output is exact for the full proleptic-
+Gregorian `Date` range:
+
+```rust
+fn format_iso8601_millis(epoch_ms: u64) -> String {
+    let total_secs = (epoch_ms / 1000) as i64;
+    let millis = (epoch_ms % 1000) as u32;
+    let days = total_secs.div_euclid(86_400);
+    let secs_of_day = total_secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    // … hour/minute/second …
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{millis:03}Z")
+}
+```
+
+`format_iso8601_millis(0)` is `1970-01-01T00:00:00.000Z`; a leap-year boundary such as
+`1_709_251_199_123` is `2024-02-29T23:59:59.123Z`.
+
+## Compose Overrides
+
+`compose_briefing_with_options` honours the `--system` / `--append-system` CLI seam carried
+on [`ComposeOptions`]:
+
+```rust
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ComposeOptions {
+    pub system: Option<String>,         // --system: REPLACES the whole composed prompt; the recipe is skipped
+    pub prelude: Option<String>,        // text prepended ahead of the rendered sections
+    pub append_system: Option<String>,  // --append-system: text appended after the sections / the override
+}
+```
+
+| Field | Effect on the briefing |
+|-------|------------------------|
+| `system` | Replaces the built-in tool-aware briefing entirely; the section recipe is skipped (only `prelude`/`append_system` still bracket it). |
+| `append_system` | Appends a trailing block after the base (composes with `system`). |
+| `prelude` | Prepends a leading block ahead of the base. |
+| none | The tool-aware built-in briefing renders from `BRIEFING_SECTIONS`. |
+
+```rust
+let opts = ComposeOptions { system: Some("CUSTOM PROMPT".into()), ..Default::default() };
+assert_eq!(compose_briefing_with_options(&ctx, &opts), "CUSTOM PROMPT");
+
+let opts = ComposeOptions {
+    system: Some("BODY".into()), prelude: Some("PRE".into()), append_system: Some("POST".into()),
+};
+assert_eq!(compose_briefing_with_options(&ctx, &opts), "PRE\n\nBODY\n\nPOST");
+```
+
+Each bracket text is trimmed and dropped when empty.
+
+## Context Docs
+
+`gather_context_docs` is the loader that builds the `Vec<ContextDoc>` the project-context
+section inlines. It walks the cwd's ancestor chain from the filesystem root **down** to the
+cwd — so the cwd's own files land last in the vector, and since the renderer treats vector
+order as priority, the closest (most specific) file wins. The home directory is scanned
+after the chain as a global fallback.
+
+```rust
+pub fn gather_context_docs(
+    cwd: &Path,
+    home: &Path,
+    opts: &GatherContextDocsOptions,
+) -> Vec<ContextDoc>
+```
+
+Within each directory the candidate filenames are read in this load-bearing order (an
+earlier entry ranks lower / renders first):
+
+```rust
+const CANDIDATE_FILES: &[&str] = &[
+    "AGENTS.md", "CLAUDE.md", "INDUSAGI.md", "CLAUDE.local.md",
+    "AGENTS.local.md", ".indusagi/CLAUDE.md", ".claude/CLAUDE.md",
+];
+```
+
+Each file may pull additional files inline via `@import` references, resolved by
+`extract_imports` against the `IMPORT_REGEX` `(?:^|\s)@((?:[^\s\\]|\\ )+)`:
+
+- An import target is unescaped (`\ ` → ` `) and has any trailing `#fragment` stripped.
+- `~/…` forms resolve against `home`; absolute specs are used as-is; relative specs resolve
+  lexically against the importing file's directory (Node-style `resolve`, no filesystem access).
+- Non-text extensions are dropped (`is_text_file` checks against `TEXT_FILE_EXTENSIONS`; a
+  bare no-extension name such as `LICENSE` is allowed) so binary bytes never reach the prompt.
+- `load_doc_tree` emits the **parent first**, then each child, recursively. A `seen` set
+  keyed by realpath makes cyclic or repeated imports a no-op rather than a recursion.
+
+Two clamps keep the prompt bounded — both with `None`-substitutes-default options:
+
+| Option | Default const | Purpose |
+|--------|---------------|---------|
+| `max_import_depth` | `DEFAULT_MAX_IMPORT_DEPTH` = `5` | `@import` recursion ceiling. |
+| `max_bytes_per_doc` | `DEFAULT_MAX_BYTES_PER_DOC` = `40_000` | Per-document body clamp (post-trim). |
+
+The byte clamp uses `floor_char_boundary` so a cut never splits a UTF-8 codepoint — the
+naive `&s[..max]` the TS `body.slice(0, maxBytes)` allows would panic mid-codepoint in Rust.
+The whole walk **never errors**: any read/permission failure folds into a skip and the
+function returns whatever it gathered so far (there is no boot-crashing exception to catch
+as there was in TS). Paths are shortened for the heading label by `shorten_path` (`./…` for
+under-cwd, `~/…` for under-home, otherwise verbatim).
+
+## Slash Macros
+
+A macro is a named prompt body discovered from a `*.md` file. Invoking `/<name> rest-of-line`
+resolves the body against the line's arguments in **one left-to-right scan** — never a
+sequence of regex passes. `scan_macro_body` walks the body's bytes once into a flat
+`Vec<MacroToken>`, and `resolve_tokens` substitutes against a `MacroScope`. Expanded
+argument text is inserted verbatim and is **never re-scanned**, which avoids the classic
+multi-pass re-interpretation footgun (a `$2` in an argument value is not re-read as a token).
+
+```rust
+pub fn scan_macro_body(body: &str, report: &mut dyn FnMut(&str, &str)) -> Vec<MacroToken>;
+pub fn resolve_tokens(tokens: &[MacroToken], scope: &MacroScope) -> String;
+pub fn build_macro_scope(raw: &str) -> MacroScope;
+pub fn apply_macros(body: &str, raw: &str) -> String;            // scan + scope + resolve, reporter is a no-op
+pub fn apply_macros_reporting(body: &str, raw: &str, report: &mut dyn FnMut(&str, &str)) -> String;
+pub fn expand_invocation(line: &str, macros: &[Macro]) -> String;
+```
+
+The scanner walks a `&[u8]` cursor (the TS indexed UTF-16 code units but only ever matched
+ASCII delimiters), so byte indexing is correct and literal slices always land on char
+boundaries.
+
+### Placeholder syntax
+
+The primary syntax is the indus double-curly `{{arg.…}}` form, so placeholders never collide
+with stray `$` in prose. Whitespace inside the braces is optional around the accessor and its
+numeric arguments:
+
+| Placeholder | Token | Resolves to |
+|-------------|-------|-------------|
+| `{{arg.1}}`, `{{arg.2}}`, … | `Positional(N)` | one positional argument (1-based; out of range ⇒ empty) |
+| `{{arg.all}}` | `All` | every positional, re-joined with single spaces |
+| `{{arg.slice N L}}` | `Slice { start: N, length: Some(L) }` | at most `L` positionals from the 1-based offset `N` |
+| `{{arg.slice N}}` | `Slice { start: N, length: None }` | positionals from `N` onward |
+| `{{arg.rest N}}` | `Slice { start: N, length: None }` | alias of `slice N`; `N` defaults to `2`, so `{{arg.rest}}` is "everything after `arg.1`" |
+| `{{{{` | `Literal("{{")` | a literal `{{` (escape) |
+
+A compatibility shim also recognises the legacy `$arg` forms and fires the threaded
+`report` callback once per recognised form (so a host can surface a deprecation notice; the
+expansion still produces the expected text):
+
+| Legacy form | Token | Notes |
+|-------------|-------|-------|
+| `$1`, `$2`, … | `Positional(N)` | 1-based positional |
+| `$@` | `All` | every positional, joined |
+| `$ARGUMENTS` | `All` | matched as an exact bareword (`$ARGUMENTSX` does not partial-match) |
+| `${@:N}` | `Slice { start: N, length: None }` | from `N` onward |
+| `${@:N:L}` | `Slice { start: N, length: Some(L) }` | bounded sub-range |
+| `${@}` | `All` | the brace spelling of `$@` |
+| `$$` | `Literal("$")` | escape — a literal `$` |
+
+Unlike the TS module-global `legacyReporter` singleton, the reporter is threaded as an
+explicit `&mut dyn FnMut(&str, &str)` parameter — callers that do not care pass
+`&mut |_, _| {}`. Any apparent placeholder that fails to parse (`${foo}`, a dangling `$`,
+a stray `{{` that does not open `{{arg.`, `{{foo}}`) is treated as literal text so the body
+survives untouched. A positional out of range resolves to empty; a slice clamps its 1-based
+start to the argument vector.
+
+`build_macro_scope` does a quote-aware split of the raw argument line (single and double
+quotes group; quotes are stripped; empty runs dropped):
+
+```rust
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MacroScope { pub args: Vec<String>, pub all: String, pub raw: String }
+```
+
+### Loading and expansion
+
+`load_macros(dir, origin, label)` reads the direct `*.md` children of a directory
+(**non-recursive** — slash macros are flat files), sorts the entries, skips dotfiles and
+non-`.md` files, parses each via `read_macro_file`, and dedupes by name (first wins). A
+missing directory yields an empty `Vec`; an unreadable file returns
+`Err(BriefingFault::MacroInvalid)`. `read_macro_file` derives the macro name from the
+basename (minus `.md`, case-insensitive) and the description from frontmatter `description`
+(suffixed with the origin's `label`), or — absent that — from the first non-blank body line,
+capped at `DERIVED_DESCRIPTION_BUDGET` (72) **chars** (not bytes) with a trailing `…`.
+
+```rust
+pub fn load_macros(dir: &Path, origin: MacroOrigin, label: Option<&str>) -> Result<Vec<Macro>, BriefingFault>;
+pub fn read_macro_file(path: &Path, origin: MacroOrigin, label: &str) -> Result<MacroDef, BriefingFault>;
+```
+
+```rust
+let macros = load_macros(Path::new("/repo/.indusagi/commands"), MacroOrigin::Project, None)?;
+assert_eq!(expand_invocation("/deploy staging fast", &macros), "ship staging in mode fast");
+//   body "ship $1 in mode $2" + args "staging fast"
+
+assert_eq!(apply_macros("all: {{arg.all}} | rest: {{arg.rest}}", "a b c"), "all: a b c | rest: b c");
+```
+
+`expand_invocation` only rewrites lines that open with `/` and name a known macro (first
+match by name wins); ordinary user turns pass straight through. These macros become dynamic
+`/template` slash commands — see [slash commands](/rust-cli/console/slash-commands).
+
+`split_frontmatter` is the shared minimal `---`-fenced YAML-ish reader: it recognises a block
+only when the first line is exactly `---` and a later line is exactly `---`, turns each
+`key: value` line into a flat entry (returned as an ordered `Vec<(String, String)>`, keeping
+the last value of a duplicate key), strips matching surrounding quotes via `unquote_scalar`,
+and skips blank / `#`-comment lines.
+
+## Skill Cards
+
+A [`SkillCard`] is *documentation the model reads*, not a callable: a markdown file in the
+Agent-Skills format whose frontmatter names a skill and one-line-describes when it applies,
+with a body of on-demand instructions. The model decides from the `description` whether a
+task matches, then loads the file's `location` with the reader to read the full body. Paths a
+skill mentions are relative to that skill's own directory.
+
+```rust
+#[derive(Clone, Debug, PartialEq)]
+pub struct SkillCard {
+    pub name: String,                  // validated invocation name
+    pub description: String,           // single-line summary surfaced in the briefing
+    pub body: String,                  // markdown instruction text below the frontmatter
+    pub location: PathBuf,             // absolute path of the SKILL.md
+    pub origin: MacroOrigin,           // where it was discovered
+    pub frontmatter: SkillFrontmatter, // parsed header, retained for introspection
+}
+```
+
+### Discovery and validation
+
+`load_skill_cards(dir, origin)` walks one root; `gather_skill_cards(roots)` merges several
+`SkillRoot`s. The walk (`walk_candidates` → `walk_level`) is a generic recursive directory
+walk that sorts entries, skips dotfiles, prunes `PRUNED_DIRS` (`node_modules`, `.git`), and
+breaks symlink cycles by canonical realpath. It recognises the format's two shapes:
+
+- At a **root** level, a loose `*.md` child is a single-file skill (its name is inferred from
+  the enclosing directory and skips the directory-match check when no `name` is declared).
+- In any **subdirectory**, a `SKILL.md` (compared case-sensitively against `SKILL_MANIFEST`)
+  is a packaged skill whose declared name **must match** its enclosing directory.
+
+`fs::metadata` (not `symlink_metadata`) is used for the file/dir check so a symlinked
+candidate is followed, matching the TS `statSync`. Validation policy (the *format* is the
+shared public spec; the prose messages are the briefing's own):
+
+| Rule | Detail |
+|------|--------|
+| Name pattern | `check_name` hand-matches `^[a-z0-9]+(?:-[a-z0-9]+)*$` — lowercase-alphanumeric words joined by single hyphens (no leading/trailing/double hyphen) |
+| Name length | ≤ `SKILL_NAME_LIMIT` (64) chars |
+| Name vs. directory | a declared name on a packaged skill (or a loose root `*.md` that declares one) must equal the enclosing directory |
+| Description | required, ≤ `SKILL_DESCRIPTION_LIMIT` (1024) chars |
+| Frontmatter keys | every key must be in `KNOWN_FRONTMATTER_KEYS`; a stray key marks the file `Invalid` (the format is closed, so a stray key is treated as a typo) |
+| Kebab → snake | `project_frontmatter` maps `allowed-tools` → `allowed_tools` (split on whitespace/commas) and `disable-model-invocation` → `disable_model_invocation` (only `"true"` sets it) |
+
+The walk **never panics**: an unreadable file becomes an `Invalid` diagnostic via
+`parse_candidate`. Each candidate yields a `SkillDiagnostic` with one of four
+`SkillOutcomeKind`s (`Loaded`/`Skipped`/`Invalid`/`Collision`).
+
+`gather_skill_cards` dedupes by name with first-root-wins and emits explicit `Collision`
+diagnostics for later claimants; `load_skill_cards` does **not** dedupe across roots. To
+keep exactly one `Loaded` diagnostic per surviving card, the merge loop forwards only
+`kind != Loaded` diagnostics from each sub-load and re-emits the `Loaded`/`Collision` line
+itself (Gotcha G-5). `model_invocable_cards` drops cards flagged `disable-model-invocation`
+— those remain available as explicit `/skill:<name>` commands but never appear in the
+briefing's skill block.
+
+```rust
+use induscode::briefing::{SkillRoot, MacroOrigin, gather_skill_cards, model_invocable_cards};
+
+let load = gather_skill_cards(&[
+    SkillRoot { dir: PathBuf::from("/repo/.indusagi/skills"), origin: MacroOrigin::Project }, // project before user
+    SkillRoot { dir: PathBuf::from("/home/u/.indusagi/skills"), origin: MacroOrigin::User },
+]);
+let visible = model_invocable_cards(&load.cards);     // drops disable-model-invocation cards
+for d in &load.diagnostics {
+    println!("{:?} {} {}", d.kind, d.location.display(), d.detail);  // Loaded / Invalid / Collision
+}
+```
+
+The skills block in the rendered prompt XML-escapes each card's `name`, `description`, and
+`location` into 2-space-indented `<skill>` entries inside `<available_skills>…</available_skills>`.
+
+## Faults
+
+`BriefingFault` is the closed, typed failure surface for the prompt half of this layer — a
+`thiserror::Error` enum. These are agent-domain errors, deliberately NOT folded into
+`indusagi::core::errors::CoreError`.
+
+```rust
+#[derive(Debug, thiserror::Error)]
+pub enum BriefingFault {
+    #[error("macro invalid: {0}")]
+    MacroInvalid(String),   // a macro file could not be read/parsed
+    #[error("skill invalid: {0}")]
+    SkillInvalid(String),   // a SKILL.md failed format validation
+}
+```
+
+| Variant | Returned when |
+|---------|---------------|
+| `MacroInvalid` | `read_macro_file` / `load_macros` cannot read a macro file. |
+| `SkillInvalid` | the prompt-half analogue of a `SKILL.md` format-validation failure. |
+
+The TS `BriefingFaultKind` also carried `publish` / `theme` kinds; those live in the
+transcript-export crate's own fault vocabulary in this rebuild, leaving the briefing
+carrying only the macro/skill kinds.
+
+## The Live Call Site
+
+The only place in the runtime that composes a briefing is `compose_session_briefing` in
+`induscode::boot::runners`. It is driven by every run mode — interactive, `-p` print,
+`--json` link — through the [boot](/rust-cli/subsystems/boot) runners:
+
+```rust
+fn compose_session_briefing(
+    inv: &Invocation,
+    cwd: &str,
+    descriptors: &[indusagi::llmgateway::contract::ToolDescriptor],
+) -> String {
+    let tools: Vec<ToolDoc> = descriptors.iter().map(|d| ToolDoc {
+        name: d.name.clone(),
+        description: d.description.clone(),
+        parameters: d.parameters.clone(),
+    }).collect();
+    let input = BriefingInput {
+        workspace: Some(cwd.to_string()),
+        cwd: Some(cwd.to_string()),
+        tools,
+        ..Default::default()
+    };
+    let opts = ComposeOptions {
+        system: inv.system.clone(),         // --system replaces wholesale
+        append_system: inv.append_system.clone(),  // --append-system appends
+        ..Default::default()
+    };
+    compose_briefing_with_options(&input, &opts)
+}
+```
+
+The deck's `ToolDescriptor`s become the briefing's [`ToolDoc`]s by copying `name`,
+`description`, and `parameters`. The live `BriefingInput` is built from `workspace`/`cwd`
+plus `tools`; the `context_docs`, `skills`, and `subagents` fields are fully implemented and
+unit-tested but are populated by separate console/boot wiring rather than this exact
+function — `gather_context_docs`, `gather_skill_cards`/`model_invocable_cards`, and the
+delegate briefs feed in through their own discovery sites. The result is the agent's
+`AgentConfig.system`, the same recipe a real run uses, so the live console drives an agent
+whose instructions and tool docs are intact.
+
+## Framework Anchors
+
+The briefing builds on the published [`indusagi`](/rust) framework crate and never
+re-declares its shapes:
+
+- `indusagi::core::time::now_ms()` ← the wall-clock source for the footer timestamp when
+  `BriefingInput.now_ms` is `None` (see [Core](/rust/subsystems/core)).
+- `indusagi::llmgateway::contract::ToolDescriptor` ← the deck/gateway tool schema the live
+  call site projects into [`ToolDoc`] (name, description, parameters).
+
+The briefing depends only on `induscode::core`, [`indusagi::smithy`](/rust/subsystems/smithy),
+and [`indusagi::core`](/rust/subsystems/core) — it consumes tool schemas as input data, so it
+carries no dependency on the [capability deck](/rust-cli/subsystems/capability-deck) crate.
+Third-party deps are `serde_json` (the `ToolDoc.parameters` value and `SkillFrontmatter.metadata`
+bag), `regex` (the `@import` grammar), and `thiserror` (`BriefingFault`).
+
+## Source Layout
+
+| Path | Holds |
+|------|-------|
+| `crates/induscode/src/briefing/mod.rs` | The public barrel re-exporting the briefing vocabulary. |
+| `crates/induscode/src/briefing/contract.rs` | The frozen type surface + `BriefingFault` + limits. |
+| `crates/induscode/src/briefing/compose.rs` | `compose_briefing`(`_with_options`), `compose_with`, `BRIEFING_SECTIONS`, the section renderers, `TOOL_SUMMARIES`, the RFC3339 footer clock. |
+| `crates/induscode/src/briefing/context_docs.rs` | `gather_context_docs`, the ancestor-chain walk, `@import` resolution, byte/depth clamps. |
+| `crates/induscode/src/briefing/macros.rs` | The single-pass scanner, resolver, scope builder, loader, and shared `split_frontmatter`. |
+| `crates/induscode/src/briefing/skills.rs` | The `SKILL.md`/`*.md` walk, validators, kebab→snake projection, and `gather_skill_cards`. |
+
+Neighbouring consumers: `boot/runners.rs` (the live `compose_session_briefing`), the console
+slash-command layer (macros become `/template` rows, skill cards become `/skill:<name>` rows
+— see [slash commands](/rust-cli/console/slash-commands)), and the session engine that hands
+the composed prompt to the [conductor](/rust-cli/subsystems/conductor) as
+`AgentConfig.system`. For the parity mapping back to the source editions see the
+[TypeScript](/cli) and [Python](/python-cli/subsystems/briefing) briefing pages; the TS
+lineage additionally hosted the SGR machine and HTML transcript palette in the briefing
+contract, which this rebuild relocated to the transcript-export crate, leaving this module
+carrying only sections, context docs, macros, skills, `ContextDoc`, and `BriefingFault`.

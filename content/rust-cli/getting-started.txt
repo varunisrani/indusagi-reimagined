@@ -1,0 +1,391 @@
+# Getting Started
+
+> `induscode` is the 100%-Rust rebuild of the terminal-first AI coding agent,
+> built on the Rust [`indusagi`](/rust/README) framework. Build it with `cargo build`,
+> install it with `cargo install induscode`, then run the `indusr` (or `indusagir`)
+> binary — a bare invocation opens the interactive ratatui console, and flags switch
+> it into one-shot print or headless line-protocol modes. State lives under
+> `~/.indusagi/agent/`.
+
+## Table of Contents
+
+- [Toolchain](#toolchain)
+- [Build from source](#build-from-source)
+- [Install](#install)
+- [The binary and invocation](#the-binary-and-invocation)
+- [Set a provider key](#set-a-provider-key)
+- [Sign in interactively](#sign-in-interactively)
+- [First interactive run](#first-interactive-run)
+- [One-shot print mode](#one-shot-print-mode)
+- [Headless line-protocol mode](#headless-line-protocol-mode)
+- [How the mode is derived](#how-the-mode-is-derived)
+- [Pick a model](#pick-a-model)
+- [Browse the model catalog](#browse-the-model-catalog)
+- [Where state lives](#where-state-lives)
+- [Notes](#notes)
+
+## Toolchain
+
+The agent is pinned to one stable Rust release, in
+[`rust-toolchain.toml`](https://github.com/) at the repo root:
+
+```toml
+[toolchain]
+channel    = "1.96.0"
+components = ["rustfmt", "clippy"]
+```
+
+The pin matches the framework's MSRV floor (`rust-version = "1.96"`, edition 2024)
+so the agent never out-runs the framework it depends on. `induscode` is its own
+virtual Cargo workspace; its product crate depends on the already-complete
+[`indusagi`](/rust/README) framework crate (`indusagi = { version = "0.1.0", features = ["swarm"] }`),
+exactly as the TypeScript agent declared `"indusagi": "^0.13.1"`.
+
+## Build from source
+
+`cargo build` exercises the default feature surface `["rustls", "mcp", "tui", "oauth"]`
+— TLS over rustls, the MCP bridge, the ratatui console, and the browser sign-in
+flows:
+
+```bash
+cargo build --workspace
+# headless (no console / no render layer):
+cargo build -p induscode --no-default-features --features "rustls,anthropic"
+# release binary (the dist profile builds with lto = "fat"):
+cargo build --release -p induscode
+
+# run straight from source without installing (dev launch):
+cargo run -p induscode --bin indusr -- --help
+cargo run -p induscode --bin indusr -- "fix the failing test in src/auth"
+```
+
+The repo-automation tasks live in `xtask` — the lineage / version single-source
+gates that keep the clean-room posture honest:
+
+```bash
+cargo run -p xtask -- lineage     # clean-room source-hygiene gate
+cargo run -p xtask -- version     # literal-VERSION single-source gate
+```
+
+The version is single-sourced: `induscode::core::VERSION` is
+`env!("CARGO_PKG_VERSION")`, resolved at compile time from `Cargo.toml`, never a
+string literal in source (an `xtask`/CI grep gate forbids any version literal
+outside `Cargo.toml`).
+
+## Install
+
+| Audience | Command | Result |
+|---|---|---|
+| Rust user (crates.io) | `cargo install induscode` | installs `indusr` + `indusagir` |
+| Rust user, prebuilt | `cargo binstall induscode` | downloads a release binary |
+| Embedding it as a library | `cargo add induscode` | adds the dependency (surface `induscode::<module>`) |
+| npm user (preserves the habit) | `npm i -g indusagi-coding-agent` | the published package wrapper |
+| macOS / Linux, scripted | `curl --proto '=https' -sSf https://…/install.sh \| sh` | scripted install |
+| Windows | `irm https://…/install.ps1 \| iex` | scripted install |
+
+Installing the crate gives you **two equivalent commands — `indusr` and
+`indusagir`** — both built from the single `src/bin/main.rs` entry (the Rust
+analogue of the TS bin block `{"indus": …, "indusagi": …}`), both launching the
+same agent. Use whichever you prefer.
+
+## The binary and invocation
+
+The binary's `main` is `async fn main() -> ExitCode` — the single place an exit
+code reaches the OS. It is the only OS exit point: returning [`ExitCode`] lets the
+tokio runtime drain and destructors run, so the terminal's raw / alt-screen mode is
+always restored on the way out (a `process::exit` mid-TUI would corrupt it).
+
+`main` runs four steps, mirroring the TS `entry.ts` + `boot.ts`:
+
+1. **Brand off `argv[0]`'s basename** (`resolve_brand`): the live brand is whichever
+   bin name launched the process, falling back to the primary `BIN_NAMES[0]`
+   (`"indus"`) when the launch name is unrecognized.
+2. **Install the single `[MCP]` console-noise filter** (`install_mcp_noise_filter`),
+   a no-op when the `INDUSAGI_DEBUG` env var is set so diagnostics flow freely.
+3. **Route the argv** (`route`): the no-session verbs (`auth`, `signin`, `signout`,
+   the package verbs, `--list-models`) are owned by the CLI and run to an exit code
+   without touching boot; `--help` / `--version` short-circuit; everything else is a
+   real run.
+4. **Hand a real run to [`boot_run`]** (`induscode::boot::boot_run`), whose resolved
+   `ExitCode` this `main` adopts unchanged.
+
+`--help` / `-h` renders the usage banner from the single declarative flag table via
+`render_usage()` (so the help text can never drift from what the parser accepts),
+then appends a `Commands:` footer documenting the credential verbs. `--version` /
+`-v` prints `<app name> <version>` from the single-source `VERSION`:
+
+```bash
+indusr --help        # the option reference, generated from the flag table
+indusr --version     # prints: indusagi <version>
+indusagir --version  # the second bin name prints the same
+```
+
+An unknown **leading** flag (a `-…` token the launch table does not name) is a usage
+error — exit code `2`, the agent's malformed-invocation convention. Note the parser
+itself (`induscode::launch::parser::read_invocation`) is deliberately *tolerant* of
+unknown flags everywhere else: an unrecognized `--flag` lands in the loose flag bag
+as a boolean (the extension-flag escape hatch), never an error.
+
+## Set a provider key
+
+The fastest path to a first run is to export the provider key for the model you
+intend to use, then run. Each provider in the credential directory
+(`induscode::launch::credentials::PROVIDER_DIRECTORY`, 14 entries) reads its own
+conventional environment variable:
+
+```bash
+export ANTHROPIC_API_KEY="sk-ant-..."   # Anthropic (Claude) — the default provider
+export OPENAI_API_KEY="sk-..."          # OpenAI
+export GEMINI_API_KEY="..."             # Google Gemini
+```
+
+The directory maps each provider id to its `env_key` and a `docs_url` where you
+obtain a key:
+
+| Provider id | Label | Env var |
+|---|---|---|
+| `anthropic` | Anthropic (Claude) | `ANTHROPIC_API_KEY` |
+| `openai` | OpenAI | `OPENAI_API_KEY` |
+| `google` | Google Gemini | `GEMINI_API_KEY` |
+| `xai` | xAI (Grok) | `XAI_API_KEY` |
+| `groq` | Groq | `GROQ_API_KEY` |
+| `cerebras` | Cerebras | `CEREBRAS_API_KEY` |
+| `mistral` | Mistral | `MISTRAL_API_KEY` |
+| `openrouter` | OpenRouter | `OPENROUTER_API_KEY` |
+| `minimax` | MiniMax | `MINIMAX_API_KEY` |
+| `kimi` | Kimi (Moonshot) | `MOONSHOT_API_KEY` |
+| `sarvam` | Sarvam | `SARVAM_API_KEY` |
+| `krutrim` | Krutrim | `KRUTRIM_API_KEY` |
+| `nvidia` | NVIDIA | `NVIDIA_API_KEY` |
+| `zai` | Z.ai | `ZAI_API_KEY` |
+
+With a key in the environment you can run immediately — no sign-in step required.
+For persistent, multi-account, or browser (OAuth) credentials, use `signin` instead
+(next section). See [Auth](/rust-cli/configuration/auth) for the full credential
+model.
+
+## Sign in interactively
+
+The `signin` / `signout` verbs are no-session credential commands the CLI owns: the
+router intercepts a leading `signin` / `signout` token **before** the boot handoff
+(boot would otherwise drop them into the REPL), runs the agent's own multi-account
+credential command, and returns its own exit code — `0` on success, `1` on a typed
+fault printed to stderr. The `auth` subcommand (`auth login` / `auth status` /
+`auth refresh` / `auth logout`) is dispatched the same way.
+
+```bash
+indusr signin anthropic                    # store an Anthropic API key (the default path)
+indusr signin openai --account work        # name a stored credential account
+indusr signin anthropic --method oauth     # force the browser (OAuth) path
+indusr signin anthropic --oauth            # shorthand for --method oauth
+indusr signin --list                       # read-only: list saved accounts
+indusr signout anthropic                   # remove a stored credential
+
+indusr auth login anthropic                # framework PKCE browser flow (where configured)
+indusr auth status [provider]              # show which providers are signed in
+indusr auth logout                         # routed to the agent's signout path
+```
+
+The credential command verbs are recognised by `induscode::launch::credentials`
+(`run_credential_command`), which accepts `--provider` / `--account` /
+`--method <oauth|api-key>` (alias `--api-key` / `--oauth`) / `--list`, and treats
+the first bare positional after the verb as the provider. The api key is read with
+echo muted on a TTY (crossterm raw mode for the duration of the read) and wrapped in
+a `SecretString` immediately, so it never logs or echoes.
+
+**Default-to-api-key:** the shipped OAuth client ids are unconfigured sentinels, so
+a bare `indusr signin <provider>` automatically appends `--method api-key`
+(`default_signin_to_api_key`) and lands straight on the working api-key prompt. Pass
+`--method oauth` explicitly to opt into the browser flow. Credentials persist to the
+multi-account `auth.json` vault under `~/.indusagi/agent/`, byte-compatible with the
+framework's single-record auth store.
+
+## First interactive run
+
+A bare `indusr` invocation — or any invocation whose resolved mode is `text` —
+opens the interactive [console](/rust-cli/console/overview), a ratatui REPL driven
+by the [conductor](/rust-cli/subsystems/conductor): streaming replies, a live tool
+deck, and slash commands. The output mode `OutputMode::Text` maps to the boot runner
+`RunnerId::Repl` (`induscode::boot::pipeline`).
+
+```bash
+indusr                                  # interactive ratatui console
+indusr "refactor the auth module"       # seed the first prompt, stay interactive
+indusr -i "start here"                  # force interactive even with a prompt
+```
+
+`--interactive` / `-i` forces the interactive session even when a prompt is supplied
+(it overrides `--print`, keeping the mode `text`). Resume or continue a prior session
+from the directory:
+
+```bash
+indusr --resume        # -r : pick a previous session to resume
+indusr --continue      # -c : continue the most recent session in this directory
+```
+
+Attach files to any prompt with `@path` references — the reader collects them into a
+separate file-reference channel (`read_file_references`), and the attachment gatherer
+inlines text files into the prompt and decodes images to the framework image block:
+
+```bash
+indusr "review this" @src/main.rs @diagram.png
+```
+
+The `@file` token is neither a flag nor a positional, and the `--` terminator stops
+option parsing so every later token is treated as a positional.
+
+## One-shot print mode
+
+`-p` (`--print`) runs a single request to settlement, prints only the final result,
+and exits — ideal for scripting and pipelines. The resolved mode is
+`OutputMode::Json`, which maps to the boot runner `RunnerId::Oneshot` in its
+clean-text shape.
+
+```bash
+indusr -p "summarize this repo"
+indusr -p "explain the boot pipeline" @src/bin/main.rs
+indusr -p --json "summarize this repo"   # NDJSON shape (see below)
+```
+
+The production output seam (`StdioSink`) writes user-facing text to stdout and
+diagnostics to stderr, flushing each write so output is not buffered behind a
+long-running turn. A closed pipe is swallowed, so piping through `| head` exits
+cleanly.
+
+## Headless line-protocol mode
+
+Adding `--json` (alias `--rpc`) selects the headless line protocol over stdio for a
+driving parent process — a newline-delimited JSON wire. The resolved mode is
+`OutputMode::Rpc`, which maps to the boot runner `RunnerId::Link`. See
+[Channels](/rust-cli/subsystems/channels) for the full wire surface.
+
+```bash
+indusr --json                            # long-lived line-protocol link
+indusr -p --json "summarize this repo"   # one-shot print run, NDJSON output
+```
+
+The production input seam (`StdinSource`) performs one blocking stdin read per line
+on a blocking thread (so the async runtime is not stalled), dropping the trailing
+newline. Only the interactive runner reads it; the one-shot and link runners drive
+their own framers and never read stdin line-by-line.
+
+### How the mode is derived
+
+The output mode resolves from your flags via the fixed `derive_mode` precedence
+that `induscode::launch::parser::read_invocation` applies, then maps to a boot
+runner:
+
+| Flags | `OutputMode` | Runner (`RunnerId`) |
+|-------|--------------|---------------------|
+| `--json` / `--rpc` | `Rpc` | `Link` (line protocol over stdio) |
+| `--print` (`-p`) without `--interactive` | `Json` | `Oneshot` |
+| anything else (the default) | `Text` | `Repl` (interactive ratatui console) |
+
+`--json` wins over `--print`; `--interactive` (`-i`) overrides `--print` to keep the
+mode `Text`. The runner registry (`induscode::boot::contract`) asks each runner
+whether it `accepts` the parsed invocation and runs the first match, falling back to
+`Repl` when nothing accepts.
+
+## Pick a model
+
+`-m` (`--model`) selects the model for the run, matched against the framework
+catalog, provider-qualified (`provider/name`) or bare:
+
+```bash
+indusr -m claude-haiku-4-5 -p "hi"
+indusr -m anthropic/claude-sonnet-4 "refactor the auth module"
+indusr -m openai/gpt -p --json "summarize this repo"
+```
+
+Pair `-m` with `--thinking` to set the reasoning effort. The accepted rungs are the
+`THINKING_EFFORTS` vocabulary (`induscode::launch::contract::ThinkingEffort`):
+`off`, `minimal`, `low`, `medium`, `high`, `xhigh`. An unrecognized value is ignored.
+
+```bash
+indusr -m claude-sonnet-4 --thinking high "design the migration plan"
+```
+
+`--fallback-model` names a model to switch to mid-turn when the selected model is
+overloaded (HTTP 529). With no `-m`, the model falls back to `default_model` /
+`default_provider` from your [settings](/rust-cli/configuration/settings) (whose
+default provider is `anthropic`), then to the framework default. See
+[Models](/rust-cli/configuration/models) and the
+[framework LLM gateway](/rust/subsystems/llm-gateway) for provider routing.
+
+## Browse the model catalog
+
+`--list-models` prints the available models as an aligned table and exits, with no
+session and no directory side effects. The CLI handles it before the boot handoff via
+`induscode::launch::catalog::print_model_catalog`, sourcing rows from the live
+facade catalog (`RegistrySource`, walking `get_providers()` × `get_models()` over
+the framework `indusagi` catalog). Pass an optional substring to filter:
+
+```bash
+indusr --list-models             # the full provider/model catalog
+indusr --list-models claude      # filter by a case-insensitive substring
+indusr --list-models=opus        # inline substring filter
+```
+
+The substring is a plain case-insensitive test over the `provider/modelId`
+identifier (no fuzzy matcher). The six table columns are `Provider`, `Model`,
+`Context`, `Max Output`, `Thinking`, and `Images` — each row's `context_window`,
+`max_tokens`, `reasoning`, and image-modality support projected from the facade
+model (`facade_model_to_row`). The `mock` echo provider is excluded
+(`EXCLUDED_PROVIDERS`) so the listing shows only the real matrix.
+
+## Where state lives
+
+Per-user state lives under `~/.indusagi/agent/` by default. The coding agent nests
+its state one level deeper than the framework `Locator` (`<home>/.indusagi`): the
+brand's `profile_dir_name` is `.indusagi` and its `state_dir_name` is `agent`, so the
+resolved profile root is `<home>/.indusagi/agent`. Override the location with the
+`INDUSAGI_CODING_AGENT_DIR` environment variable (`~`-expanded, cwd-relative-aware).
+
+The fully-resolved layout is one `Workspace` record of absolute paths
+(`induscode::core::create_workspace`):
+
+| Member | Path under the profile root | What it holds |
+|---|---|---|
+| `settings_path` | `settings.json` | merged user preferences |
+| `auth_path` | `auth.json` | the multi-account credential vault |
+| `sessions_dir` | `sessions/` | per-cwd transcript directories |
+| `models_path` | `models.json` | custom model-catalog overrides |
+| `tools_dir` / `bin_dir` | `bin/` | provisioned native helpers (fd / rg) |
+| `prompts_dir` | `prompts/` | user-authored prompt / command templates |
+| `themes_dir` | `themes/` | user-installed colour themes |
+| `export_template_dir` | `export-template/` | HTML transcript-export template |
+| `debug_log_path` | `debug.log` | verbose diagnostic log |
+| `mcp_config_path` | `mcp-servers.json` | external MCP server config |
+| `memory_config_path` | `memory.json` | memory-feature config |
+| `composio_config_path` | `composio.json` | Composio-integration config |
+| `memory_db_path` | `memory.db` | on-disk memory database |
+
+Settings are read through a two-tier `PreferenceStore`
+(`induscode::core::PreferenceStore`): project-over-global-over-default on read, with
+writes landing in the project tier only (`<cwd>/.indusagi/settings.json`), so a
+per-checkout override never leaks machine-wide. A missing / unreadable / bad-JSON /
+non-object settings file degrades to the empty record rather than throwing. See
+[Settings](/rust-cli/configuration/settings) for the 24-key `Preferences` record and
+the merge.
+
+## Notes
+
+- The crate is `induscode` on crates.io; the two installed binaries are `indusr`
+  (primary) and `indusagir`, both built from the single `src/bin/main.rs` entry.
+- Requires the Rust toolchain pinned in `rust-toolchain.toml` (channel `1.96.0`,
+  MSRV 1.96, edition 2024).
+- `--help` and `--version` are rendered from the same `FLAG_SPECS` table the parser
+  reads (`induscode::launch::flags`, 18 rows in 5 groups), so usage text can never
+  drift from behavior.
+- The version is single-sourced from `Cargo.toml` via `env!("CARGO_PKG_VERSION")`,
+  re-exported as `induscode::core::VERSION` — never duplicated; an `xtask` gate
+  forbids version literals outside `Cargo.toml`.
+- State lives under `~/.indusagi/agent/` by default; relocate it with
+  `INDUSAGI_CODING_AGENT_DIR`. Set `INDUSAGI_DEBUG` to unmute the `[MCP]`
+  transport-log filter.
+- The agent is built on the Rust [`indusagi`](/rust/README) framework and reaches it
+  as `indusagi::<module>` (core, llmgateway, runtime, tui, shell_app, …). For the
+  full flag grammar and mode documentation see [Launch](/rust-cli/subsystems/launch)
+  and the [CLI reference](/rust-cli/reference/cli). Parity with the other editions is
+  documented at [Python CLI](/python-cli/getting-started) and the
+  [TS edition](/cli/README).

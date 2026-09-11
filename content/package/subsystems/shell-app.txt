@@ -1,0 +1,119 @@
+# Shell App
+
+> `src/shell-app` is the L5 Product CLI layer — it turns a command line into a
+> running agent. Imported as `indusagi/shell-app`, or as the `shell` namespace from
+> `indusagi`. The package's `indusagi` binary maps to `dist/cli.js`.
+
+The shell app owns the boot pipeline: parse `argv` into a structured `Invocation`,
+short-circuit the output-only `help` / `version` modes, assemble a `BootContext`
+(settings, model, tools, agent factory, I/O streams), and hand it to the selected
+runner — one of `print`, `wire`, or `repl`. It calls no UI toolkit and never
+`process.exit` itself.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-directories](#sub-directories)
+- [The boot pipeline](#the-boot-pipeline)
+- [Flags and runners](#flags-and-runners)
+- [Settings, branding, upgrades, and auth](#settings-branding-upgrades-and-auth)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+From `src/shell-app/index.ts`:
+
+| Export | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `main`, `buildBootContext` | functions | `cli.ts` | The CLI entry point and the boot-context assembler |
+| `renderUsage`, `resolveVersion` | functions | `cli.ts` | Derive `--help` text and the version string |
+| `OneShotRunner`, `WireRunner`, `ReplRunner`, `TextView` | classes | `runners/` | The three runners and the default text view |
+| `RUNNERS`, `selectRunner`, `NoRunnerError`, `EndOfInput` | values/classes | `runners/` | The runner registry, selector, and signals |
+| `tokenizeInvocation`, `FLAG_SPECS` | fn / const | `invocation/parse.ts`, `invocation/flags.ts` | The table-driven parser and the flag table |
+| `Locator`, `BRAND`, `envName` | class / const / fn | `locate/` | The single source of naming and path truth |
+| `loadSettings`, `resolveModelId`, `DEFAULT_SETTINGS` | fns / const | `config/` | Settings resolution |
+| `applyUpgrades`, `UPGRADES` | fn / const | `upgrade/` | Idempotent startup upgrades |
+| `runAuthCommand` | function | `auth-cli/` | The `auth` OAuth helper subcommand |
+
+Types: `CliStreams`; `Runner`, `BootContext`, `AgentDeps`, `InteractiveView`;
+`Invocation`, `RunnerMode`, `FlagSpec`, `FlagValue`, `FlagKind`; `Brand`,
+`LocatorOverrides`; `Settings`; `Upgrade`; `AuthIO`.
+
+## Sub-directories
+
+| Directory | Holds |
+|-----------|-------|
+| `cli.ts` | The `main` entry point — parse, short-circuit `help`/`version`, assemble + run, teardown |
+| `invocation/` | `flags.ts` (`FLAG_SPECS`, the declarative flag table), `parse.ts` (`tokenizeInvocation`) |
+| `boot/` | `pipeline.ts` (the `Stage` reducer `runStages`), `stages.ts` (`BOOT_STAGES`, `buildBootContext`), `context.ts` |
+| `runners/` | `contract.ts` (`Runner`/`BootContext`/`InteractiveView`), `one-shot.ts`, `wire.ts`, `repl.ts`, `registry.ts` |
+| `config/` | `settings.ts` (`Settings`, `loadSettings`, `resolveModelId`), `locator.ts` |
+| `locate/` | `brand.ts` (`BRAND`, `envName`), `locator.ts` (`Locator`) — naming and path truth |
+| `upgrade/` | `upgrades.ts` — `UPGRADES` and `applyUpgrades` |
+| `auth-cli/` | `oauth-cli.ts` — `runAuthCommand`, the OAuth subcommand |
+
+## The boot pipeline
+
+`main` is a thin seam between the OS and the machinery. It parses `argv` into an
+`Invocation`, short-circuits `help` (rendered from the flag table) and `version`
+(read from `package.json`) without ever standing up an agent, then for every running
+mode assembles a `BootContext` and hands it to the selected runner, returning the
+exit code. The context's closables (MCP fleets, etc.) are always run on the way out.
+
+`buildBootContext` threads the invocation through a `Stage` pipeline (`runStages`
+over `BOOT_STAGES`): load settings, resolve the model id, compose the tool boxes,
+probe the streams, and package an agent factory. A runner never re-derives any of
+this — it only calls `makeAgent(deps?)` and drives the agent over the supplied
+`output` / `input` streams.
+
+## Flags and runners
+
+`FLAG_SPECS` is the single source of truth for the CLI vocabulary — every flag is
+one declarative row, and `--help` is generated from it. The flags:
+
+| Flag | Aliases | Kind | Meaning |
+|------|---------|------|---------|
+| `--model` | `-m` | string | Choose the model by catalog id or alias |
+| `--print` | `-p` | boolean | Emit a single answer to stdout and exit (one-shot) |
+| `--json` | `--rpc`, `--wire` | boolean | Speak the JSON line protocol over stdio (wire mode) |
+| `--interactive` | `-i` | boolean | Force the REPL even with a prompt present |
+| `--cwd` | — | string | Run as if started from this working directory |
+| `--system` | — | string | Override the system prompt |
+| `--no-tools` | — | boolean | Disable every tool; the model may only produce text |
+| `--mcp` | — | string (repeatable) | Attach an external MCP server |
+| `--help` | `-h` | boolean | Show usage and exit |
+| `--version` | `-v` | boolean | Print the version and exit |
+
+The parser dispatches by name/alias lookup (with longest-match on clustered short
+flags) rather than a hand-written loop. `selectRunner` does a linear scan over
+`RUNNERS` — the first `Runner` whose `accepts(invocation)` returns true wins:
+
+- **`OneShotRunner`** — print mode (`-p`): emit one answer and exit.
+- **`WireRunner`** — wire mode (`--json`/`--rpc`/`--wire`): the JSON line protocol.
+- **`ReplRunner`** — the default interactive REPL.
+
+The interactive surface is kept behind the `InteractiveView` seam (`render` /
+`prompt` / `close`). A minimal plain-text `TextView` ships in `repl.ts`; a richer
+terminal UI (the `src/ui-bridge` Ink app) satisfies the same three methods without
+this layer importing any UI toolkit. `EndOfInput` is the rejection the view raises
+when input is exhausted.
+
+## Settings, branding, upgrades, and auth
+
+`loadSettings` merges user settings (starting from `DEFAULT_SETTINGS`) and
+`resolveModelId` resolves the model id; the `Settings` shape includes `ToolSettings`
+and `CompactionSettings`. `BRAND` is the single source of naming truth (app name,
+bin name, env-var prefix, directory names) and `Locator` turns those names plus the
+home/cwd roots into concrete paths; `envName` derives a prefixed env-var name.
+`applyUpgrades` runs the idempotent `UPGRADES` once on start-up, and `runAuthCommand`
+is the `auth` OAuth helper subcommand (over an `AuthIO` seam).
+
+## Relationship to neighbors
+
+Each runner wraps a [Runtime](/docs/subsystems/runtime) `Agent` (built by the boot
+context's `makeAgent` factory) and a [Capabilities](/docs/subsystems/capabilities)
+tool box. The `--mcp` flag attaches [Interop](/docs/subsystems/interop-mcp) fleets,
+closed on teardown. The richer interactive view is the
+[React-Ink](/docs/subsystems/react-ink) stack mounted through `src/ui-bridge`.
+
+Back to the [Architecture overview](/docs/architecture).

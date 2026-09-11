@@ -1,0 +1,359 @@
+# Capabilities
+
+> `indusagi.capabilities` is the batteries-included tool layer the agent runtime
+> exposes to a model: file read/write/edit/ls, content grep and filename find,
+> one-shot bash and background process control, a per-conversation todo
+> checklist, and web search/fetch. Import the whole surface from one site:
+> `from indusagi.capabilities import tool_box, define_tool, ToolSpec`.
+
+Every tool is authored as a declarative `ToolSpec` and wrapped by a single
+`define_tool` adapter, so authors write only an async `run()`. The defining
+architectural rule: tools never touch `pathlib`/`subprocess`/`httpx`-for-files
+directly — they receive abstract `Fs` and `Shell` capabilities through their
+`ToolContext`, and the one sanctioned binding to the real OS lives entirely in
+`backends/local.py`. The registry groups tools into read-only / coding / all
+collections and mints runtime `ToolBox`es from them.
+
+## Table of Contents
+
+- [Layout](#layout)
+- [The authoring kernel](#the-authoring-kernel)
+- [The Fs and Shell seams](#the-fs-and-shell-seams)
+- [Output budgeting](#output-budgeting)
+- [The built-in tools](#the-built-in-tools)
+- [Registry and collections](#registry-and-collections)
+- [Local backends](#local-backends)
+- [Diff helpers](#diff-helpers)
+- [Using the suite](#using-the-suite)
+- [Authoring a custom tool](#authoring-a-custom-tool)
+- [Relationship to neighbors](#relationship-to-neighbors)
+- [Notable behaviors](#notable-behaviors)
+
+## Layout
+
+Three layers stack under `capabilities/__init__.py`, which re-exports the whole
+surface from one import site.
+
+| Sub-directory | Holds |
+|---------------|-------|
+| `kernel/` | The frozen authoring shape: `ToolSpec`/`define_tool`/`DefinedTool`, `ToolContext`/`ToolResult`/content blocks, the `Fs`/`Shell` Protocols, `OutputBudget`+`clamp`, `ToolRegistry`, and the `resolve_path`/`make_context` context shape. |
+| `backends/` | The single sanctioned OS binding: `LocalFs` (`os`/`shutil` on threads), `LocalShell` (asyncio + Popen, process-group kills), and `make_local_context` with the standard 64 KB budget. |
+| `files/` | `read`/`write`/`edit`/`ls` tools plus a from-scratch Myers line differ (`diff_lines`/`render_unified_diff`) the edit tool uses for its unified-diff output. |
+| `search/` | `grep_tool` (regex content search) and `find_tool` (filename/glob search with a file/dir kind filter). |
+| `shell/` | `bash_tool` (one-shot `Shell.exec` with timeout/cwd) and `process_tool` (start/list/poll/stop background jobs via a global process table + scratch capture files). |
+| `planning/` | The todo checklist: `todo_set`/`todo_read` tools over a module-level `TodoStore` keyed by `ToolContext` identity; `TodoItem`/`TodoStatus` + `reset_todos`. |
+| `web/` | `web_search_tool` (DuckDuckGo HTML scraping via httpx) and `web_fetch_tool` (httpx GET + HTML-to-text simplification, byte-capped). |
+
+The two outward contracts capabilities depends on — the runtime's
+`ToolCall`/`ToolOutcome`/`ToolBox` and the gateway's `ToolDescriptor`/`JsonSchema`
+— are deliberately **not** re-exported here; consumers import those from their
+own contracts so there is a single source of truth.
+
+## The authoring kernel
+
+A tool is a `ToolSpec`: a `name`, a model-facing `description`, a JSON-Schema
+`parameters` shape, and one async `run(input, ctx) -> ToolResult`. `define_tool`
+wraps it into a `DefinedTool` so the author never writes descriptor, invocation,
+cancellation, or error-folding boilerplate.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `define_tool` | function | `kernel/spec.py` | Wrap a `ToolSpec` into a `DefinedTool` the model sees and the runtime invokes. |
+| `ToolSpec` | dataclass | `kernel/spec.py` | Declarative description: `name`, `description`, `parameters` (`JsonSchema`), async `run(input, ctx) -> ToolResult`. |
+| `DefinedTool` | class | `kernel/spec.py` | Wrapped tool; exposes `descriptor()`/`invoke(call, ctx)` for the runtime plus facade-shaped `label`/`description`/`parameters`/`execute()`. |
+| `ToolResult` | dataclass | `kernel/spec.py` | A tool's return: a sequence of content blocks + an `is_error` flag. |
+| `TextContentBlock` | dataclass | `kernel/spec.py` | A plain-text result fragment (`kind='text'`). |
+| `JsonContentBlock` | dataclass | `kernel/spec.py` | A structured result fragment (`kind='json'`), serialized when shown to the model. |
+| `ToolContentBlock` | type | `kernel/spec.py` | Union alias `TextContentBlock \| JsonContentBlock`. |
+| `ToolContext` | dataclass | `kernel/spec.py` | What every `run` receives besides its input: `cwd`, `fs`, `shell`, `cancel`, `budget`. Declared `eq=False` so per-session stores key by identity. |
+| `resolve_path` | function | `kernel/context.py` | Pure-string anchoring of a tool-supplied path against `ctx.cwd` (absolute passes through). |
+| `make_context` | function | `kernel/context.py` | Declared test-seam `ContextFactory` — intentionally raises `NotImplementedError`; use `make_local_context` instead. |
+| `ContextOverrides` | dataclass | `kernel/context.py` | Partial `ToolContext` shape for `make_context` (test seam). |
+| `ContextFactory` | class | `kernel/context.py` | Protocol for building a `ToolContext` defaulting omitted fields. |
+
+`DefinedTool.invoke(call, ctx)` coerces the model's raw input (unwrapping a
+JSON-string or `None` arg bag), honors an already-cancelled token up front, runs
+the spec, and folds both success and any thrown exception into the runtime's
+`ToolOutcome`. Outcome projection collapses a `ToolResult`'s content blocks into
+the flat `ToolOutcome.output`: a lone text block becomes a bare string, a lone
+json block becomes its raw value, and any mix stays a block sequence. A hard
+`asyncio.CancelledError` is re-raised, never folded into an outcome.
+
+## The Fs and Shell seams
+
+Tools receive abstract `Fs` and `Shell` Protocols via `ToolContext` and may
+never import `pathlib`/`subprocess` themselves — so a host can swap in a
+sandboxed, remote, or in-memory backend invisibly. These are the only I/O seams
+a tool may use.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `Fs` | class | `kernel/backends.py` | Protocol: async `read_text`/`read_bytes`/`write_file`/`stat`/`readdir`/`mkdir`/`rm`/`exists` — the only filesystem seam. |
+| `Shell` | class | `kernel/backends.py` | Protocol: async `exec()` (blocking, captured) + `spawn()` (background `ShellHandle`) — the only command seam. |
+| `FsEntryInfo` | dataclass | `kernel/backends.py` | `stat()` result: `is_file`/`is_directory`/`is_symlink`/`size`/`modified_ms`. |
+| `DirChild` | dataclass | `kernel/backends.py` | `readdir()` entry: `name` + `is_directory`. |
+| `RemoveOptions` | dataclass | `kernel/backends.py` | `Fs.rm` options: `recursive`, `ignore_missing`. |
+| `ShellLaunchOptions` | dataclass | `kernel/backends.py` | Shared spawn/exec settings: `cwd`, `env`, `cancel`. |
+| `ShellExecOptions` | dataclass | `kernel/backends.py` | `exec()` extras (subclass): `timeout_ms`, `input`. |
+| `ShellExecResult` | dataclass | `kernel/backends.py` | Settled `exec()` result: `stdout`, `stderr`, `code` (`None` when signalled). |
+| `ShellHandle` | class | `kernel/backends.py` | Protocol over a spawned process: `pid`, `kill(signal)`, `on_exit(listener) -> unsubscribe`. |
+
+## Output budgeting
+
+`OutputBudget` is a windowing policy that bounds tool output to a number of
+UTF-8 bytes so no single tool can flood the model's context window.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `OutputBudget` | dataclass | `kernel/output.py` | UTF-8 byte windowing policy: `kind` (head/tail/middle), `max_bytes`, optional `notice` callback. |
+| `clamp` | function | `kernel/output.py` | Bound text to an `OutputBudget` on character boundaries, splicing in a notice where bytes were dropped. |
+| `ClipEnd` | type | `kernel/output.py` | `Literal['head', 'tail', 'middle']`. |
+
+`clamp` measures in UTF-8 bytes and always cuts on a character boundary (backing
+off over `0b10xxxxxx` continuation bytes), so no multibyte sequence is split.
+The default supplied by `make_local_context` is a 64 KB `middle`-clamp.
+
+## The built-in tools
+
+Eleven capabilities — twelve registered tool objects, because `todo` is two
+tools. Each is a `DefinedTool` constant ready to register.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `read_tool` | const | `files/read.py` | Tool `read`: UTF-8 file contents with a line-number gutter, `offset`/`limit` windowing, budget-clamped. |
+| `write_tool` | const | `files/write.py` | Tool `write`: create/overwrite a file (creating parent directories). |
+| `edit_tool` | const | `files/edit.py` | Tool `edit`: replace an exact-or-whitespace-fuzzy snippet, return a unified diff; `replaceAll` supported. |
+| `ls_tool` | const | `files/ls.py` | Tool `ls`: list directory entries with kind/size columns. |
+| `grep_tool` | const | `search/grep.py` | Tool `grep`: regex content search over a tree, hit-capped and budget-clamped. |
+| `find_tool` | const | `search/find.py` | Tool `find`: filename/glob search with an optional file/dir kind filter. |
+| `bash_tool` | const | `shell/bash.py` | Tool `bash`: run one command to completion via `Shell.exec`, with `timeoutMs` (10-min ceiling, 2-min default) and `cwd`. |
+| `process_tool` | const | `shell/process.py` | Tool `process`: start/list/poll/stop long-lived background jobs whose output is captured to scratch files. |
+| `todo_set_tool` | const | `planning/todo.py` | Tool `todo_set`: replace the whole per-context checklist. |
+| `todo_read_tool` | const | `planning/todo.py` | Tool `todo_read`: play back the stored checklist (read-only). |
+| `web_search_tool` | const | `web/websearch.py` | Tool `websearch`: scrape the DuckDuckGo HTML endpoint via httpx, return ranked title/url/snippet hits. |
+| `web_fetch_tool` | const | `web/webfetch.py` | Tool `webfetch`: httpx GET an http(s) URL, simplify HTML to text, byte-cap the result. |
+
+Supporting state and test helpers:
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `reset_process_table` | function | `shell/process.py` | Clear the global background-job registry (test setup/teardown). |
+| `todo_store` | const | `planning/todo.py` | Module-level `TodoStore` keyed by `ToolContext` identity. |
+| `TodoStore` | class | `planning/todo.py` | In-process per-context checklist store: read/replace/reset. |
+| `TodoItem` | dataclass | `planning/todo.py` | One checklist line: `id`, `text`, `status`. |
+| `TodoStatus` | type | `planning/todo.py` | `Literal['pending', 'active', 'done']`. |
+| `reset_todos` | function | `planning/todo.py` | Wipe all stored checklists (re-export of `todo.reset`). |
+
+Stateful tools key off `ToolContext` identity. `todo_store` is a dict keyed by
+the context object (which is why `ToolContext` is `eq=False`), so each
+conversation threads a distinct context and gets isolated state. `process_tool`
+uses a module-global process table of job rows, capturing each background job's
+stdout/stderr to scratch files under a `.indus-process` directory and tracking
+read offsets so `poll` returns only new bytes.
+
+## Registry and collections
+
+A `ToolRegistry` is a mutable catalog of tools plus the named *collections* that
+group them. Its payoff is `to_tool_box`, which turns a collection into a runtime
+`ToolBox`: the descriptors the model is shown together with a runner that
+dispatches calls.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `ToolRegistry` | class | `kernel/registry.py` | Mutable catalog of tools + named collections; `to_tool_box(ctx_factory, collection)` builds a runtime `ToolBox`. |
+| `UnknownToolError` | class | `kernel/registry.py` | Raised when a tool or collection name is not registered. |
+| `RegistryContextFactory` | type | `kernel/registry.py` | `Callable[[], ToolContext]` supplied per dispatch. |
+| `builtin_registry` | function | `registry.py` | Mint a fresh `ToolRegistry` with all 12 tools registered and the read-only/coding/all collections defined. |
+| `tool_box` | function | `registry.py` | One-call helper: produce a runnable `ToolBox` for a named collection, backed by local fs/shell rooted at `cwd`. |
+| `ToolCollection` | type | `registry.py` | `Literal['read-only', 'coding', 'all']`. |
+
+The three standard collections:
+
+| Collection | Members |
+|------------|---------|
+| `read-only` | `read`, `ls`, `grep`, `find`, `websearch`, `webfetch` — observe the workspace and the web; safe when no mutation should be possible. |
+| `coding` | `read-only` plus `write`, `edit`, `bash`, `todo_set`, `todo_read`, `process`. |
+| `all` | The union of every registered tool. |
+
+At dispatch time the registry's runner looks up the tool by `call.name`, mints a
+fresh context via the factory, threads the runtime's per-call cancel token in via
+`dataclasses.replace`, and calls `tool.invoke`. `resolve_path` anchors every
+tool-supplied path at `ctx.cwd` before any fs call, so relative paths cannot
+escape the sandbox.
+
+## Local backends
+
+`backends/local.py` is the single sanctioned OS binding. Nothing above this
+layer touches platform modules directly.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `local_fs` | const | `backends/local.py` | Shared `LocalFs` instance backed by `os`/`shutil` on worker threads. |
+| `local_shell` | const | `backends/local.py` | Shared `LocalShell` instance backed by asyncio subprocesses + `subprocess.Popen` for background jobs. |
+| `make_local_context` | function | `backends/local.py` | Assemble a `ToolContext` from a `cwd` plus `local_fs`/`local_shell`, a never-cancelling token, and the 64 KB `middle` standard budget. |
+
+`LocalFs` runs `os`/`shutil` work on `asyncio.to_thread` worker threads and
+re-shapes `OSError`s into stable, libuv-style messages
+(`ENOENT: no such file or directory, open '/path'`). `LocalShell.exec` uses
+`asyncio.create_subprocess_shell` with `start_new_session=True` so a kill reaches
+the whole process group via `os.killpg`; `LocalShell.spawn` uses
+`subprocess.Popen` with a daemon watcher thread.
+
+## Diff helpers
+
+`edit_tool` builds its unified-diff output from a from-scratch Myers line diff,
+exported for direct use.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `diff_lines` | function | `files/diff.py` | Myers O(ND) line diff -> `LineDiff` (ops + added/removed tallies). |
+| `render_unified_diff` | function | `files/diff.py` | Render before/after as a `@@`-hunk unified diff (used by `edit_tool`). |
+| `DiffOp` | dataclass | `files/diff.py` | One line op: `kind`, `text`, `before_line`, `after_line`. |
+| `DiffOpKind` | type | `files/diff.py` | `Literal['keep', 'add', 'remove']`. |
+| `LineDiff` | dataclass | `files/diff.py` | `diff_lines` outcome: ops tuple + added/removed counts. |
+
+## Using the suite
+
+A host wires up the whole suite with a single `tool_box('coding', cwd)` call. The
+box advertises descriptors (what the model is shown) and dispatches each call
+through `box.runner.run`.
+
+```python
+import asyncio
+from indusagi.capabilities import tool_box
+from indusagi.runtime.contract import ToolCall
+from indusagi._internal.cancel import CancelToken
+
+
+async def main():
+    box = tool_box("coding", cwd=".")
+    # Descriptors are what the model is shown:
+    print([d.name for d in box.descriptors()])
+
+    call = ToolCall(id="c1", name="read", input={"path": "README.md", "limit": 20})
+    outcome = await box.runner.run(call, CancelToken())
+    print(outcome.is_error, outcome.output[:200])
+
+
+asyncio.run(main())
+```
+
+To invoke a single tool directly, build a local context and call `invoke`:
+
+```python
+import asyncio
+from indusagi.capabilities import edit_tool, make_local_context
+from indusagi.runtime.contract import ToolCall
+
+
+async def main():
+    ctx = make_local_context(cwd="/tmp/project")
+    call = ToolCall(id="e1", name="edit", input={
+        "path": "main.py",
+        "oldText": "print('hi')",
+        "newText": "print('hello')",
+    })
+    outcome = await edit_tool.invoke(call, ctx)
+    print(outcome.output)  # text summary, or a block list incl. the unified diff
+
+
+asyncio.run(main())
+```
+
+The diff helpers and `clamp` are usable without any filesystem:
+
+```python
+from indusagi.capabilities import diff_lines, render_unified_diff, clamp, OutputBudget
+
+before = "a\nb\nc\n"
+after = "a\nB\nc\nd\n"
+result = diff_lines(before, after)
+print(result.added, result.removed)        # tallies
+print(render_unified_diff(before, after))  # @@ ... @@ / + / - text
+
+big = "x" * 100_000
+out = clamp(big, OutputBudget(kind="middle", max_bytes=64 * 1024))
+print(len(out.encode("utf-8")))             # bounded; a notice is spliced at the cut
+```
+
+## Authoring a custom tool
+
+Write only an async `run`; `define_tool` supplies descriptor, invocation,
+cancellation, and error-folding. Register the result and box a collection over
+it.
+
+```python
+import asyncio
+from indusagi.capabilities import (
+    define_tool, ToolSpec, ToolResult, TextContentBlock,
+    ToolRegistry, make_local_context,
+)
+
+
+async def run(inp, ctx):
+    name = inp.get("name", "world")
+    return ToolResult(content=(TextContentBlock(text=f"hello {name}"),))
+
+
+greet = define_tool(ToolSpec(
+    name="greet",
+    description="Say hello to someone.",
+    parameters={"type": "object", "properties": {"name": {"type": "string"}}},
+    run=run,
+))
+
+reg = ToolRegistry().register(greet)
+reg.collection("mine", ["greet"])
+box = reg.to_tool_box(lambda: make_local_context("."), "mine")
+print([d.name for d in box.descriptors()])  # ['greet']
+```
+
+Because `DefinedTool` also carries a facade-compatible surface
+(`label`/`description`/`parameters` + an `execute()` entry point), the same
+`greet` object drops straight into the high-level [Agent](/python/facades/agent)
+via `set_tools([greet])`.
+
+## Relationship to neighbors
+
+Capabilities sits between two outward contracts it imports rather than redefines:
+
+- The [Runtime](/python/subsystems/runtime)'s
+  `ToolCall`/`ToolOutcome`/`ToolBox`/`ToolRunner`. `DefinedTool.invoke()` produces
+  the runtime's outcome; `ToolRegistry.to_tool_box` returns a runtime `ToolBox`.
+- The [LLM Gateway](/python/subsystems/llm-gateway)'s `ToolDescriptor`/`JsonSchema`.
+  `DefinedTool.descriptor()` produces the gateway's model-facing advertisement.
+
+It also depends on `indusagi._internal.cancel` (`CancelToken`) for cooperative
+cancellation. Upward, the facade surface lets a defined tool drop into
+[Agent](/python/facades/agent). For the bigger picture of how these layers
+compose, see the [Architecture](/python/architecture) overview.
+
+## Notable behaviors
+
+- **`make_context` is a stub.** `kernel/context.py`'s `make_context` intentionally
+  raises `NotImplementedError` — it is importable for typing but never callable;
+  callers must use `make_local_context`.
+- **Eleven capabilities, twelve tool objects.** The `todo` capability is two
+  tools (`todo_set` + `todo_read`); the suite's "eleven" count treats todo as one
+  capability.
+- **`resolve_path` enforces the sandbox.** It anchors every tool-supplied path at
+  `ctx.cwd` (absolute paths pass through) before any fs call, so relative paths
+  cannot escape the working directory. Output and error text still echo the
+  model's spelling of the path.
+- **Stable filesystem error text.** `LocalFs` reshapes `OSError`s into libuv-style
+  strings (`ENOENT: no such file or directory, open '/path'`); an `EISDIR`-on-read
+  produces a path-less message on purpose.
+- **`edit_tool` matching.** Strict literal matching first (must be unique unless
+  `replaceAll`), then a single whitespace-fuzzy fallback via canonicalized
+  whitespace comparison; identical `oldText`/`newText` or zero-change results are
+  refused.
+- **`bash_tool` timeout.** `timeoutMs` is pinned to a 10-minute ceiling and
+  defaults to 2 minutes.
+- **`websearch` never raises.** It scrapes the DuckDuckGo HTML endpoint with
+  regexes via httpx (no parser dependency, no API key); every network failure is
+  returned as an `is_error` `ToolResult`, never raised.
+- **`process` table is process-global on purpose.** A job started in one call must
+  be pollable later; captures are written to a `.indus-process` scratch dir under
+  `cwd` with a tail window per poll.
+- **`grep_tool` flags.** It accepts JS-style flag letters `g`/`i`/`m`/`s`/`u`/`y`;
+  `g` and `y` are accepted-but-noops.

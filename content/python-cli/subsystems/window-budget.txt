@@ -1,0 +1,280 @@
+# Window Budget
+
+> `window_budget` is `induscode`'s own context-window budgeting and compaction engine: it measures transcript tokens, decides when and where to cut, and folds the dropped head into one synthetic digest message. Reach it with `from induscode.window_budget import create_condenser, plan_slice, condense, ...`; its produced `Condenser` plugs straight into the [Conductor](/python-cli/subsystems/conductor)'s `CondenseFn` seam with no adapter.
+
+A long-running coding session accrues turns — user prompts, assistant replies, tool calls and their results — until the transcript approaches the model's context window. `window_budget` keeps the session usable by answering three questions in sequence: **when** are we over budget (the gate), **where** do we cut (the slice planner), and **how** do we compress the dropped portion (model-driven summarization). The older head is condensed into a single structured digest while a verbatim tail of recent turns is preserved.
+
+It is built **on top of** the indusagi framework but is deliberately a *separate* engine from the framework's own [`indusagi.runtime`](/python/subsystems/runtime) memory compactor — different message types, thresholds, prompts, and digest headers (see [Two Compaction Engines](#two-compaction-engines)).
+
+## Table of Contents
+
+- [The Three-Question Pipeline](#the-three-question-pipeline)
+- [Public Surface](#public-surface)
+- [The Contract Layer](#the-contract-layer)
+- [Budget Math: Estimate, Gate, Slice](#budget-math-estimate-gate-slice)
+- [The Summarize Path](#the-summarize-path)
+- [The Condenser Factory](#the-condenser-factory)
+- [How the Session Runner Wires It](#how-the-session-runner-wires-it)
+- [Two Compaction Engines](#two-compaction-engines)
+- [Examples](#examples)
+- [Source Layout](#source-layout)
+
+## The Three-Question Pipeline
+
+Three layers feed one factory. Each layer answers one question:
+
+| Question | Layer | Entry point |
+|----------|-------|-------------|
+| **When** are we over budget? | gate | `is_over_budget(messages, model, policy)` |
+| **Where** do we cut? | slice | `plan_slice(messages, policy)` → `CondensePlan` |
+| **How** do we compress the head? | summarize | `summarize(dropped, deps)` → `Summary` |
+
+`create_condenser` stitches all three into a single async `Condenser`. When there is nothing to do it returns the **same input list object** — the identity no-op the conductor relies on — otherwise it returns `[summary.message, *kept]`, a strictly smaller transcript.
+
+## Public Surface
+
+Everything below is re-exported from the `induscode.window_budget` barrel.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `create_condenser` | function | `condenser.py` | Factory tying gate + slice + summarize into one async `Condenser`. |
+| `condense` | async function | `condenser.py` | Session-scope summarization wrapper over `summarize` (pins `scope="session"`). |
+| `condense_scope` | async function | `summarize/condense.py` | Branch-archival entrypoint (pins `scope="branch"`); re-exported from `condenser.py`. |
+| `summarize` | async function | `summarize/condense.py` | The single condensing primitive — one path for both scopes. |
+| `DEFAULT_POLICY` | const | `condenser.py` | `BudgetPolicy(trigger_ratio=0.75, keep_recent=6000, reserve_tokens=2048)`. |
+| `estimate_tokens` | function | `budget/estimate.py` | Heuristic total token cost of a transcript. |
+| `estimate_message_tokens` | function | `budget/estimate.py` | Per-message token estimate (conservative, biased high). |
+| `prefix_tokens` | function | `budget/estimate.py` | Forward cumulative-token array of length `n+1`. |
+| `is_over_budget` | function | `budget/gate.py` | `True` when `estimate_tokens` strictly exceeds `budget_limit`. |
+| `budget_limit` | function | `budget/gate.py` | `max(0, contextWindow - reserve_tokens) * trigger_ratio`. |
+| `plan_slice` | function | `budget/slice.py` | Forward prefix-sum + binary-search cut planner → `CondensePlan`. |
+| `build_summary_prompt` | function | `summarize/prompt.py` | Assembles the user-turn prompt (framing + scrollback + template). |
+| `flatten_transcript` | function | `summarize/prompt.py` | Renders messages into `» role:` lines. |
+| `CONDENSER_BRIEF` | const | `summarize/prompt.py` | System-prompt brief framing the model as a transcript recorder. |
+
+The contract dataclasses and type aliases (`BudgetPolicy`, `TokenEstimate`, `CondensePlan`, `Summary`, `CondenserDeps`, `SummarizeDeps`, `CompleteFn`, `Condenser`, `CondenseScope`, `AgentMessage`) are documented next.
+
+## The Contract Layer
+
+`contract.py` declares **only shapes and seams** — no behavior, no I/O, no prompt strings. Every later module is written against the names declared here.
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `BudgetPolicy` | frozen dataclass | Config-sourced thresholds: `trigger_ratio` (fraction of window, in `(0, 1]`), `keep_recent` (tokens of recent tail to keep verbatim), `reserve_tokens` (optional headroom, default `None`). No magic literals baked in. |
+| `TokenEstimate` | frozen dataclass | Result of measuring a transcript: `context_tokens`, `context_window`, `anchored` (`True` when based on a real provider `usage` figure rather than a heuristic). |
+| `CondensePlan` | frozen dataclass | Output of `plan_slice`: `cut` index, `kept` tail (`messages[cut:]`), `dropped` head (`messages[:cut]`). `cut == 0` means nothing is condensable. |
+| `Summary` | frozen dataclass | Structured summarize result: a single synthetic `message` plus `covered_count` (how many source messages it replaces). |
+| `CondenserDeps` | frozen dataclass | Optional deps for `create_condenser`: `complete`, `model`, `policy` — all optional, so a bare factory yields a network-free no-op condenser. |
+| `CompleteFn` | `Protocol` | The injectable model completer, structurally identical to `indusagi.ai.complete_simple`: `(model, context, options=None, logger=None) -> Awaitable[AssistantMessage]`. |
+| `Condenser` | `TypeAlias` | `Callable[[list[AgentMessage]], list[AgentMessage] | Awaitable[...]]` — structurally compatible with the conductor's `CondenseFn`. |
+| `CondenseScope` | `TypeAlias` | `Literal["session", "branch"]` — the flag that collapses branch-archival into the single condenser path. |
+| `AgentMessage` | `TypeAlias` | Widens [`indusagi.ai`](/python/facades/ai) `AgentMessage` with the four [`indusagi.agent`](/python/facades/agent) custom kinds (`BashExecutionMessage`, `CustomMessage`, `BranchSummaryMessage`, `CompactionSummaryMessage`). |
+
+### Composed, never re-declared
+
+`contract.py` composes the framework vocabulary rather than re-declaring it. From `indusagi.ai` it pulls `Api`, `AssistantMessage`, `Context`, `Model`, `SimpleStreamOptions`, `StreamLogger`, `Usage`, and the base `AgentMessage` (the LLM `Message` trio: `UserMessage | AssistantMessage | ToolResultMessage`). From `indusagi.agent` it pulls the four custom session-message dataclasses.
+
+The framework's `indusagi.ai.AgentMessage` alias covers only the LLM trio, so the app-level `AgentMessage` **explicitly unions in** the four agent custom kinds. Every role-probing consumer (the estimator, the slicer, the flattener) handles those roles via `getattr` duck typing over a `role` discriminator — messages here are frozen dataclasses, never JSON records. A silent omission would mis-estimate tokens and skip those turns in the digest.
+
+## Budget Math: Estimate, Gate, Slice
+
+The `budget/` subpackage is **pure arithmetic with no I/O**.
+
+### Estimate (`budget/estimate.py`)
+
+There is no tokenizer call. `estimate_message_tokens` walks each message's serialized payload and applies a transparent weighting model:
+
+```text
+cost = ceil(serialized_chars / CHARS_PER_TOKEN) + framing_tokens + images * IMAGE_TOKENS
+```
+
+The module's own tunables are `CHARS_PER_TOKEN = 3.6`, `IMAGE_TOKENS = 1024` (flat, resolution-agnostic), plus small per-message and per-block framing adds. The dispatch has explicit arms for `user`, `assistant`, and `toolResult` roles, plus the four agent custom roles (`bashExecution`, `custom`, `branchSummary`, `compactionSummary`), with a generic serialized-form fallback for unknown roles.
+
+The estimate is **conservative** — rounding up and adding framing biases it high so the gate fires a little early rather than overflowing the window. `estimate_tokens` sums every message (an empty transcript estimates to exactly `0`), and `prefix_tokens` builds the forward cumulative-token array (`result[i]` = tokens of `messages[0:i]`) that `plan_slice` binary-searches.
+
+### Gate (`budget/gate.py`)
+
+```python
+def budget_limit(model, policy):
+    reserve = policy.reserve_tokens or 0
+    usable = max(0, model.contextWindow - reserve)
+    return usable * policy.trigger_ratio
+
+def is_over_budget(messages, model, policy):
+    return estimate_tokens(messages) > budget_limit(model, policy)
+```
+
+Optional fixed headroom is carved off the window first, then the remaining capacity is scaled by the window-relative trigger ratio. The limit is floored at `0`, so a misconfigured reserve larger than the window can never yield a negative limit. The gate fires once the estimate **strictly** exceeds the limit.
+
+### Slice (`budget/slice.py`)
+
+`plan_slice` partitions the transcript into a `dropped` prefix and a `kept` suffix via **forward prefix-sum + binary search** (not a backward accumulate-and-snap):
+
+1. Build the cumulative-token array; the total is `prefix[n]`.
+2. We want the tail to hold ~`keep_recent` tokens, so binary-search the lower bound of the threshold `total - keep_recent` over the monotonic `prefix` array — O(log n).
+3. **Snap the cut forward** past any leading `toolResult` so the kept tail never begins with one.
+
+**Tool-pair safety**: a `toolResult` must stay glued to the assistant turn that issued its `toolCall`, so the kept tail may never begin with a tool result. `_snap_forward` advances the cut past leading tool results; every other role (including the agent custom kinds) is a legal tail-start. If the whole transcript already fits in `keep_recent`, or snapping forward consumes everything, `cut` is `0` (nothing condensable).
+
+## The Summarize Path
+
+The `summarize/` subpackage does the model call. `summarize` is the **single condensing primitive** — one path for both `session` and `branch` scopes; the scope flag only changes the prompt framing line and the digest header, never the machinery.
+
+### Prompt assembly (`summarize/prompt.py`)
+
+`build_summary_prompt` produces one user-turn string:
+
+- A scope **framing line** (active-session checkpoint vs abandoned-branch archive).
+- An optional `<carried-digest>…</carried-digest>` block (the iterative-refresh / branch carry-in path).
+- A `<scrollback>…</scrollback>` block holding the flattened transcript.
+- The fixed **section template**: `# Objective`, `# Guardrails`, `# Status (Shipped / Active / Stuck)`, `# Rationale`, `# Plan`, `# Carryover`.
+
+`flatten_transcript` renders each message into `» role:` lines: `» you`, `» agent`, `» agent.plan` (thinking), `» agent.call <name>`, `» tool` / `» tool!err`, `» shell$` (bash executions), `» note` (custom), and `» digest` (branch/compaction summaries).
+
+`CONDENSER_BRIEF` is the system prompt: it frames the model as a *transcript recorder*, not a chat continuation — read the transcript as archival data, preserve concrete facts (paths, identifiers, commands, error text, decisions), keep every heading, and emit **only** the structured digest.
+
+### The summarize core (`summarize/condense.py`)
+
+`summarize` runs `Context(systemPrompt=CONDENSER_BRIEF, messages=[the prompt])` through the injectable completer once with `reasoning="high"`, extracts the assistant text, and wraps it as a synthetic `indusagi.ai.UserMessage` stamped with a header. It returns `Summary(message, covered_count)`.
+
+| Scope | Digest header |
+|-------|---------------|
+| `session` | `[session digest — older turns condensed]` |
+| `branch` | `[branch digest — archived from a path not taken]` |
+
+`SummarizeDeps` carries `complete`, `model`, `scope` (default `"session"`), `prior_digest`, `signal` (a `CancelToken`, forwarded opaquely onto `SimpleStreamOptions.signal`), and `max_tokens` (forwarded to the completer's `maxTokens`).
+
+**Network-free and never-raising**: with no `model` bound, `summarize` emits a deterministic `_local_fallback_digest` (recording the count of elided messages and any carried digest) rather than guessing a model. Even an empty model reply falls back to the local digest, so a `Summary` is **always** produced.
+
+The model completer is an injectable `Protocol` (`CompleteFn`) defaulting to `indusagi.ai.complete_simple`, so the condenser runs without network in tests by passing a stub of the same shape.
+
+## The Condenser Factory
+
+`create_condenser(deps)` returns an async `Condenser` that ties the pipeline together:
+
+```python
+async def condenser(messages):
+    if model is None:                              # no window to measure → identity
+        return messages
+    if not is_over_budget(messages, model, policy): # under budget → identity
+        return messages
+    plan = plan_slice(messages, policy)
+    if plan.cut == 0 or not plan.dropped:          # nothing condensable → identity
+        return messages
+    summary = await condense(plan.dropped, SummarizeDeps(complete=complete, model=model))
+    return [summary.message, *plan.kept]
+```
+
+**Identity no-op contract**: on all three no-op paths (no model, under budget, or `cut == 0` / empty `dropped`) the condenser returns the **same input list object**. The conductor relies on this `is`-identity to detect "nothing to do"; tests pin it. Otherwise it returns `[summary.message, *plan.kept]` — one digest in place of the dropped prefix, plus the verbatim recent tail.
+
+All `CondenserDeps` fields are optional, so `create_condenser()` with no arguments yields a working, network-free condenser (a no-op until a `model` and `policy` are supplied).
+
+`condense` and `condense_scope` are exported alongside the factory so callers can summarize a slice directly without building a full `Condenser`: `condense` pins `scope="session"`, `condense_scope` pins `scope="branch"`.
+
+## How the Session Runner Wires It
+
+The real consumer is the [Boot](/python-cli/subsystems/boot) session runner (`boot/runners/session.py`), which builds the conductor's condense hook:
+
+```python
+from induscode.window_budget import BudgetPolicy, condense as condense_slice, plan_slice
+
+AUTO_CONDENSE_POLICY = BudgetPolicy(trigger_ratio=0.75, keep_recent=6000, reserve_tokens=2048)
+
+async def condense_transcript(messages, force=False):
+    if force:                                  # manual /compact: keep only the final user turn
+        cut = _last_user_turn_start(messages)
+        if cut <= 0:
+            return messages
+        summary = await condense_slice(messages[:cut])
+        return [summary.message, *messages[cut:]]
+    plan = plan_slice(messages, AUTO_CONDENSE_POLICY)   # auto path: budget-gated
+    if plan.cut == 0 or len(plan.dropped) == 0:
+        return messages
+    summary = await condense_slice(list(plan.dropped))
+    return [summary.message, *plan.kept]
+```
+
+Both folds keep recent turns verbatim; the difference is *how much*. The **auto** path is budget-gated — it folds only the head beyond the recent ~6k-token tail. The **manual** `/compact` force path folds everything before the last user turn into the digest, keeping only that final turn — this always reclaims context on a multi-turn session (even a tiny one the token tail would leave untouched) while cutting at a user-message boundary keeps tool call/result pairs intact. Because the summarizer emits a deterministic local digest with no model bound, compaction never depends on a provider key or a round-trip.
+
+## Two Compaction Engines
+
+`window_budget` is the app's **conductor `CondenseFn`** seam. The framework ships its own compactor in [`indusagi.runtime`](/python/subsystems/runtime) memory (`should_compact` / `find_cut_point` / `summarize` / `compact`), but it is a **different engine** and is never wired into the conductor. Keep them distinct:
+
+| | `window_budget` (this module) | `indusagi.runtime` memory (framework) |
+|--|-------------------------------|----------------------------------------|
+| message type | `indusagi.ai` `AgentMessage` (+ agent custom kinds) | `llmgateway` `Turn` |
+| `keep_recent` | **tokens** (default 6000) | **turns** (default 8) |
+| trigger | ratio **0.75** of the window | ratio **0.8** |
+| completer | `complete_simple` (injectable) | `ModelInvoker` |
+| digest header | `[session digest …]` / `[branch digest …]` | `[condensed earlier context]` |
+
+The policies, prompts, and digest headers differ, and tests pin this module's headers. Do not substitute one for the other.
+
+## Examples
+
+### Build a network-free condenser (identity no-op without a model)
+
+```python
+from induscode.window_budget import create_condenser, CondenserDeps
+
+condenser = create_condenser(CondenserDeps())   # no model bound
+out = await condenser(messages)
+assert out is messages   # identity: nothing to do without a window to measure
+```
+
+### Drive the summary path with an injected stub (no network)
+
+```python
+from induscode.window_budget import create_condenser, CondenserDeps, BudgetPolicy
+from indusagi.ai import AssistantMessage, TextBlock
+
+async def stub_complete(model, context, options=None, logger=None):
+    return AssistantMessage(content=[TextBlock(type="text", text="# Objective\nport budgeting")])
+
+condenser = create_condenser(CondenserDeps(
+    complete=stub_complete,
+    model=my_model,
+    policy=BudgetPolicy(trigger_ratio=0.75, keep_recent=6000, reserve_tokens=2048),
+))
+rebuilt = await condenser(long_transcript)   # -> [digest_message, *recent_tail]
+```
+
+### Use the budget math directly
+
+```python
+from induscode.window_budget import (
+    estimate_tokens, is_over_budget, budget_limit, plan_slice, DEFAULT_POLICY,
+)
+
+estimate_tokens(messages)               # heuristic total
+budget_limit(model, DEFAULT_POLICY)     # (contextWindow - 2048) * 0.75
+if is_over_budget(messages, model, DEFAULT_POLICY):
+    plan = plan_slice(messages, DEFAULT_POLICY)   # plan.cut / plan.kept / plan.dropped
+```
+
+### Branch-archival via the scope wrapper
+
+```python
+from induscode.window_budget import condense_scope, SummarizeDeps
+
+summary = await condense_scope(abandoned_branch_messages, SummarizeDeps(model=my_model))
+# summary.message text starts with '[branch digest — archived from a path not taken]'
+```
+
+## Source Layout
+
+```text
+window_budget/
+├── __init__.py              # public barrel
+├── contract.py              # frozen shapes + seams only (no behavior)
+├── condenser.py             # create_condenser, condense, DEFAULT_POLICY
+├── budget/                  # pure budget arithmetic (no I/O)
+│   ├── estimate.py          # token heuristic + forward prefix-sum
+│   ├── gate.py              # is_over_budget / budget_limit
+│   └── slice.py             # plan_slice (binary-search cut planner)
+└── summarize/               # model-driven summarization
+    ├── prompt.py            # CONDENSER_BRIEF, flatten_transcript, build_summary_prompt
+    └── condense.py          # summarize core, SummarizeDeps, condense_scope, fallback digest
+```
+
+The produced `Condenser` is consumed by the [Conductor](/python-cli/subsystems/conductor)'s condense seam and assembled by the [Boot](/python-cli/subsystems/boot) session runner; the messages it operates on come from [`indusagi.ai`](/python/facades/ai) and [`indusagi.agent`](/python/facades/agent), and the default completer is the framework's `complete_simple`.

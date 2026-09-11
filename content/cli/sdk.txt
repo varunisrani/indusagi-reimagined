@@ -1,0 +1,326 @@
+# SDK
+
+> indusagi can help you use the SDK. Ask it to build an integration for your use case.
+
+The coding agent ships as the `indusagi-coding-agent` package. Its terminal
+binary is `indus` (alias `indusagi`), but the package root barrel (`src/index.ts`)
+also exposes every subsystem as a **namespace** for embedding the agent in
+another program, scripting it in-process, or testing it. Its core LLM, agent,
+and TUI primitives come from the sibling framework package, `indusagi`.
+
+**Example use cases:**
+
+- Embed a coding-agent session inside your own application or service.
+- Build a custom interface on top of the conductor's signal stream.
+- Drive a headless JSON-RPC link from in-process instead of spawning a subprocess.
+- Compose your own tool deck, system prompt, and MCP endpoints programmatically.
+
+## Table of Contents
+
+- [Installation](#installation)
+- [The barrel namespaces](#the-barrel-namespaces)
+- [Quick start: a session conductor](#quick-start-a-session-conductor)
+- [The conductor API](#the-conductor-api)
+- [Signals](#signals)
+- [Running a oneshot](#running-a-oneshot)
+- [Serving / driving the JSON-RPC link](#serving--driving-the-json-rpc-link)
+- [Booting the full CLI](#booting-the-full-cli)
+- [Version](#version)
+
+## Installation
+
+```bash
+npm install indusagi-coding-agent
+```
+
+The framework package `indusagi` is a dependency and is installed with it (along
+with the agent's other runtime dependencies).
+
+## The barrel namespaces
+
+`src/index.ts` re-exports each subsystem as a namespace plus the `VERSION`
+constant:
+
+```typescript
+import {
+  boot,             // CLI launch pipeline + runner registry
+  workspace,        // resolved on-disk layout + branding
+  conductor,        // the session runtime core
+  windowBudget,     // context-window planning / condensing
+  capabilityDeck,   // the built-in tool deck
+  runtimeBridge,    // framework agent wiring
+  addons,           // optional integrations
+  consoleUi,        // the interactive terminal UI
+  channels,         // non-interactive drivers (oneshot + JSON-RPC link)
+  briefing,         // system-prompt composition
+  transcriptExport, // HTML transcript export
+  launch,           // command-line surface (flags, attachments, credentials)
+  insight,          // diagnostics / telemetry
+  kit,              // shared utilities
+  settings,         // settings manager
+  sessions,         // session library
+  VERSION,          // the package version string
+} from "indusagi-coding-agent";
+```
+
+Each namespace bundles a frozen contract plus its behavior modules. The two you
+reach for most are `conductor` (drive a session) and `channels` (drive it
+headlessly).
+
+## Quick start: a session conductor
+
+The `SessionConductor` is the single seam between the product and the framework
+`Agent`. Create one with `conductor.createSessionConductor`, subscribe to its
+signal stream, and submit a prompt:
+
+```typescript
+import { conductor } from "indusagi-coding-agent";
+
+const session = conductor.createSessionConductor({
+  modelId: "anthropic/claude-sonnet-4-5",
+});
+
+const unsubscribe = session.subscribe((signal) => {
+  if (signal.kind === "text") process.stdout.write(signal.delta);
+});
+
+await session.submit("What files are in the current directory?");
+unsubscribe();
+```
+
+`createSessionConductor(options, deps?)` takes a `SessionConductorOptions` and an
+optional `ConductorDeps` (both declared in `src/conductor/contract.ts` /
+`src/conductor/conductor.ts`). Only `modelId` is required:
+
+```typescript
+const session = conductor.createSessionConductor({
+  modelId: "anthropic/claude-sonnet-4-5",
+  system: "You are a concise assistant.", // override the built-in briefing
+  tools: myTools,                         // AgentTool[]
+  thinking: "medium",                     // off | minimal | low | medium | high | xhigh
+  workspace: "/path/to/project",          // defaults to process.cwd()
+  sessionsDir: "/path/to/sessions",       // persist transcripts here (else in-memory)
+  autoCompact: true,                      // condense automatically near the window
+  getApiKey: async (provider) => process.env[`${provider.toUpperCase()}_API_KEY`],
+});
+```
+
+When `sessionsDir` is set, the conductor backs its transcript store with a
+filesystem backend (one `<sessionId>.ndjson` per session) so the conversation
+survives the process and can be resumed. Absent, the transcript stays in memory.
+
+`getApiKey` is called per request, so short-lived OAuth tokens can be refreshed;
+returning `undefined` lets the framework fall back to its own environment lookup.
+
+### Building a tool deck and system prompt
+
+The CLI assembles its deck from `capabilityDeck.provisionDeck` and its prompt
+from `briefing.composeBriefing` (see `src/boot/runners/session.ts`). You can do
+the same:
+
+```typescript
+import { conductor, capabilityDeck, briefing } from "indusagi-coding-agent";
+
+const tools = capabilityDeck.provisionDeck("all", { cwd: process.cwd() }).tools();
+const system = briefing.composeBriefing({ tools });
+
+const session = conductor.createSessionConductor({
+  modelId: "anthropic/claude-sonnet-4-5",
+  tools,
+  system,
+});
+```
+
+### Resolving a model id
+
+The model catalog and matcher come from the `conductor` namespace:
+
+```typescript
+import { conductor } from "indusagi-coding-agent";
+
+const catalog = new conductor.ModelCatalog();
+const card = new conductor.ModelMatcher(catalog).resolve({ pattern: "sonnet" });
+const session = conductor.createSessionConductor({ modelId: card?.id ?? "" });
+```
+
+## The conductor API
+
+A `SessionConductor` (full signature in `src/conductor/contract.ts`) exposes a
+small product API. The most-used members:
+
+| Member | Purpose |
+|--------|---------|
+| `submit(input)` | Run a user turn to settlement; resolves to a `ConductorState`. |
+| `enqueue(input, mode?)` | Queue an input as a later turn (`"steer"` or `"followUp"`). |
+| `abort()` | Cancel the in-flight turn; emits an `aborted` fault signal. |
+| `subscribe(handler)` | Register a `SignalHandler`; returns an unsubscribe function. |
+| `snapshot()` | Read an immutable `ConductorState`. |
+| `messages()` | The live transcript messages for the active branch. |
+| `model()` | The bound framework `Model`, or `undefined`. |
+| `selectModel(id)` | Bind a model by canonical id for later turns. |
+| `setThinkingLevel(level)` / `cycleThinkingLevel()` | Adjust reasoning effort. |
+| `condense()` | Manually run the transcript-condense path. |
+| `fork(entryId)` / `navigateTree(nodeId)` | Branch / walk the transcript tree. |
+| `executeBash(command, opts?)` | Run a shell command in the session workspace. |
+| `stats()` | A point-in-time `SessionStats` tally. |
+| `resume(sessionId)` | Restore a persisted session. |
+| `newSession()` | Abandon the conversation and start a fresh one. |
+
+`submit` resolves to a `ConductorState` snapshot:
+
+```typescript
+const state = await session.submit("Refactor src/entry.ts");
+// state.phase     -> "idle" | "streaming" | "tooling" | "condensing" | "faulted"
+// state.usage     -> cumulative Usage
+// state.modelId   -> bound model id
+// state.fault     -> ConductorFault when phase === "faulted"
+```
+
+## Signals
+
+Subscribe to receive the product-level `SessionSignal` stream (declared in
+`src/conductor/contract.ts`). Switch on `signal.kind`:
+
+```typescript
+session.subscribe((signal) => {
+  switch (signal.kind) {
+    case "prompt":     /* signal.text  — user turn committed */ break;
+    case "text":       process.stdout.write(signal.delta); break;
+    case "thinking":   /* signal.delta — reasoning chunk */ break;
+    case "tool_start": console.log(`tool ${signal.name} (${signal.id})`); break;
+    case "tool_end":   console.log(`tool ${signal.id} ok=${signal.ok}`); break;
+    case "turn_end":   /* signal.usage */ break;
+    case "persisted":  /* signal.entryId */ break;
+    case "compacted":  break;
+    case "fault":      console.error(signal.fault.kind, signal.fault.message); break;
+    case "queue":      /* signal.count */ break;
+    case "idle":       break;
+  }
+});
+```
+
+This is the conductor's re-emitted surface — deliberately distinct from the raw
+framework `AgentEvent` union. Consumers never see a framework loop event
+directly.
+
+## Running a oneshot
+
+The `channels` namespace exposes the non-interactive oneshot runner — submit
+prompts, stream the result to a sink, resolve an exit code:
+
+```typescript
+import { conductor, channels } from "indusagi-coding-agent";
+
+const session = conductor.createSessionConductor({
+  modelId: "anthropic/claude-sonnet-4-5",
+});
+
+const stdout: channels.WritableLine = {
+  write: (chunk, cb) => process.stdout.write(chunk, cb),
+};
+
+const ctx: channels.ChannelContext = {
+  conductor: session,
+  out: stdout,
+  framer: channels.ndjsonFramer,
+  dialog: channels.inertDialog, // no driver attached: asks resolve to their fallback
+};
+
+const exitCode = await channels.runOneshot(ctx, {
+  shape: "text",                         // "text" (clean answer) or "ndjson" (event log)
+  prompts: ["Summarise the repository"],
+});
+process.exit(exitCode);
+```
+
+The `"text"` shape writes the accumulated answer as one trailing line; the
+`"ndjson"` shape streams every signal as a framed line, bracketed by `start` /
+`end` frames. See [print / JSON mode](json.md) for the wire shape.
+
+## Serving / driving the JSON-RPC link
+
+The link channel is the bidirectional JSON-RPC 2.0 server plus a generated
+client. Both come from the `channels` namespace.
+
+### Serve a session over an injected transport
+
+```typescript
+import { conductor, channels } from "indusagi-coding-agent";
+
+const session = conductor.createSessionConductor({
+  modelId: "anthropic/claude-sonnet-4-5",
+});
+
+const stdout: channels.WritableLine = {
+  write: (chunk, cb) => process.stdout.write(chunk, cb),
+};
+
+const server = channels.createLinkServer(
+  channels.SESSION_OPS,                 // the declarative op registry
+  session,
+  { in: process.stdin as channels.ReadableChunks, out: stdout },
+);
+
+await server.done; // resolves when the inbound stream ends
+```
+
+### Drive a child process with the generated client
+
+`createLinkDriver` returns a `Proxy`-backed client typed from the registry — one
+callable method per op, no hand-written method bodies:
+
+```typescript
+import { channels } from "indusagi-coding-agent";
+
+// channels.SessionOps types the registry; client gets one method per op.
+const { client, done, close } = channels.createLinkDriver<typeof channels.SESSION_OPS>(
+  { out: childStdin, in: childStdout },
+  {
+    onSignal: (signal) => {
+      if (signal.name === "text") process.stdout.write((signal.body as any).delta);
+    },
+    onAsk: (ask) => null, // dismiss every blocking dialog
+  },
+);
+
+const snapshot = await client.submit({ input: "List the files in src" });
+console.log(snapshot.model, snapshot.usage);
+
+close();
+```
+
+The op registry is `channels.SESSION_OPS` with methods `submit`, `abort`,
+`snapshot`, `resume`, `listModels`, `cycleModel`. The framer
+(`channels.ndjsonFramer`), error codes (`channels.OP_ERROR`), and protocol
+version (`channels.PROTOCOL_VERSION`) are exported alongside. See the
+[link protocol](rpc.md) for the wire format.
+
+## Booting the full CLI
+
+To run the complete launch pipeline (flag parsing, workspace resolution, runner
+dispatch) from your own entry point, call `boot` with a sliced argv. It resolves
+to the process exit code:
+
+```typescript
+import { boot } from "indusagi-coding-agent";
+
+const exitCode = await boot(process.argv.slice(2));
+process.exit(exitCode);
+```
+
+`boot` selects a runner via the registry in `src/boot/runners/registry.ts`:
+`replRunner` (interactive), `oneshotRunner` (print/JSON), or `linkRunner`
+(JSON-RPC) — chosen from the resolved invocation mode. The `launch` namespace
+exposes the lower-level pieces (`readInvocation`, `renderUsage`,
+`gatherAttachments`) if you want to parse a command line without dispatching it.
+
+## Version
+
+```typescript
+import { VERSION } from "indusagi-coding-agent";
+console.log(VERSION);
+```
+
+For one-shot scripting from a shell, see [print / JSON mode](json.md). For
+cross-language or process-isolated integration, see the
+[link protocol](rpc.md).

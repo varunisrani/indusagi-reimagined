@@ -1,0 +1,108 @@
+# Custom Models
+
+The set of models indusagi can use comes from the bundled `indusagi` framework registry. This page covers how to inspect that catalog, narrow which models appear in the picker, select one for a run, and register a model programmatically.
+
+## Table of Contents
+
+- [Listing Models](#listing-models)
+- [Selecting a Model](#selecting-a-model)
+- [Narrowing the Picker](#narrowing-the-picker)
+- [Supported APIs](#supported-apis)
+- [Registering a Model Programmatically](#registering-a-model-programmatically)
+- [Model Shape](#model-shape)
+
+## Listing Models
+
+`--list-models` prints the full catalog as an aligned table — provider, model id, context window, max output, whether it supports reasoning, and whether it accepts images. An optional substring filters the rows:
+
+```bash
+indus --list-models
+indus --list-models claude        # only rows whose provider/model id contains "claude"
+```
+
+The catalog is sourced from `getProviders()` / `getModels()` in `indusagi/ai`. The framework's in-process `mock` provider (one model, `mock-default`) is filtered out of the interactive model catalog, so it is never the auto-selected default and never appears in the `/model` picker. It is not filtered from `--list-models`, which prints the raw framework registry, so `mock-default` can show up there.
+
+## Selecting a Model
+
+Pick a model for a run with `--model` (alias `-m`). It accepts a provider-qualified id or a bare id when that id is unambiguous across providers:
+
+```bash
+indus --model anthropic/claude-sonnet-4-20250514
+indus -m claude-sonnet-4-20250514
+```
+
+With no `--model`, the agent chooses a default model belonging to the first provider you are authenticated with. Inside an interactive session, `/model` (alias `/models`) opens the picker.
+
+## Narrowing the Picker
+
+The `enabledModels` setting restricts which models the picker offers. It is a list of glob / id patterns; an empty list (the default) means every model is offered.
+
+```json
+{
+  "enabledModels": ["claude-*", "gpt-4o", "gemini-2*"]
+}
+```
+
+See [Settings](settings.md).
+
+## Supported APIs
+
+Each model declares the streaming `api` its provider speaks. The framework wires up these built-in API adapters:
+
+| API | Description |
+|-----|-------------|
+| `anthropic-messages` | Anthropic Messages API |
+| `openai-completions` | OpenAI Chat Completions API (most compatible) |
+| `openai-responses` | OpenAI Responses API |
+| `azure-openai-responses` | Azure OpenAI Responses API |
+| `openai-codex-responses` | OpenAI Codex Responses API |
+| `google-generative-ai` | Google Generative AI |
+| `google-vertex` | Google Vertex AI |
+| `bedrock-converse-stream` | Amazon Bedrock Converse API |
+| `kimi-openai-compatible` | Kimi (Moonshot) OpenAI-compatible API |
+| `nvidia-openai-compatible` | NVIDIA OpenAI-compatible API |
+| `mock-ai` | In-process echo provider (tests only) |
+
+## Registering a Model Programmatically
+
+To add a model that the bundled catalog does not ship, use the framework `ModelRegistry`. It exposes `registerCustomModel(model)` to add one model and `loadCustomModels(models)` to add several. A registered model becomes visible to `getModels()` for its provider, so it shows up in `--list-models` and the picker.
+
+```ts
+import { ModelRegistry } from "indusagi/ai";
+
+const registry = new ModelRegistry();
+
+registry.registerCustomModel({
+  id: "my-local-llama",
+  name: "Llama 3.1 8B (Local)",
+  api: "openai-completions",
+  provider: "ollama",
+  baseUrl: "http://localhost:11434/v1",
+  reasoning: false,
+  input: ["text"],
+  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+  contextWindow: 128000,
+  maxTokens: 32000,
+});
+```
+
+For routing an existing provider through a proxy, or implementing a non-standard streaming API, see [Custom Providers](custom-provider.md).
+
+## Model Shape
+
+A model is the framework `Model` record (from `indusagi/ai`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | string | Model identifier (e.g. `"claude-sonnet-4-20250514"`) |
+| `name` | string | Display name |
+| `api` | string | Streaming API the provider speaks (see above) |
+| `provider` | string | Owning provider id |
+| `baseUrl` | string | API endpoint URL |
+| `reasoning` | boolean | Whether the model supports extended thinking |
+| `input` | `("text" \| "image")[]` | Supported input types |
+| `cost` | object | `{ input, output, cacheRead, cacheWrite }`, $ per million tokens |
+| `contextWindow` | number | Context window size in tokens |
+| `maxTokens` | number | Maximum output tokens |
+| `headers` | object | Optional custom request headers |
+| `compat` | object | Optional OpenAI-compatibility quirks (for `openai-completions` / `openai-responses`) |

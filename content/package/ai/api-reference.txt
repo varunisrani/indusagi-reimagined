@@ -1,0 +1,129 @@
+# AI API Reference
+
+This document describes the public API surfaced by `indusagi/ai`.
+The exact re-export list is defined in `src/facade/ml/index.ts` (re-exported by
+`src/facade/ai.ts`).
+
+## Table of Contents
+
+- [Dispatch Functions](#dispatch-functions)
+- [Model Registry](#model-registry)
+- [Provider (Backend) Registry](#provider-backend-registry)
+- [Environment Credentials](#environment-credentials)
+- [Kit Utilities](#kit-utilities)
+- [OAuth](#oauth)
+- [Types](#types)
+- [Provider Option Types](#provider-option-types)
+
+## Dispatch Functions
+
+From `src/facade/ml/stream.ts`:
+
+- `stream(model, context, options?, logger?)` returns an `AssistantMessageEventStream`.
+- `complete(model, context, options?, logger?)` awaits the stream and resolves the final `AssistantMessage`.
+- `streamSimple(model, context, options?, logger?)` like `stream`, using `SimpleStreamOptions` (reasoning controls, no tool wiring).
+- `completeSimple(model, context, options?, logger?)` awaits a `streamSimple` to completion.
+- `streamByApi(api, model, context, options?, logger?)` asserts `model.api === api`, then delegates to `stream`.
+- `getEnvApiKey(provider)` is also re-exported here (defined in `env-api-keys.ts`).
+
+The optional `logger` is a `StreamLogger` (`{ debug?: (message, details?) => void }`)
+used to trace `ai.stream.start` / `ai.stream.simple.start` dispatch events.
+
+## Model Registry
+
+From `src/facade/ml/models.ts`:
+
+- `getModel(provider, modelId)` returns a `Model`, throwing on unknown provider/model.
+- `tryGetModel(provider, modelId)` returns the `Model` or `undefined`.
+- `getModels(provider)` returns every model for a provider.
+- `getProviders()` returns the catalog's provider names.
+- `findModels(filters?)` filters by `provider`, `api`, `reasoning`, `supportsImageInput`, `nameIncludes`.
+- `registerCustomModel(model)` / `loadCustomModels(models)` add models to the registry.
+- `estimateCost(model, { inputTokens, outputTokens, cacheReadTokens?, cacheWriteTokens? })` returns a cost breakdown.
+- `calculateCost(model, usage)` mutates and returns `usage.cost`.
+- `supportsXhigh(model)` is `true` for `gpt-5.1-codex-max`, `gpt-5.2`, `gpt-5.2-codex`.
+- `modelsAreEqual(a, b)` compares by `id` and `provider`.
+- `ModelRegistry` (class) and `modelRegistry` (the shared singleton) are also exported.
+
+## Provider (Backend) Registry
+
+From `src/facade/ml/api-registry.ts`:
+
+- `registerApiProvider(provider, sourceIdOrOptions?)` registers a backend for an API tag.
+- `getApiProvider(api)` returns the enabled `ApiProviderInternal` or `undefined`.
+- `getApiProviderWithMetadata(api)` returns the entry plus its `ApiProviderMetadata`.
+- `getApiProviders(includeDisabled?)` lists registered backends.
+- `enableApiProvider(api)` / `disableApiProvider(api)` toggle a backend.
+- `unregisterApiProviders(sourceId)` removes all backends registered under a source id.
+- `clearApiProviders()` empties the registry.
+- `ProviderRegistry` (class) and `providerRegistry` (singleton) are also exported.
+
+The built-in adapters self-register via a side-effect import. `register-builtins.ts`
+exports `registerBuiltInApiProviders()` and `resetApiProviders()`.
+
+## Environment Credentials
+
+From `src/facade/ml/env-api-keys.ts`:
+
+- `getEnvApiKey(provider)` resolves a credential from the environment (or a marker for SDK-managed auth).
+- `resolveEnvApiKey(provider)` returns an `EnvApiKeyResolution` (`{ provider, apiKey?, isAuthenticatedMarker, isValid }`).
+- `isLikelyValidApiKey(value)` reports whether a value looks usable.
+- `rotateEnvApiKey(provider, fallback?)` returns the env key when valid, otherwise the fallback.
+
+## Kit Utilities
+
+Re-exported from `src/facade/ml/kit/*` (see [AI Utilities](/docs/ai/utils)):
+
+- `parseStreamingJson(partialJson, options?)` and `parseStreamingJsonWithDiagnostics(...)`.
+- `sanitizeSurrogates(text)` and `sanitizeUnknownUnicode(value)`.
+- `isContextOverflow(message, contextWindow?)`, `getOverflowPatterns()`, `getOverflowSuggestion(errorMessage?)`.
+- `StringEnum(values, options?)` and `normalizeSchemaForValidation(schema)`.
+- `validateToolArguments(tool, toolCall)`, `validateToolCall(tools, toolCall)`, `getValidationDiagnostics()`.
+- `createAssistantMessageEventStream(options?)`, plus the `EventStream` and `AssistantMessageEventStream` classes.
+
+## OAuth
+
+Re-exported from `src/facade/ml/kit/auth/index.ts` (see [OAuth Providers](/docs/ai/oauth)):
+
+- `getOAuthProvider(id)`, `registerOAuthProvider(provider)`, `getOAuthProviders()`.
+- `getOAuthApiKey(providerId, credentialsMap)`, `refreshOAuthToken(...)`, `ensureFreshOAuthCredentials(...)`.
+- Per-provider helpers such as `loginAnthropic`, `refreshAnthropicToken`, `loginOpenAICodex`, `loginGitHubCopilot`.
+
+## Types
+
+All types live in `src/facade/ml/types.ts`. Key types include:
+
+- `Api`, `KnownApi`, `Provider`, `KnownProvider`
+- `Model<TApi>`
+- `Context`, `Tool<TParameters>`
+- `Message`, `UserMessage`, `AssistantMessage`, `ToolResultMessage`
+- `TextContent`, `ThinkingContent`, `ImageContent`, `ToolCall`
+- `Usage`, `StopReason`
+- `StreamOptions`, `ProviderStreamOptions`, `SimpleStreamOptions`, `ThinkingLevel`, `ThinkingBudgets`
+- `StreamFunction<TApi, TOptions>`
+- `AssistantMessageEvent` and `AssistantMessageEventStream`
+- `OpenAICompletionsCompat`, `OpenAIResponsesCompat`, `OpenRouterRouting`
+
+Runtime helpers also exported from `types.ts`: the `API_NAMES`, `PROVIDER_NAMES`,
+and `STOP_REASONS` constants; the type guards `isTextContent`, `isThinkingContent`,
+`isImageContent`, `isToolCall`, `isUserMessage`, `isAssistantMessage`,
+`isToolResultMessage`, `isMessage`; the factories `createZeroUsage`,
+`createAssistantMessage`; and the validators `validateTool`, `validateMessage`,
+`validateContext`.
+
+## Provider Option Types
+
+Each adapter exports its own options interface (all extend `StreamOptions`):
+
+- `OpenAICompletionsOptions`
+- `OpenAIResponsesOptions`
+- `AzureOpenAIResponsesOptions`
+- `OpenAICodexResponsesOptions`
+- `AnthropicOptions`
+- `BedrockOptions`
+- `GoogleOptions`
+- `GoogleVertexOptions`
+- `KimiOptions`
+- `NvidiaOptions`
+
+See [AI Providers](/docs/ai/providers) for the field-level details.

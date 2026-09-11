@@ -1,0 +1,193 @@
+# Agent API Reference
+
+The public API from `indusagi/agent`. The `Agent` class and its options live in `src/facade/bot/agent.ts`; the loop functions in `src/facade/bot/agent-loop.ts`; types and the event model in `src/facade/bot/types.ts`.
+
+## Table of Contents
+
+- [Agent Class](#agent-class)
+- [AgentOptions](#agentoptions)
+- [AgentState](#agentstate)
+- [AgentEvent](#agentevent)
+- [Tool Types](#tool-types)
+- [Loop Functions](#loop-functions)
+- [Helpers and Guards](#helpers-and-guards)
+
+## Agent Class
+
+```typescript
+import { Agent } from "indusagi/agent";
+
+const agent = new Agent({ steeringMode: "all" });
+agent.setSystemPrompt("You are a helpful coding assistant.");
+const unsubscribe = agent.subscribe((event) => console.log(event.type));
+await agent.prompt("List the files in this directory");
+unsubscribe();
+```
+
+Constructor: `new Agent(opts?: AgentOptions)`.
+
+Run control:
+
+- `prompt(message: AgentMessage | AgentMessage[]): Promise<void>` — start a run from one or more messages.
+- `prompt(input: string, images?: ImageContent[]): Promise<void>` — start a run from raw text plus optional images. Throws if a run is already in progress or no model is selected.
+- `continue(): Promise<void>` — resume the existing conversation (e.g. after a context overflow). Throws if streaming, if the conversation is empty, or if the last message is an assistant turn.
+- `abort(): void` — cancel the in-flight request via its `AbortController`.
+- `waitForIdle(): Promise<void>` — resolves once any running prompt settles.
+- `reset(): void` — clear messages, streaming flags, pending tool calls, error, and all queues.
+
+Steering and follow-ups:
+
+- `steer(m: AgentMessage): void` — enqueue a steering message; it lands after the current tool finishes and skips any still-pending tool calls in that turn.
+- `followUp(m: AgentMessage): void` — enqueue a message that is held until the agent goes idle.
+- `setSteeringMode(mode)` / `getSteeringMode()` — `"all"` or `"one-at-a-time"`.
+- `setFollowUpMode(mode)` / `getFollowUpMode()` — `"all"` or `"one-at-a-time"`.
+- `clearSteeringQueue()`, `clearFollowUpQueue()`, `clearAllQueues()`.
+
+Configuration setters (forward into the state manager):
+
+- `setSystemPrompt(v: string)`
+- `setModel(m: Model<any>)`
+- `setThinkingLevel(l: ThinkingLevel)`
+- `setTools(t: AgentTool<any>[])`
+
+Message management:
+
+- `replaceMessages(ms: AgentMessage[])`
+- `appendMessage(m: AgentMessage)`
+- `clearMessages()`
+
+Subscription:
+
+- `subscribe(fn: (e: AgentEvent) => void): () => void` — register a listener; returns an unsubscribe function.
+
+Accessors:
+
+- `state` (getter) — the current `AgentState`.
+- `sessionId` (getter/setter) — the provider-caching session id.
+- `thinkingBudgets` (getter/setter) — `ThinkingBudgets | undefined`.
+
+Public fields:
+
+- `streamFn: StreamFn` — defaults to `streamSimple`.
+- `getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined`.
+
+## AgentOptions
+
+```typescript
+interface AgentOptions {
+  initialState?: Partial<AgentState>;
+  convertToLlm?: (messages: AgentMessage[]) => Message[] | Promise<Message[]>;
+  transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => Promise<AgentMessage[]>;
+  steeringMode?: "all" | "one-at-a-time";   // default "one-at-a-time"
+  followUpMode?: "all" | "one-at-a-time";   // default "one-at-a-time"
+  streamFn?: StreamFn;                       // default streamSimple
+  sessionId?: string;
+  getApiKey?: (provider: string) => Promise<string | undefined> | string | undefined;
+  thinkingBudgets?: ThinkingBudgets;
+}
+```
+
+When `convertToLlm` is omitted, the built-in default keeps only `user`, `assistant`, and `toolResult` messages.
+
+## AgentState
+
+```typescript
+interface AgentState {
+  systemPrompt: string;
+  model: Model<any>;
+  thinkingLevel: ThinkingLevel;        // "off" | "minimal" | "low" | "medium" | "high" | "xhigh"
+  tools: AgentTool<any>[];
+  messages: AgentMessage[];
+  isStreaming: boolean;
+  streamMessage: AgentMessage | null;
+  pendingToolCalls: Set<string>;
+  error?: string;
+}
+```
+
+`AgentMessage = Message | CustomAgentMessages[keyof CustomAgentMessages]`. Applications add their own message kinds by declaration-merging the `CustomAgentMessages` interface.
+
+## AgentEvent
+
+The events the loop streams out (`type` discriminator). Grouped in `AGENT_EVENT_GROUPS`:
+
+- Lifecycle: `agent_start`, `agent_end` (carries `messages: AgentMessage[]`).
+- Turn: `turn_start`, `turn_end` (carries `message` and `toolResults: ToolResultMessage[]`).
+- Message: `message_start`, `message_update` (carries `assistantMessageEvent`), `message_end`.
+- Tool execution: `tool_execution_start`, `tool_execution_update` (carries `partialResult`), `tool_execution_end` (carries `result` and `isError`).
+
+Related exports: `AgentEventType`, `ExtractAgentEvent<TType>`, and the `AGENT_EVENT_GROUPS` constant.
+
+## Tool Types
+
+`AgentTool<TParameters extends TSchema = TSchema, TDetails = any>` extends the AI module's `Tool` with:
+
+```typescript
+interface AgentTool<TParameters, TDetails> extends Tool<TParameters> {
+  label: string;
+  execute: (
+    toolCallId: string,
+    params: Static<TParameters>,
+    signal?: AbortSignal,
+    onUpdate?: AgentToolUpdateCallback<TDetails>,
+  ) => Promise<AgentToolResult<TDetails>>;
+}
+
+interface AgentToolResult<T> {
+  content: (TextContent | ImageContent)[];
+  details: T;
+  isError?: boolean;
+}
+
+type AgentToolUpdateCallback<T = any> = (partialResult: AgentToolResult<T>) => void;
+```
+
+`AgentContext` mirrors a plain `Context` but types its tool list as `AgentTool<any>[]`:
+
+```typescript
+interface AgentContext {
+  systemPrompt: string;
+  messages: AgentMessage[];
+  tools?: AgentTool<any>[];
+}
+```
+
+## Loop Functions
+
+For hosts that drive the loop directly rather than through `Agent`:
+
+- `agentLoop(prompts, context, config, signal?, streamFn?): EventStream<AgentEvent, AgentMessage[]>` — start a new run.
+- `agentLoopContinue(context, config, signal?, streamFn?): EventStream<AgentEvent, AgentMessage[]>` — resume an existing context.
+
+`AgentLoopConfig` extends the AI module's `SimpleStreamOptions` and adds `model`, `convertToLlm`, and the optional hooks `transformContext`, `getApiKey`, `getSteeringMessages`, and `getFollowUpMessages`.
+
+```typescript
+import { agentLoop } from "indusagi/agent";
+import { getModel } from "indusagi/ai";
+
+const stream = agentLoop(
+  [{ role: "user", content: [{ type: "text", text: "hi" }], timestamp: Date.now() }],
+  { systemPrompt: "", messages: [], tools: [] },
+  { model: getModel("google", "gemini-2.5-flash"), convertToLlm: (m) => m as any },
+);
+for await (const event of stream) {
+  console.log(event.type);
+}
+```
+
+## Helpers and Guards
+
+From `indusagi/agent`:
+
+- `validateMessage(value): value is Message`
+- `isUserMessage(value): value is UserMessage`
+- `isThinking(value): value is ThinkingContent`
+- `isToolCall(value): value is ToolCall`
+- `StreamFn` — the streaming entry-point type, accepting the same arguments as `streamSimple`.
+- `streamProxy(model, context, options)` — a remote `StreamFn` from `proxy.ts`.
+
+## See Also
+
+- [Agent Loop and Tools](/docs/agent/loop-and-tools)
+- [Tools Reference](/docs/agent/tools-reference)
+- [Agent Module](/docs/agent/README)

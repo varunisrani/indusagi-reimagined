@@ -1,0 +1,5 @@
+{
+  "repository": "https://github.com/varunisrani/indusagi-docs.git",
+  "commit": "a24f7e9823d0149e27bf05af912fba8dd959866c",
+  "importedAreas": ["package", "cli", "python", "python-cli", "rust", "rust-cli"]
+}

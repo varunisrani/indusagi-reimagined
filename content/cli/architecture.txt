@@ -1,0 +1,176 @@
+# Architecture: Module Map
+
+> The coding agent is a single npm package, `indusagi-coding-agent`, built entirely on the `indusagi` framework. `src/index.ts` is a barrel that exposes every subsystem as a namespace; `src/entry.ts` is the terminal bin (`indus` / `indusagi`). This page maps those modules and the launch flow that connects them.
+
+The agent is structured as a set of self-contained subsystems, each with its own `index.ts` barrel and a frozen `contract.ts` of type-only shapes. The package root re-exports them as namespaces so they can be embedded or tested in isolation, while the OS launches the agent through `entry.ts`.
+
+## Table of Contents
+
+- [The Two Entry Points](#the-two-entry-points)
+- [Launch Flow: entry → boot → runners](#launch-flow-entry--boot--runners)
+- [Subsystem Map](#subsystem-map)
+- [How a Session Is Assembled](#how-a-session-is-assembled)
+- [Source Files](#source-files)
+
+## The Two Entry Points
+
+The package has two faces, both at the root of `src/`:
+
+| File | Role |
+|------|------|
+| `src/index.ts` | The **library surface** — a barrel that exports each subsystem as a namespace (`boot`, `conductor`, `capabilityDeck`, …) for embedding and testing. Also re-exports `VERSION`. |
+| `src/entry.ts` | The **terminal binary** — the `#!/usr/bin/env node` bin the OS launches (installed as `indus` and `indusagi`). |
+
+`src/index.ts` re-exports sixteen namespaces plus the `VERSION` constant:
+
+```typescript
+export * as boot from "./boot";
+export * as workspace from "./workspace";
+export * as conductor from "./conductor";
+export * as windowBudget from "./window-budget";
+export * as capabilityDeck from "./capability-deck";
+export * as runtimeBridge from "./runtime-bridge";
+export * as addons from "./addons";
+export * as consoleUi from "./console";
+export * as channels from "./channels";
+export * as briefing from "./briefing";
+export * as transcriptExport from "./transcript-export";
+export * as launch from "./launch";
+export * as insight from "./insight";
+export * as kit from "./kit";
+export * as settings from "./settings";
+export * as sessions from "./sessions";
+
+export { VERSION } from "./workspace";
+```
+
+`entry.ts` does only three things before handing off control:
+
+1. Sets `process.title` to the brand's first bin name (`indus`) so the process is identifiable in `ps`.
+2. Installs a single, idempotent console filter that drops transport-layer `[MCP]` noise from stdout/stderr — unless the brand debug env var (`INDUSAGI_DEBUG`) is set, in which case nothing is filtered.
+3. Hands the sliced `argv` to `boot()` and adopts its resolved exit code (`process.exitCode`).
+
+The `boot()` call is guarded by an `import.meta` entry check (`isProgramEntry()`), so importing `entry.ts` from a test never launches the agent — only running it as the program entry does. The check resolves **both** `import.meta.url` and `process.argv[1]` through `realpathSync` before comparing, so a global `npm i -g` symlinked bin still launches.
+
+## Launch Flow: entry → boot → runners
+
+`boot(argv)` (in `boot/boot.ts`) owns the whole launch arc and is the single function `entry.ts` calls.
+
+```
+entry.ts
+  └─ boot(argv)                         boot/boot.ts
+       ├─ seedContext(argv)             workspace + brand + placeholder invocation
+       ├─ runCredential / runPackage    short-circuit verbs (signin/signout, install/remove/…)
+       ├─ --help / --version            short-circuit meta requests
+       ├─ --list-models [filter]        print catalog, exit
+       ├─ runStages(seeded)             boot/stages.ts — the ordered pipeline
+       └─ selectRunner(invocation).run  boot/runners/registry.ts
+            ├─ replRunner      → mountConsole(...)        (interactive)
+            ├─ oneshotRunner   → runOneshot(...)          (text / NDJSON to stdout)
+            └─ linkRunner      → createLinkServer(...)     (JSON-RPC over stdio)
+```
+
+### 1. Seed and short-circuits
+
+`seedContext(argv)` builds a `BootContext` from a resolved `Workspace`, the `BRAND` record, and a parsed placeholder `Invocation`. Before any stage runs, `boot()` checks for command verbs and meta requests that exit early:
+
+- **Credential verbs** (`signin` / `signout`) are routed through the launch layer's `runCredentialCommand` over a disk-backed auth vault. (api-key only — there is no OAuth route here.)
+- **Package verbs** (`install` / `remove` / `update` / `list` / `config`) go to `runPackageCommand` over a workspace-scoped `PreferenceStore`.
+- `--help` / `-h` renders the generated usage banner; `--version` / `-v` prints `BRAND.name` + `VERSION`.
+- `--list-models [filter]` prints the model catalog and exits, with no session and no directory side effects.
+
+### 2. The stage pipeline
+
+`runStages(seeded)` folds an **immutable** `BootContext` through an ordered list of `Stage` transforms (`STAGES`). Each stage receives a context and returns its successor by spreading — never by mutating. The five stages, in order:
+
+| Stage | Name | What it does |
+|-------|------|--------------|
+| 1 | `locate-workspace` | `ensureDirs(workspace)` — materialise the profile directories on disk. |
+| 2 | `apply-upgrades` | Fold the idempotent `applyUpgrades` registry over the workspace (non-fatal, retried next launch). |
+| 3 | `build-invocation` | Parse `argv` into the typed `Invocation` via `tokenizeInvocation`. |
+| 4 | `resolve-resources` | Best-effort assemble the `StartupResources` graph (framework `DEFAULT_SETTINGS` + `ModelRegistry`), degrading to minimal placeholders if a framework piece is unavailable. |
+| 5 | `select-runner` | A marker/tracing no-op — the real dispatch happens in `boot()` after the pipeline, so the chosen runner owns the exit code. |
+
+### 3. Runner dispatch
+
+The pipeline ends by handing the resolved `Invocation` to exactly one `Runner`. Dispatch is data, not control flow: `RUNNERS` lists every runner in priority order and `selectRunner` returns the first whose `accepts` predicate matches.
+
+```typescript
+export const RUNNERS: readonly Runner[] = [replRunner, oneshotRunner, linkRunner];
+```
+
+`replRunner` is both first and the guaranteed fallback — a bare command line lands in the interactive session. The invocation parser maps the launch `OutputMode` onto the runner mode: `text` → `repl`, `json` → `oneshot`, `rpc` → `link`.
+
+| Runner | `mode` | File | Behaviour |
+|--------|--------|------|-----------|
+| `replRunner` | `repl` | `boot/runners/repl-runner.ts` | Builds a `SessionConductor`, honours `--resume` / `--continue`, then `mountConsole(conductor, ...)` for the live Ink session. |
+| `oneshotRunner` | `oneshot` | `boot/runners/oneshot-runner.ts` | One non-interactive run to `process.stdout` via `runOneshot` — clean text, or streamed NDJSON when a `json` flag is set. Exits non-zero (`2`) with no request text. |
+| `linkRunner` | `link` | `boot/runners/link-runner.ts` | Serves the declarative `SESSION_OPS` registry over the stdio pair via `createLinkServer` — framed JSON-RPC for a driving parent. |
+
+Cleanup is guaranteed: every teardown callback accumulated in `BootContext.closables` is drained in a `finally`, latest-registered first, regardless of how the runner resolved.
+
+## Subsystem Map
+
+Each subsystem is imported as a namespace from `src/index.ts`. The table groups them by concern.
+
+### Launch & lifecycle
+
+| Namespace | Module | Responsibility |
+|-----------|--------|----------------|
+| `boot` | `src/boot` | The launch orchestrator (`boot`), the `STAGES` pipeline, the `tokenizeInvocation` parser, the runner registry (`selectRunner` / `RUNNERS`), and the idempotent profile-`applyUpgrades` driver. |
+| `workspace` | `src/workspace` | The `BRAND` record (single source of truth for the product name, bin names, profile dir, and env-var namespace), `VERSION`, the `createWorkspace` / `ensureDirs` locator, and runtime/packaging detection. |
+| `launch` | `src/launch` | The declarative `FlagSpec` flag table and `readInvocation` parser, the usage renderer, the `signin` / `signout` credential command and `AuthVault` seam, attachment gathering, the model-catalog printer, and the resume picker. |
+| `settings` | `src/settings` | The typed `Preferences` record + `SettingKey` vocabulary, `DEFAULT_PREFERENCES`, and the two-tier `PreferenceStore` (global + project) reader/writer. |
+| `sessions` | `src/sessions` | The `SessionLibrary` — the catalog-and-navigation layer over persisted transcripts — plus its `SavedSession`, `BranchNode`, and `PriorTurn` rows. |
+
+### The session core
+
+| Namespace | Module | Responsibility |
+|-----------|--------|----------------|
+| `conductor` | `src/conductor` | The `SessionConductor` — the orchestrator over the framework agent loop. Owns the product-`SessionSignal` stream (via `SignalHub`), the persistent branchable `TranscriptStore`, the `ModelCatalog` / `ModelMatcher`, and the skill-invocation parser. |
+| `capabilityDeck` | `src/capability-deck` | The tooling layer: the `Capability` (= framework `AgentTool`) catalog, the `provisionDeck` assembler over `authoring` / `survey` / `all` profiles, the in-house cards, and the event-sourced MCP bridge ledger. See [Built-in Tools](tools.md). |
+| `windowBudget` | `src/window-budget` | Context-window budgeting: token measurement (`estimateTokens` / `isOverBudget`), slice planning (`planSlice`), and the conductor-consumable transcript `condense` / `createCondenser`. |
+| `briefing` | `src/briefing` | The declarative system-prompt pipeline (`composeBriefing` over `BRIEFING_SECTIONS`), the single-pass `$arg` macro model, and the Agent-Skills `SkillCard` loader. |
+
+### Surfaces & I/O
+
+| Namespace | Module | Responsibility |
+|-----------|--------|----------------|
+| `consoleUi` | `src/console` | The interactive Ink/React surface: the pure `consoleReducer` state machine, the theme engine, the data-driven slash-command registry (`SLASH_COMMANDS`), the keymap / paste / completion input modules, the surface components, and `mountConsole`. |
+| `channels` | `src/channels` | The non-interactive channels: the JSON-RPC envelope and declarative `SESSION_OPS` registry served by `createLinkServer`, the NDJSON framer, the dialog bridge, and the `runOneshot` text/NDJSON channel. |
+| `transcriptExport` | `src/transcript-export` | The HTML transcript publisher: the SGR-to-HTML painter (`paintSgr`), the WCAG-luminance `ThemeBridge`, the page-shell template, and `publishTranscript`. |
+
+### Integrations & extension
+
+| Namespace | Module | Responsibility |
+|-----------|--------|----------------|
+| `runtimeBridge` | `src/runtime-bridge` | Provider routing for external runtimes: the `bridge:<adapter>` endpoint convention, the provider-neutral `NormalizedEvent` union, the `ChildTransport` boundary, and the `RuntimeBroker` / `RuntimeRoute` surface. |
+| `addons` | `src/addons` | The third-party customization contract: the `AddonManifest` / `AddonSurface`, the colon-named `HookEvent` taxonomy and `EventDispatcher`, the `ToolInterceptor` chain, addon-contributed `AddonTool` / `AddonCommand`, and the module-loader seam. |
+| `insight` | `src/insight` | The observability plane: the immutable `Probe` value and `ProbeHandle`, the wire `Signal` union, the `SampleGate` / `Sink` / `Recorder` facades, and the `SecretRedactor` attribute processor. |
+| `kit` | `src/kit` | Framework-agnostic leaf helpers with no framework or sibling dependency: the managed-binary (`fd` / `rg`) provisioner, PNG/JPEG magic-byte sniffing, and POSIX shell-argument quoting. |
+
+Every subsystem barrel re-exports a frozen `contract.ts` (type-only shapes) and adds behavior modules as they land, so consumers import from the subsystem root (e.g. `src/conductor`) rather than reaching into individual files.
+
+## How a Session Is Assembled
+
+When `replRunner` (or either headless runner) handles an invocation, it calls `buildSessionConductor(ctx)` in `boot/runners/session.ts`. That helper threads the invocation's flags into the framework agent:
+
+1. **Tools** — `selectTools(cwd, inv)` provisions the full deck with `provisionDeck("all", { cwd }).tools()`. `--no-tools` yields an empty deck; `--tools name1,name2` filters the deck by an allow-list (ids matched case-insensitively with `_` and `-` stripped, so `--tools web_fetch,todo_read` lines up with the `webfetch` / `todoread` ids). MCP tools from `--mcp` endpoints are then concatenated onto the deck.
+2. **System prompt** — `composeSystem` builds the tool-aware briefing via `composeBriefing({ tools })`; `--system` replaces it (file path or literal text) and `--append-system` adds a trailing block.
+3. **The conductor** — `buildSessionConductor` calls `createSessionConductor(options, …)` with `SessionConductorOptions` carrying the resolved `tools`, `system` prompt, `modelId`, `sessionsDir`, the optional thinking level (`--thinking`), and a `getApiKey` resolver. The `tools?: AgentTool[]` field takes the flat capability list `provisionDeck("all", { cwd }).tools()` (plus any MCP tools) verbatim — `AnyCapability` is an alias of the framework `AgentTool`, so no adapter is needed. There is no `account` option field: `--account` is consumed earlier, to build the per-request `getApiKey` credential resolver.
+
+The runner then either mounts the console over the conductor (interactive) or drives it through a channel (oneshot / link).
+
+## Source Files
+
+Internal source (`indus-code-rebuild/src`):
+
+- `index.ts` — the package barrel; sixteen subsystem namespaces + `VERSION`.
+- `entry.ts` — the terminal bin; `process.title`, the `[MCP]` filter, and the guarded `boot()` call.
+- `boot/boot.ts` — the `boot` orchestrator, credential/package short-circuits, meta requests, and `drainClosables`.
+- `boot/stages.ts` — the five-stage `STAGES` pipeline and `runStages` fold.
+- `boot/invocation.ts` — `tokenizeInvocation`, mode projection, `wantsHelp` / `wantsVersion`.
+- `boot/runners/registry.ts` — `RUNNERS` table and `selectRunner`.
+- `boot/runners/{repl,oneshot,link}-runner.ts` — the three runners.
+- `boot/runners/session.ts` — `buildSessionConductor`, `selectTools`, `composeSystem`, `loadMcpTools`.
+- `workspace/brand.ts` — the `BRAND` record and `VERSION`.

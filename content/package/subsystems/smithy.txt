@@ -1,0 +1,102 @@
+# Smithy
+
+> `src/smithy` is the L5 Product agent-builder (IndusForge) — a meta-tool that helps
+> a user design and generate new agents that run on the runtime. Imported as
+> `indusagi/smithy`, or as the `smithy` namespace from `indusagi`.
+
+Smithy is a leaf product surface. Its layers turn a partial spec into a validated,
+runnable agent description: a flag reader, a persona/blueprint generator, an
+externalised knowledge pack, session-level tool accounting, a render seam, and the
+`Forge` build session that conducts them all and instantiates the finished blueprint
+into a real agent.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-directories](#sub-directories)
+- [The Forge build session](#the-forge-build-session)
+- [Layers](#layers)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+`src/smithy/index.ts` re-exports the layer barrels (`export *` over `config`,
+`persona`, `knowledge`, `runtime`, `ui`) plus the `Forge` build session.
+
+| Export | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `Forge`, `createForge` | class / fn | `forge.ts` | The build session that wires the layers into one agent-builder |
+| `FlagReader`, `readFlags`, `FlagError`, `FLAG_TABLE` | from `config` | `config/flag-reader.ts` | Reads Smithy's own CLI into a `SmithyConfig` |
+| `defineAgent`, `toAgentConfig` | from `persona` | `persona/define-agent.ts` | Merge a spec over a profile into a blueprint, then bridge to a runtime config |
+| `PROFILES`, `PROFILE_NAMES`, `getProfile`, `isProfileName` | from `persona` | `persona/profiles.ts` | The starter profile table |
+| `agentBlueprintSchema`, `validateBlueprint`, `serializeBlueprint`, `deserializeBlueprint`, `BlueprintError` | from `persona` | `persona/blueprint.ts` | The `AgentBlueprint` shape and (de)serialization |
+| `loadKnowledge`, `KnowledgeError` | from `knowledge` | `knowledge/loader.ts` | Load the guide pack into a `KnowledgePack` |
+| `ToolLedger` | from `runtime` | `runtime/tool-ledger.ts` | Append-only account of tool executions during a build |
+| `TranscriptModel`, `ConsoleForgeView`, `formatTranscript` | from `ui` | `ui/transcript.ts` | The render seam + minimal text `ForgeView` |
+
+Types include `ForgeOptions`, `InterviewKey`, `InterviewAnswers`; `SmithyConfig`,
+`SmithyFlagName`; `AgentBlueprint`, `ToolCollectionName`, `AgentProfile`,
+`ProfileName`, `AgentSpec`; `KnowledgePack`, `KnowledgeManifest`, `Guide`;
+`ToolEvent`, `LedgerEntry`, `ToolTally`, `LedgerSummary`; and the `RenderTranscript`
+/ `ForgeView` family.
+
+## Sub-directories
+
+| Directory | Holds |
+|-----------|-------|
+| `config/` | `flag-reader.ts` — the `FlagReader` state machine and `FLAG_TABLE` |
+| `persona/` | `blueprint.ts`, `profiles.ts`, `define-agent.ts` — the blueprint shape, profiles, and generator |
+| `knowledge/` | `loader.ts`, `manifest.json`, `guides/` — the externalised guide pack |
+| `runtime/` | `tool-ledger.ts` — the `ToolLedger` |
+| `ui/` | `transcript.ts` — the `TranscriptModel` and `ForgeView` seam |
+| `forge.ts` | The `Forge` build session |
+
+## The Forge build session
+
+The `Forge` is the conductor that wires the layers into a single drivable build
+session. It runs in two modes:
+
+- **`Forge.buildInteractive`** — a short scripted *interview*. It asks the user,
+  through the injected `ForgeView` seam, for the agent's name, purpose, tool needs,
+  and model preference; folds the answers into a blueprint via `defineAgent`; records
+  each step on a `ToolLedger`; and keeps the dialogue as a transcript a
+  `TranscriptModel` can project.
+- **`Forge.buildFromConfig`** — the non-interactive path. It takes a `SmithyConfig`
+  (a profile plus pre-supplied `answers`) and produces the same kind of blueprint
+  with no I/O at all.
+
+`Forge.instantiate` turns a finished blueprint into a runnable `Agent` via
+`toAgentConfig` and `createAgent`:
+
+```ts
+import { createForge } from "indusagi/smithy";
+
+const forge = createForge(/* ForgeOptions */);
+const blueprint = forge.buildFromConfig(config); // synchronous; returns AgentBlueprint
+const agent = forge.instantiate(blueprint);      // a runtime Agent
+```
+
+The view (and its lone `ask`) is *injected*, never constructed here, so tests script
+the whole interview with canned answers; with neither given, the Forge falls back to
+a `ConsoleForgeView` over stdio.
+
+## Layers
+
+- **config** — the `FlagReader` state machine reads Smithy's CLI into a `SmithyConfig`.
+- **persona** — `defineAgent` merges an `AgentSpec` over a `PROFILES` entry into a
+  validated `AgentBlueprint`; `toAgentConfig` bridges that into a runtime `AgentConfig`.
+- **knowledge** — `loadKnowledge` loads a `manifest.json` plus markdown `guides/`
+  into a `KnowledgePack` for Smithy to consult while authoring.
+- **runtime** — the `ToolLedger` accounts for tool executions during a build.
+- **ui** — the `TranscriptModel` visitor sanitizes and projects a transcript; the
+  minimal text `ForgeView` is the seam the builder loop talks to.
+
+## Relationship to neighbors
+
+Smithy generates agents that run on the [Runtime](/docs/subsystems/runtime):
+`toAgentConfig` produces an `AgentConfig` and `Forge.instantiate` calls `createAgent`.
+The generated agent's tools are a [Capabilities](/docs/subsystems/capabilities)
+collection (`ToolCollectionName`). Smithy sits at the top of the stack — it *builds*
+agents rather than running model conversations itself.
+
+Back to the [Architecture overview](/docs/architecture).

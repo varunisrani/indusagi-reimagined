@@ -1,0 +1,506 @@
+# Testing
+
+> The Rust edition is gated by `cargo test --workspace` — **2062 tests passing /
+> 0 failing**, run twice with no flakes, strictly network-free and
+> credential-free. Tests live inline as `#[cfg(test)] mod tests` next to the code
+> they cover (npm-style: one module, many test modules), and one out-of-process
+> binary smoke test sits under `crates/indusagi/tests/`. The dev-only
+> `indusagi-testkit` crate carries four reusable seams (a scripted-model double, a
+> wiremock transcript server, a render harness, and a golden-corpus loader); it is
+> wired in as a `dev-dependency` and self-tested, but the inline suite currently
+> hand-rolls its own per-test fakes rather than importing it. The suite also
+> fmt-checks clean, passes `clippy -D warnings`, and `cargo bench --no-run`
+> compiles.
+
+## Table of Contents
+
+- [Running the tests](#running-the-tests)
+- [The test layout](#the-test-layout)
+- [The indusagi-testkit crate](#the-indusagi-testkit-crate)
+- [The ScriptedModel double](#the-scriptedmodel-double)
+- [The TranscriptServer wiremock helper](#the-transcriptserver-wiremock-helper)
+- [The render harness](#the-render-harness)
+- [The golden-corpus fixture loader](#the-golden-corpus-fixture-loader)
+- [Integration tests](#integration-tests)
+- [Benchmarks](#benchmarks)
+- [The xtask gates](#the-xtask-gates)
+- [Per-subsystem coverage map](#per-subsystem-coverage-map)
+- [Why offline and deterministic](#why-offline-and-deterministic)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Running the tests
+
+Everything runs from the workspace root with stock `cargo`. No environment
+variables, no API keys, no network, no terminal.
+
+```bash
+export PATH="$HOME/.cargo/bin:$PATH"   # rustc/cargo 1.96.0, edition 2024
+
+cargo test --workspace                 # the whole suite (2062 tests)
+cargo test -p indusagi                 # the framework crate's inline tests + the binary smoke test
+cargo test -p indusagi-testkit         # the testkit's own self-tests
+cargo test -p indusagi runtime::       # one module path's tests
+cargo test --workspace -- --list       # enumerate test names without running
+```
+
+The workspace is a virtual workspace whose members are `crates/indusagi`,
+`crates/indusagi-testkit`, and `xtask`
+(`default-members = ["crates/indusagi"]`). Because the thirteen former
+per-subsystem crates were merged into the single `indusagi` crate as
+modules, almost the entire suite compiles as one test binary — see
+[The crates](/rust/) in the overview and [Architecture](/rust/architecture)
+for the merge rationale.
+
+The full green gate, as recorded in the repository README, is:
+
+```bash
+cargo build --workspace
+cargo test  --workspace                # 2062 passing / 0 failing (run twice, no flakes)
+cargo fmt   --all --check              # clean
+cargo clippy --workspace --all-targets -- -D warnings   # exit 0
+cargo bench --workspace --no-run       # benches compile
+cargo run   -p xtask -- lineage        # clean-room hygiene gate, exit 0
+```
+
+## The test layout
+
+Rust does not split tests into a parallel `tests/` tree the way the
+[Python edition](/python/reference/testing) does. The convention here is **inline
+unit tests**: each source file that has tests ends with a private
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    // ...
+}
+```
+
+block, compiled only under `cargo test` and never shipped in the release binary.
+This keeps a test next to the function it exercises and lets it reach the
+module's private items via `use super::*`. There are **148** such `#[cfg(test)]`
+modules across `crates/indusagi/src`, holding the bulk of the suite.
+
+Two things sit outside the inline pattern:
+
+| Location | Kind | Purpose |
+|----------|------|---------|
+| `crates/indusagi/src/**` (inline `#[cfg(test)] mod tests`) | unit / integration | The framework suite — pure-logic units, conductor runs against inline `impl ModelInvoker` doubles, connector decode/fold tests, and ratatui frame snapshots. |
+| `crates/indusagi/tests/binary_smoke.rs` | integration (out-of-process) | Drives the *real* built binary via `CARGO_BIN_EXE_indusagi` through `--help` / `--version` / `--bogus`. |
+| `crates/indusagi-testkit/src/*` (inline `mod tests`) | self-test | The four shared seams test themselves — `script.rs`, `wire.rs`, `render.rs`, and `fixture.rs` each carry their own `#[cfg(test)]` block. |
+| `crates/indusagi/benches/*.rs` | criterion benches | Hot-path microbenchmarks; compiled by `cargo bench`, not `cargo test`. |
+| `xtask/src/*` | self-test | The lineage / embed hygiene gates carry inline tests. |
+
+The framework's inline tests carry the bulk of the suite, and the crate's
+`tests/` directory holds only `binary_smoke.rs`: the higher-level "does the whole loop run
+end-to-end" tests are themselves inline (e.g. the `tui_render` interactive-app
+tests and the `runtime` conductor tests), so the inline tree doubles as the map of
+the public surface.
+
+## The indusagi-testkit crate
+
+`indusagi-testkit` is a dev-only crate (`publish = false`,
+"Dev-only test helpers and fixtures shared across the indusagi crate test suites.
+Never published.") that carries four reusable seams meant to spare each subsystem's
+tests from re-hand-rolling them. Its `Cargo.toml` declares the framework as a
+normal dependency (`indusagi = { path = "../indusagi", version = "0.1.0" }`) while
+`indusagi` depends back on the testkit only as a `dev-dependency` — the resulting
+cycle is dev-only, which cargo permits.
+
+> **Status note:** the testkit is declared as a dev-dependency of `indusagi` but
+> the inline `#[cfg(test)]` suite does **not** currently import it — there are zero
+> `use indusagi_testkit::…` sites in `crates/indusagi`.
+> The conductor/runner tests hand-roll their own inline `impl ModelInvoker`
+> doubles (10 such inline impls across `src`), the connector tests decode recorded
+> bodies directly rather than through `TranscriptServer`, and the TUI tests draw
+> into ratatui's `TestBackend` directly rather than through `render_frame`. The
+> seams below are therefore *provided and self-tested* but not yet wired into the
+> main suite. They are described here as the intended shared harness.
+
+```toml
+# crates/indusagi-testkit/Cargo.toml
+[package]
+name    = "indusagi-testkit"
+publish = false
+
+[dependencies]
+indusagi   = { path = "../indusagi", version = "0.1.0" }
+serde      = { workspace = true }      # fixture deserialization
+serde_json = { workspace = true }      # load_json
+futures    = { workspace = true }      # ScriptedModel's Channel stream
+wiremock   = { workspace = true }      # TranscriptServer
+ratatui    = "0.30.1"                  # TestBackend render harness
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }   # the self-tests' async runtime
+```
+
+The crate root re-exports the public seam from four modules:
+
+| Module | Public API | Role |
+|--------|-----------|------|
+| `fixture` | `fixture_path`, `load_json`, `load_text`, `fixtures_dir` | The cross-language golden-corpus loader. |
+| `script` | `ScriptedModel` | A `ModelInvoker` test double that replays recorded turns and panics past the script. |
+| `wire` | `TranscriptServer` (+ `SSE_CONTENT_TYPE`, `NDJSON_CONTENT_TYPE`) | A localhost `wiremock` server that serves recorded provider SSE/NDJSON bodies. |
+| `render` | `render_frame`, `render_lines`, `buffer_to_string`, `TestBackend` | A headless ratatui `TestBackend` render harness — no PTY, CI-safe on every OS. |
+
+```rust
+// crates/indusagi-testkit/src/lib.rs
+pub mod fixture;
+pub mod render;
+pub mod script;
+pub mod wire;
+
+pub use fixture::{fixture_path, load_json, load_text};
+pub use render::{buffer_to_string, render_frame, render_lines};
+pub use script::ScriptedModel;
+pub use wire::TranscriptServer;
+```
+
+The framework wires it in as a dev-dependency (`path`-only, so cargo strips it
+from the published manifest):
+
+```toml
+# crates/indusagi/Cargo.toml [dev-dependencies] (excerpt)
+indusagi-testkit = { path = "../indusagi-testkit" }
+insta            = { workspace = true }   # snapshot assertions
+proptest         = { workspace = true }   # property tests
+wiremock         = { workspace = true }
+tempfile         = "3"                     # on-disk sandboxes
+filetime         = "0.2"                   # simulate mtime drift for the read gate
+ratatui          = "0.30.1"               # inline TestBackend frame tests
+```
+
+## The ScriptedModel double
+
+The runtime conductor takes an injected `Arc<dyn ModelInvoker>`
+(`indusagi::runtime::contract::ModelInvoker`, a `Send + Sync` trait). In
+production a gateway-backed invoker binds the live stream; the testkit provides
+`ScriptedModel` as the canonical scripted double. It replays **one recorded
+emission-turn per `invoke` call** and **panics past the script**, so a runaway
+drive loop surfaces as a failed assertion rather than a wedged suite. It is the
+direct Rust port of the TypeScript `runtime.test.ts` `scriptModel` +
+`channelOf(emissions)` pattern.
+
+(In the current suite the inline conductor/runner tests define their own small
+`impl ModelInvoker` doubles inline rather than importing `ScriptedModel`; the
+testkit version below is the shared seam they could collapse onto, and its own
+self-tests pin its contract.)
+
+```rust
+// crates/indusagi-testkit/src/script.rs
+pub struct ScriptedModel {
+    turns: Vec<Arc<Vec<Emission>>>,
+    cursor: AtomicUsize,
+}
+
+impl ScriptedModel {
+    pub fn new(turns: Vec<Vec<Emission>>) -> Self { /* ... */ }
+    pub fn single(turn: Vec<Emission>) -> Self { Self::new(vec![turn]) }
+    pub fn calls(&self) -> usize { self.cursor.load(Ordering::SeqCst) }
+}
+
+impl ModelInvoker for ScriptedModel {
+    fn invoke(&self, _conversation: Conversation, _options: StreamOptions) -> Channel {
+        let i = self.cursor.fetch_add(1, Ordering::SeqCst);
+        let turn = self.turns.get(i).cloned().unwrap_or_else(|| {
+            panic!(
+                "ScriptedModel invoked {} time(s); only {} turn(s) recorded \
+                 (runaway drive loop?)",
+                i + 1,
+                self.turns.len()
+            )
+        });
+        // Re-iterable Channel: each `iter()` rebuilds the stream from the recorded Vec.
+        Channel::of(move || {
+            let turn = turn.clone();
+            Box::pin(stream::iter((*turn).clone()))
+        })
+    }
+}
+```
+
+Two contracts matter and are pinned by the testkit's own self-tests:
+
+- **One turn per call, in order.** `turns[i]` is replayed on the `i`-th call;
+  `calls()` reports the cursor so a test can assert the exact number of turns a
+  drive loop issued.
+- **The returned `Channel` is re-iterable within a turn.** Iterating the same
+  channel twice replays the identical turn and does **not** advance the script
+  cursor, mirroring the production gateway's re-iterable `Channel` semantics. The
+  `#[should_panic(expected = "only 1 turn(s) recorded")]` self-test pins the
+  runaway-loop guard.
+
+`Emission`, `Reply`, `Channel`, `Conversation`, and `StreamOptions` come from
+`indusagi::llmgateway::contract` — see [LLM Gateway](/rust/subsystems/llm-gateway)
+for the streaming type contract and [Runtime](/rust/subsystems/runtime) for the
+`ModelInvoker` engine seam.
+
+## The TranscriptServer wiremock helper
+
+The 11 wire connectors (`anthropic`, `openai_chat`, `openai_responses`,
+`google`, `google_vertex`, `azure_openai`, `bedrock`, `ollama`, `nvidia`,
+`kimi`, plus the `mock` double) are designed to be tested **not** by mocking the
+connector but by replaying a recorded provider SSE/NDJSON body through the *real*
+framer + decoder + fold over a localhost `wiremock` server. `TranscriptServer`
+wraps the three-line setup (start a server, mount a route, serve a transcript
+with the right content-type) behind a small builder.
+
+```rust
+// crates/indusagi-testkit/src/wire.rs
+pub const SSE_CONTENT_TYPE: &str    = "text/event-stream";
+pub const NDJSON_CONTENT_TYPE: &str = "application/x-ndjson";
+
+pub struct TranscriptServer { inner: MockServer }
+
+impl TranscriptServer {
+    pub async fn start() -> Self;
+    pub fn uri(&self) -> String;            // http://127.0.0.1:<port>
+    pub fn server(&self) -> &MockServer;    // for extra matchers / .expect(n)
+
+    pub async fn serve(&self, method: &str, path: &str, body: impl Into<String>, content_type: &str);
+    pub async fn serve_sse(&self, method: &str, path: &str, body: impl Into<String>);     // text/event-stream
+    pub async fn serve_ndjson(&self, method: &str, path: &str, body: impl Into<String>);  // application/x-ndjson (Ollama)
+    pub async fn serve_status(&self, method: &str, path: &str, status: u16);              // HTTP-status → GatewayError-kind table
+}
+```
+
+The intended connector replay test (from the `wire.rs` module doc-comment) reads
+like:
+
+```rust
+let server = TranscriptServer::start().await;
+server.serve_sse("POST", "/v1/messages", anthropic_body).await;
+let connector = create_anthropic_connector(server.uri(), "sk-test");
+// … drive the connector against server.uri(), assert the folded Reply …
+```
+
+(The connector factories are the `create_*_connector` functions in
+`llmgateway::connectors` — e.g. `create_anthropic_connector`,
+`create_ollama_connector`; the doc-comment abbreviates them.)
+
+`serve` mounts a `200` route via `Mock::given(method).and(path)` that both
+`insert_header("content-type", …)` and `set_body_raw(body, content_type)`, and
+calls `.expect(1)` so a connector that fails to issue the request is caught;
+`serve_sse` / `serve_ndjson` are thin wrappers passing `SSE_CONTENT_TYPE` /
+`NDJSON_CONTENT_TYPE`. `serve_status` mounts an empty-body route at an arbitrary
+`status` (no `.expect`), covering the HTTP-status → `GatewayErrorKind` table. The
+testkit's own self-tests verify the served content-type and status with a
+dependency-free `TcpStream` GET on a `spawn_blocking` worker thread under a
+multi-thread tokio runtime (so the testkit pulls in no HTTP client of its own).
+
+## The render harness
+
+ratatui ships `TestBackend`, an in-memory `Buffer` the renderer draws into. The
+harness wraps the draw-into-a-fixed-size-backend-and-stringify dance so any TUI
+snapshot test is a one-liner. There is no PTY, so it runs in CI on all three
+operating systems.
+
+```rust
+// crates/indusagi-testkit/src/render.rs
+/// Draw into a fixed w×h TestBackend and return the frame as snapshot text.
+pub fn render_frame<F>(w: u16, h: u16, draw: F) -> String
+where
+    F: FnOnce(&mut ratatui::Frame);
+
+/// Render a slice of ratatui `Line`s into a w-wide buffer (the common case for
+/// view functions that return `Vec<Line>` rather than taking a `&mut Frame`).
+pub fn render_lines(w: u16, lines: &[ratatui::text::Line<'_>]) -> String;
+
+/// Flatten a `Buffer` into snapshot text: each row's cell symbols, trailing
+/// blanks trimmed, rows joined by `\n`. Style is intentionally dropped — the
+/// snapshot pins the glyph layout (the flicker / wrap / clamp contract).
+pub fn buffer_to_string(buffer: &Buffer) -> String;
+```
+
+Style (colour/modifier) is intentionally dropped from the snapshot string — it
+pins the **glyph layout**, which is the flicker / wrapping / clamping contract the
+TUI render tests care about. Cell-level style (`buf[(x, y)].bg`, modifiers) is
+asserted separately by the unit tests that read the buffer directly. The pinned
+version (`ratatui = "0.30.1"`) keeps frame snapshots byte-stable across crates.
+
+In practice, the `tui_render` modules use ratatui's `TestBackend` directly — it
+appears in **29** source files across `crates/indusagi/src/tui_render` (the
+interactive app, the app loop, the theme adapter, the markdown renderer, the
+message list, the task panel, and every dialog/message component). The testkit's
+`render_frame` / `render_lines` / `buffer_to_string` offer a single-line front
+door for the same dance (and `render.rs` re-exports `TestBackend` for
+convenience), but the inline TUI tests currently call the ratatui backend
+themselves rather than going through these helpers. See [TUI](/rust/ui/tui) for
+the render pipeline these snapshots cover.
+
+## The golden-corpus fixture loader
+
+A cross-language golden corpus lives once at the workspace root in
+`tests/fixtures/` (generated from the TypeScript repo, never hand-edited); the
+`fixture` module is the single front door for reaching it without re-deriving the
+path. The directory is resolved relative to the testkit's manifest
+(`CARGO_MANIFEST_DIR = <workspace>/crates/indusagi-testkit`), walking up two
+levels (`.parent().and_then(Path::parent)`) to the workspace root — stable
+regardless of the cwd a test runs under.
+
+```rust
+// crates/indusagi-testkit/src/fixture.rs
+pub fn fixtures_dir() -> PathBuf;             // <workspace>/tests/fixtures
+pub fn fixture_path(name: &str) -> PathBuf;   // may include sub-paths
+pub fn load_text(name: &str) -> String;       // verbatim bytes as UTF-8
+pub fn load_json<T: DeserializeOwned>(name: &str) -> T;  // decode a JSON corpus into T
+```
+
+Both readers **panic with the fixture path** on a read or parse error, so a
+misconfigured corpus fails loudly at the call site rather than silently
+degrading. The two read shapes are: `load_json` for a typed corpus and
+`load_text` for a transcript body the framer would replay verbatim. The fixture
+module ships two self-tests of its own: `fixtures_dir` ends with
+`tests/fixtures` and resolves to a directory whose grandparent holds the
+workspace `Cargo.toml`, and `fixture_path("transcripts/anthropic.txt")` joins
+sub-paths correctly.
+
+The on-disk corpus **currently contains only `tests/fixtures/myers_diff.json`**
+(the golden line-diff pairs that back the `myers_diff` benchmark). There is no
+`tests/fixtures/transcripts/` directory at present — the sub-path the self-test
+references is illustrative, not a file that exists. Because the inline suite does
+not yet import the testkit, the `load_json` / `load_text` / `fixture_path` loaders
+are exercised only by the fixture module's own self-tests, not by any subsystem
+test.
+
+## Integration tests
+
+The one classic out-of-process integration test is `binary_smoke.rs`, which
+drives the *real* built `indusagi` binary (via cargo's
+`CARGO_BIN_EXE_indusagi` env var) through the three output-only / parse-error
+paths that need no terminal, network, or agent:
+
+```rust
+// crates/indusagi/tests/binary_smoke.rs
+fn bin() -> &'static str { env!("CARGO_BIN_EXE_indusagi") }
+
+#[test] fn help_exits_0_and_prints_the_usage_banner() { /* --help → exit 0 */ }
+#[test] fn version_exits_0_and_prints_the_workspace_version() { /* --version → "indusagi 0.1.0\n" */ }
+#[test] fn bogus_flag_exits_2_with_the_byte_exact_error() { /* --bogus → exit 2, stderr-only */ }
+```
+
+This asserts the binary is correctly wired to `indusagi::shell_app::run` and that
+the exit code flows out via the returned `ExitCode` (never `process::exit`). The
+running modes (print / wire / repl) are covered by the shell-app's own runner
+suites with scripted, network-free models; the smoke test only exercises the
+short-circuit paths so it stays hermetic. See [CLI](/rust/reference/cli) and
+[Shell App](/rust/subsystems/shell-app) for the wired surface it guards.
+
+## Benchmarks
+
+The hot paths carry criterion microbenchmarks under `crates/indusagi/benches/`.
+They are declared `harness = false` in the framework `Cargo.toml` and compiled by
+`cargo bench` (the green gate only requires `cargo bench --workspace --no-run`).
+
+| Bench | Covers |
+|-------|--------|
+| `session_hash.rs` | canonical-JSON encode + `content_hash` (sha256) on a session node. |
+| `sse_parse.rs` | SSE + NDJSON framer parsing a streamed body in incremental chunks. |
+| `myers_diff.rs` | the hand-rolled Myers O(ND) line diff on realistic file pairs. |
+| `fuzzy_match.rs` | the autocomplete / file-picker fuzzy matcher on a 10k-path corpus. |
+| `cell_diff.rs` | the terminal cell-grid diff. |
+
+The benches re-declare their own deps (`bytes`, `futures`, `criterion`,
+`ratatui`) because bench targets do not inherit the crate's normal dependencies.
+
+## The xtask gates
+
+`cargo xtask` replaces the TypeScript `build.mjs` and the
+`lineage-scan.mjs` / `consumer-gate.sh` hygiene scripts. It is a real workspace
+member (`xtask/`) with two subcommands, both carrying inline tests:
+
+```bash
+cargo run -p xtask -- lineage   # clean-room source-hygiene gate (exit 0 = clean)
+cargo run -p xtask -- embed     # verify the Smithy knowledge pack is intact
+```
+
+- **`lineage`** walks `crates/*/src` and fails (non-zero, printing the offending
+  `file:line`) if any re-derived clean-room lineage marker survives. It is the
+  Rust analogue of the TS `prepublishOnly → lineage-scan` gate and is part of the
+  green gate above.
+- **`embed`** verifies the Smithy knowledge pack on disk is intact and internally
+  consistent, so the compile-time `include_dir!` embed cannot bake a broken pack.
+  See [Smithy](/rust/subsystems/smithy).
+
+`xtask` resolves the workspace root from its own `CARGO_MANIFEST_DIR` (the parent
+of `<root>/xtask`), so the gates run identically from CI or a developer shell.
+
+## Per-subsystem coverage map
+
+Approximate inline test-function counts (`#[test]` + `#[tokio::test]`) per
+top-level module of `crates/indusagi/src`:
+
+| Module | ~Test fns | Documented page |
+|--------|-----------|-----------------|
+| `tui_render` | 866 | [TUI](/rust/ui/tui) |
+| `tui` | 240 | [TUI](/rust/ui/tui) |
+| `shell_app` | 186 | [Shell App](/rust/subsystems/shell-app) |
+| `facade` | 127 | [Facade](/rust/subsystems/facade) |
+| `swarm` | 127 | [Swarm](/rust/subsystems/swarm) |
+| `smithy` | 119 | [Smithy](/rust/subsystems/smithy) |
+| `llmgateway` | 95 | [LLM Gateway](/rust/subsystems/llm-gateway) |
+| `runtime` | 77 | [Runtime](/rust/subsystems/runtime) |
+| `core` | 42 | [Core](/rust/subsystems/core) |
+| `connectors_saas` | 16 | [Connectors](/rust/subsystems/connectors) |
+| `capabilities` | 12 | [Capabilities](/rust/subsystems/capabilities) |
+| `interop` | (via `facade`) | [Interop](/rust/subsystems/interop) |
+| `tracing` | (via `facade`) | [Tracing](/rust/subsystems/tracing) |
+
+`interop` and `tracing` carry no inline `#[cfg(test)]` blocks of their own — their
+round-trip behavior is exercised through the `facade` tests (the `ai` / `agent` /
+`mcp` / `memory` compat shims) that compose them, mirroring the
+[Python edition](/python/reference/testing) where `interop` is the thinnest
+directory. Static attribute counts under-report the true total: `cargo test`
+reports **2062 collected** because proptest property tests and `insta` snapshot
+batteries fan a single `#[test]` function into many cases. File size is not test
+count — the authoritative number comes from a real run, not a grep.
+
+## Why offline and deterministic
+
+The whole suite is strictly **offline / no-credential**, by three mechanisms that
+recur across every module:
+
+- **Scripted model, not a live gateway.** Conductor and runner tests inject an
+  inline `impl ModelInvoker` double (the testkit's `ScriptedModel` is the shared
+  reference implementation of the same idea) so the drive loop is fully
+  deterministic and panics rather than hanging if it over-iterates.
+- **Recorded / synthesized bodies, not live providers.** Connector tests feed
+  recorded SSE/NDJSON bytes through the real framer + decoder + fold so the exact
+  wire framing is exercised (chunk boundaries, content-types, status codes) with
+  no outbound network. `TranscriptServer` is the shared seam for doing this over a
+  localhost `wiremock` server.
+- **Real on-disk sandboxes, not stubs.** Filesystem-touching suites
+  (`capabilities`, `swarm`, `smithy`, `shell_app` sessions) write under
+  `tempfile`'s `TempDir` against the genuine local backends; `filetime` is used to
+  simulate mtime drift for the read gate. No global state is mutated.
+- **Headless rendering, not a PTY.** TUI tests draw into a ratatui `TestBackend`
+  in-memory buffer and assert the glyph grid, so they run identically on Linux,
+  macOS, and Windows CI.
+
+The README records the suite run **twice with no flakes** as part of the parity
+verdict (26/26, full parity).
+
+## Relationship to neighbors
+
+Cross-module coupling shows up entirely in the harnesses, exactly as in the other
+editions:
+
+- `runtime`, `shell_app`, and `facade` all script the model via an
+  `impl ModelInvoker` double (inline today; `ScriptedModel` is the shared form)
+  returning a re-iterable `Channel` of `Emission`s, so the conductor loop runs
+  deterministically. There are ten such inline `impl ModelInvoker` doubles across
+  `crates/indusagi/src`.
+- `llmgateway` and the connector tests share the recorded-body / real-framer
+  pattern that `TranscriptServer` is built to wrap; the framework's connector
+  tests exercise the decode/fold path directly.
+- `tui` and `tui_render` share ratatui's `TestBackend` render path, making the
+  `tui_render` interactive-app tests (which compose `runtime` + an inline scripted
+  model + the ratatui app) the broadest integration tests in the suite.
+
+For the layering these tests cover, see [Architecture](/rust/architecture); for
+the exported entry points the binary smoke test guards, see
+[Crate Exports](/rust/reference/crate-exports) and [CLI](/rust/reference/cli). For
+the TS/Python-vs-Rust provenance and the parity story, the Rust suite mirrors the
+[Python testing](/python/reference/testing) structure with inline `#[cfg(test)]`
+modules in place of a parallel `tests/` tree.

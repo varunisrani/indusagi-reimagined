@@ -1,0 +1,524 @@
+# TUI Render Engine
+
+> `indusagi::tui_render` is the Rust edition's live terminal UI: the immediate-mode
+> app framework (state struct + `dirty` redraw flag), a ratatui component model,
+> the runtime→render projection bridge, a flicker-free streaming markdown stack, a
+> structured word-level diff renderer, twelve modal dialogs on an overlay stack,
+> and the framework-free utility helpers. It is the React-Ink analogue for Rust —
+> built on **ratatui 0.30 immediate mode** with the React reconciler deleted, not
+> ported. It ports `src/react-ink/*` + `src/ui-bridge/*` from the TypeScript ground
+> truth onto plain Rust structs that paint into a `ratatui::Frame`.
+
+## Table of Contents
+
+- [Layout](#layout)
+- [The immediate-mode app framework](#the-immediate-mode-app-framework)
+- [The interactive driver loop](#the-interactive-driver-loop)
+- [View-model types](#view-model-types)
+- [Theme adapter](#theme-adapter)
+- [The render bridge](#the-render-bridge)
+- [Markdown stream](#markdown-stream)
+- [Diff renderer](#diff-renderer)
+- [Component model](#component-model)
+- [The twelve dialogs](#the-twelve-dialogs)
+- [Pure helpers](#pure-helpers)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Layout
+
+Everything lives under `indusagi/src/tui_render/`. The module map mirrors the
+deleted TypeScript `src/react-ink/` + `src/ui-bridge/` pair, with one new layer —
+`app/` — that replaces the React reconciler (`src/react-host/`, the JSX loader
+hack, is **gone**, not ported).
+
+| Module | Holds | TS origin |
+|--------|-------|-----------|
+| `app/` | The immediate-mode framework: `Component`/`Dialog` traits, `DialogStack`, `AppState`, `App` | replaces `react-host` + the Ink loop |
+| `types.rs` | Frozen value types (`SessionSnapshot`, `StatusMessage`, `ToolExecutionState`, …) | `react-ink/types.ts` |
+| `theme_adapter.rs` | The `InkTheme` color-role indirection → ratatui `Style` | `react-ink/theme-adapter.ts` |
+| `markdown/` | `format_token`, `highlight`, `render`: streaming markdown → ratatui lines | `react-ink/markdown/*` |
+| `diff/` | `structured`, `word`, `view`: structured word-level diff → ratatui lines | `react-ink/diff/*` |
+| `utils/` | `message_groups`, `selection`, `session_browser`, `tool_display`: pure helpers | `react-ink/utils/*` |
+| `bridge/` | `adapter`, `transcript`: `RunSnapshot` → `AgentMessage[]` projection + exit reprint | `ui-bridge/adapter.ts` |
+| `components/` | Chrome (Footer/StatusLine/TaskPanel/ToolEvent/Changelog/MessageList) + the `messages/` and `dialogs/` families | `react-ink/components/*` |
+| `interactive_app.rs` | The driver: `mount_interactive`, `drive_headless`, the theme registry, dialog bindings | `ui-bridge/InteractiveApp.tsx` + `mountInteractive` |
+
+The crate root re-exports `indusagi::tui` (the host-agnostic primitives layer —
+keys, keybindings, width, fuzzy, editor, theme contracts) so a render consumer
+reaches both layers through one module path. `tui_render/mod.rs` re-exports the
+public surface writers and the CLI consume.
+
+The pure subpackages (`diff`, `markdown`, all of `utils`) import no terminal
+machinery beyond ratatui's pure `Line`/`Span`/`Style` types and produce plain
+`Vec<Line<'static>>`; the interactive surface (`app`, `interactive_app`,
+`components`) drives crossterm and the real terminal.
+
+## The immediate-mode app framework
+
+This is the architectural linchpin: it **replaces the React reconciler**. There is
+no virtual DOM, no JSX, no `react-host` singleton. The four-part substitution
+(`app/mod.rs`) is:
+
+- **State is a plain struct** — `AppState` — where `useState`/`useMemo`/`useEffect`
+  collapse into fields plus a `dirty` redraw flag.
+- **Every frame is one `terminal.draw(|f| …)` pass** (`App::draw`); ratatui
+  double-buffers and cell-diffs, so flicker is gone for free — the cell-diff is
+  the structural replacement for React's virtual-DOM diff.
+- **Input is routed by focus** (`Focus`): Ink's focus-free `useInput` (which saw
+  every key) becomes an explicit router — top-level Ctrl-C/Esc, then the active
+  dialog, then the prompt.
+- **Dialogs are modal state machines on an overlay stack** (`DialogStack`); each
+  implements `Dialog` with `handle_key -> Option<DialogOutcome>` and `render`.
+
+### The `Component` trait
+
+`app/component.rs` defines the Ink-style composition primitive without a
+reconciler. A component, given a `Rect` and the `Theme`, paints itself onto the
+`Frame`. Composition is a parent calling `child.render(f, area, theme)` with a
+sub-`Rect` carved via ratatui `Layout`/`Constraint`.
+
+```rust
+pub trait Component {
+    fn render(&self, f: &mut Frame, area: Rect, theme: &Theme);
+    fn height(&self, _width: u16) -> u16 { 0 }
+    fn handle_key(&mut self, _key: KeyEvent) -> bool { false }
+}
+```
+
+The three methods mirror what Ink gave implicitly: paint (the JSX), measure
+(`height`, the Yoga `<Box>` measure — height-for-width is the contract), and — for
+focusable widgets — consume a key (`useInput`). `app/mod.rs` aliases the
+render-layer theme as `pub type Theme = theme_adapter::InkTheme` and the frame as
+`pub type Frame<'a> = ratatui::Frame<'a>`.
+
+### The `Dialog` trait, `DialogOutcome`, and `DialogStack`
+
+`app/dialog.rs` models modal dialogs as state machines on an overlay **stack**. A
+dialog `handle_key`s a `KeyEvent` and returns a `DialogOutcome` the host loop acts
+on — there are no callbacks.
+
+```rust
+pub enum DialogOutcome<T> {
+    Select(T),            // Enter
+    Close,                // Esc
+    Rename(T, String),    // Session dialog Ctrl+R sub-mode
+    Delete(T),            // Session dialog Ctrl+D confirm
+}
+
+pub trait Dialog {
+    type Out;
+    fn handle_key(&mut self, key: KeyEvent) -> Option<DialogOutcome<Self::Out>>;
+    fn render(&self, f: &mut Frame, area: Rect, theme: &Theme);
+}
+```
+
+The concrete dialogs are generic over their `Out` payload, but the host loop needs
+a uniform `Box<dyn …>` to stack and route keys to. `ErasedDialog` provides that:
+its `handle_key` returns an `ErasedOutcome` (`Continue` / `Close` / `Acted`), and
+the selection is delivered through a side-channel. The borrow problem — a dialog
+owned *by* `AppState` cannot hold a closure that mutates `AppState` — is solved by
+`DialogEffect` + `DialogEffects`:
+
+```rust
+pub type DialogEffects = Rc<RefCell<Vec<DialogEffect>>>;
+
+pub enum DialogEffect {
+    PreviewTheme(String),
+    CommitTheme(String),
+    RevertTheme,
+    SelectModel { provider: String, id: String },
+    SelectSession(SessionInfo),
+    RenameSession { session: SessionInfo, name: String },
+    DeleteSession(SessionInfo),
+}
+```
+
+A `DialogBinding` translates a concrete `DialogOutcome` into host `DialogEffect`s
+(and, for the theme dialog only, emits a per-key `live_preview`). `HostDialog<B>`
+wraps a concrete `Dialog` + a `DialogBinding` + the shared `DialogEffects` sink; on
+construction it fires the live preview once (the TS `onHighlight` on mount). The
+host drains the sink after routing each key. This is the value-based replacement
+for Ink's `onSelect`/`onClose`/`onHighlight`/`onRename`/`onDelete` closures.
+
+`DialogStack` is `Vec<Box<dyn ErasedDialog>>`: the **top** receives input and is
+drawn last. `handle_key` routes to the top, popping it on a terminal outcome;
+`render` draws every dialog bottom-to-top, each `Clear`ing its `area` first so it
+fully occludes what it overlays (the modal overlay). A stack — not a single
+`Option` — is used because some flows push a dialog over a dialog (Session → its
+rename/delete confirm, or Login → OAuth).
+
+### `AppState`, `Focus`, `Action`
+
+`app/state.rs` is the single source of truth a frame renders. Every field is a
+plain value; a transition mutates it and sets `dirty`.
+
+| Field | Type | Purpose |
+|-------|------|---------|
+| `agent` | `Arc<Agent>` | The live runtime agent this view renders and drives |
+| `snapshot` | `RunSnapshot` | The latest authoritative snapshot (re-read on every `RunEvent`) |
+| `draft` / `cursor` | `String` / `usize` | The controlled prompt buffer + caret byte-offset |
+| `queued` | `Option<String>` | Text typed mid-run, restored on `Settled` |
+| `tool_executions` | `IndexMap<String, ToolExecutionState>` | TaskPanel cards keyed by call id (insertion-ordered, running-first) |
+| `status` | `StatusMessage` | The status-line override |
+| `theme` / `pre_open_theme` | `InkTheme` / `Option<InkTheme>` | The live theme + the captured pre-open theme for the Esc revert |
+| `cwd` / `model` | `String` | Footer cwd + bound model id |
+| `focus` | `Focus` | `Prompt` or `Dialog` |
+| `dialogs` / `effects` | `DialogStack` / `DialogEffects` | The overlay stack + the shared effect sink |
+| `resumed_session_id` | `Option<String>` | The testable seam of the resume flow |
+| `spinner` / `dirty` | `usize` / `bool` | Busy-spinner frame + the redraw flag |
+
+`Focus` is `Prompt | Dialog`; `Action` is `Continue | Exit`. The two folds are the
+heart of the model:
+
+- `on_run_event(event: RunEvent)` adopts any snapshot the event carries, then
+  updates the tool-execution map (`ToolStarted` inserts a running card,
+  `ToolFinished` updates it in place preserving prior args, `Settled` clears the
+  panel and restores the queued draft, `Faulted` surfaces the error). This ports
+  the `agent.subscribe` handler.
+- `on_terminal_event(event: Event) -> Action` routes by focus: Ctrl-C always
+  exits; Esc closes an open dialog, else aborts an in-flight run, else exits at an
+  idle prompt; an open dialog owns every other key; Ctrl+T opens the theme picker
+  live; otherwise the minimal editor (`insert_char`/`insert_str`/`backspace`,
+  UTF-8 safe) extends `draft`. Typing is locked while a run is active
+  (`is_active()` is true for `Invoking | Streaming | Dispatching | Compacting`).
+
+Slash commands `/theme`, `/model`, `/sessions`/`/resume` open dialogs via
+`OpenDialog`; `/exit` and `/quit` return `Action::Exit`. Submitting fires
+`agent.submit_prompt(...)` fire-and-forget on `tokio::spawn` so the loop keeps
+draining `RunEvent`s. Dialog opens (`open_theme_dialog` / `open_model_dialog` /
+`open_session_dialog`) push a `HostDialog`, set `Focus::Dialog`, and apply the
+mount preview via `apply_dialog_effects`.
+
+### `App`: the terminal handle + draw seam
+
+`app/loop_.rs` owns the `ratatui::DefaultTerminal`. `App::init()` mirrors
+`ratatui::init()` (raw mode, alternate screen, panic-safe restore hook);
+`App::draw(&state)` runs one `terminal.draw(|f| draw_ui(f, state))` pass;
+`App::restore(self)` mirrors `ratatui::restore()`.
+
+`draw_ui(f, state)` is the root layout — a free function so it is unit-testable
+against a `TestBackend`. It projects the snapshot once via `build_session_snapshot`
+(the TS `useMemo`s: `to_agent_messages` + `live_usage` + `tally_messages` +
+`count_tool_calls`), then lays out a vertical stack: header, message list (flexes,
+`Constraint::Min(0)`), task panel, status line, prompt, footer — and finally the
+dialog stack on top. The message list is capped at `MESSAGE_LIST_MAX_ITEMS = 240`
+(the TS `<MessageList maxItems={240}/>`). An empty session shows the placeholder
+hint; the prompt gutter (`›`) tints accent when idle, muted while streaming, with
+a `working… (Esc to interrupt)` hint while active.
+
+## The interactive driver loop
+
+`interactive_app.rs` is the live terminal surface (`mount_interactive`), porting
+`InteractiveApp.tsx` + `mountInteractive`. The React component subscribed to the
+agent and folded every event into `useState`; there is no React here.
+
+```rust
+pub async fn mount_interactive(agent: Arc<Agent>, opts: MountOptions) -> io::Result<i32>
+```
+
+The subscription becomes a `tokio::mpsc` channel (`forward_run_events`, which
+bridges `Agent::subscribe`'s callback onto a receiver + an `Unsubscribe` guard).
+The loop is a single cancel-safe `tokio::select!` over three branches:
+
+1. the crossterm `EventStream` (keys/resize/paste → `AppState::on_terminal_event`),
+   breaking on `Action::Exit`;
+2. the bridged `RunEvent` channel (`AppState::on_run_event`);
+3. an 80 ms spinner tick (`TICK_MILLIS`), gated on `is_active()`.
+
+It **redraws only when `dirty`** — ratatui cell-diffs the frame, so flicker is
+gone. All three `select!` futures are cancel-safe, so the loop is sound. On exit
+the terminal is restored *before* the transcript is reprinted via
+`exit_transcript_text` (an empty session prints nothing). `MountOptions` carries
+the bound `model` and the display `cwd`.
+
+`build_initial_state` assembles the first `AppState` (pure, no terminal/await):
+empty draft, no queue, empty tool map, the `"Type a message to begin."` status,
+the fixed interactive theme, `Focus::Prompt`, an empty dialog stack, `dirty=true`.
+`drive_headless` mirrors the loop body against an in-memory `TestBackend` so the
+shell-app wiring tests and CI can step the real surface without owning a terminal.
+
+The fixed `indus-interactive` palette baked into `InteractiveApp.tsx` is
+reproduced as `INTERACTIVE_PALETTE` (12 keys); `interactive_theme()` parses it.
+The interactive surface adds a small theme registry (`BUILTIN_SCHEMES`:
+`indus-interactive`, `light`, `solarized`) reached through `theme_scheme_items()`
+and `theme_for_scheme(token)`, plus the concrete `DialogBinding`s
+`ThemeBinding` / `ModelBinding` / `SessionBinding`.
+
+## View-model types
+
+`types.rs` is the UI vocabulary. Every chrome component renders from a single
+`SessionSnapshot`; TS discriminated unions become Rust enums.
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `SessionSnapshot` | struct | The full view-model: `messages`, `model: Option<(String, String)>`, streaming/compacting/bash flags, pending counts, session metadata, `stats`, `context_usage` |
+| `StatusMessage` / `StatusKind` | struct / enum | A toned status line (`Info`/`Success`/`Warning`/`Error`/`Busy`) |
+| `ToolExecutionState` / `ToolExecStatus` | struct / enum | One in-flight tool card keyed by `tool_call_id` (`Running`/`Success`/`Error`), with `args`/`output` as `Option<Value>` and an `updated_at` ms stamp |
+| `PendingMessageItem` / `PendingMode` / `PendingSource` | struct / enums | A queued user input (`Steer`/`FollowUp`, `Session`/`Compaction`) |
+| `SessionStats` / `StatsTokens` / `ContextUsage` | structs | Footer token/cost stats and context-window usage |
+| `SessionInfo` | struct | A session-browser row (`id`/`path`/`name`/`last_modified`/`size`/`cwd`/`message_count`/`first_message`/`all_messages_text`) |
+| `OAuthOverlayState` / `OAuthMode` | struct / enum | The OAuth overlay state (`Oauth`/`ApiKey`) |
+| `LoginProviderOption` / `SavedAccountOption` / `AuthKind` | structs / enum | Login picker rows (`Oauth`/`ApiKey`) |
+| `UserMessageOption` / `SessionTreeOption` | structs | Fork-from-message + session-tree dialog rows |
+| `UiDisplayBlock` / `DisplayBlockKind` | struct / enum | A host/extension-emitted block (today `Changelog`) merged into the transcript |
+
+Field names mirror the TypeScript ground truth verbatim (`tool_call_id`,
+`is_streaming`, `updated_at`, `cache_read`). `model` in TS is a `Model<any>`; here
+it is the projected `(provider, id)` pair so the Footer can print `provider/id`
+without reaching into the catalog.
+
+## Theme adapter
+
+`theme_adapter.rs` projects one flat host palette onto ratatui `Style`. TS baked
+chalk-ANSI escape strings into `string`s; ratatui works in
+`Style { fg, bg, mods }` on `Span`, so the chalk painters become `Style` builders
+and `strip-ansi` is deleted (width math runs on plain text).
+
+`ThemeRole` is the 12-role enum the markdown/diff/syntax path resolves against
+(`CodeInline`, `Heading`, `BlockquoteBar`, `DiffAddedBg`, `DiffRemovedBg`,
+`DiffAddedText`, `DiffRemovedText`, `SynKeyword`, `SynString`, `SynNumber`,
+`SynComment`, `SynType`). Each role carries a `default_key()` and a
+`fallback_key()`, reproducing the TS `DEFAULT_ROLE_KEYS` / `ROLE_FALLBACK_KEYS`
+tables. The **role-key → fallback-key → text-fallback** resolution chain ports
+verbatim.
+
+```rust
+pub struct InkTheme {
+    pub name: String,
+    pub colors: HashMap<String, Color>,       // parsed once from #rrggbb strings
+    pub roles: HashMap<ThemeRole, String>,    // per-role color-key overrides
+    pub fallback: Color,                      // colors.text ?? #e5e5e7
+}
+```
+
+The key paradigm shift is **parse-once**: TS carried raw `#rrggbb` strings and
+`resolveColorToken` rejected blanks at lookup time. Here `parse_hex_color` is
+called once in `create_theme_adapter`; a blank/un-parseable string is simply *not
+inserted*, so a missing key is the Rust analogue of `resolveColorToken(...) ===
+undefined`. The painters are `color(key)`, `role(role)`,
+`role_background(bg, fg)`, `dim()`, `muted()` — each returning a `Style`.
+`parse_hex_color` handles `#rgb`/`#rrggbb` (case-insensitive, leading `#`
+optional, `#rgb` doubled to `#rrggbb`).
+
+```rust
+pub fn create_theme_adapter(
+    name: &str,
+    colors: &HashMap<String, String>,
+    role_overrides: Option<&HashMap<ThemeRole, String>>,
+) -> InkTheme
+```
+
+## The render bridge
+
+`bridge/` is a **pure projection** from the NEW runtime state to the OLD react-ink
+message shapes (`ui-bridge/adapter.ts`). The runtime exposes a `RunSnapshot` whose
+`messages` are kind-tagged `Turn`s of `Block`s plus a running `Usage`; the renderer
+dispatches on the OLD `AgentMessage` union.
+
+`AgentMessage` is the render-vocabulary enum:
+
+```rust
+pub enum AgentMessage {
+    User { content: UserContent, ts: i64 },
+    Assistant { content: Vec<AssistantBlock>, model: String, provider: String, stop: StopReason, ts: i64 },
+    ToolResult { call_id: String, name: String, content: Vec<ToolContent>, is_error: bool, ts: i64 },
+    Bash { command: String, output: String, exit_code: Option<i32>, cancelled: bool, ts: i64 },
+    BranchSummary { summary: String, ts: i64 },
+    Compaction { summary: String, tokens_before: u64, ts: i64 },
+    Custom { content: CustomContent, display: bool, ts: i64 },
+}
+```
+
+`UserContent` / `CustomContent` are `Text(String) | Parts(Vec<ToolContent>)`;
+`AssistantBlock` is `Text | Thinking | ToolCall { id, name, args: Value }`;
+`ToolContent` is `Text(String) | Image { media_type, data_base64 }`; `StopReason`
+is `Stop | Length | ToolUse | Aborted | Error`.
+
+The public projection functions:
+
+| Function | Role |
+|----------|------|
+| `turn_to_agent_messages(turn, model, ts)` | One `Turn` → the OLD message(s); a tool turn fans out one `ToolResult` per `tool_result` block |
+| `to_agent_messages(snapshot)` | A whole `RunSnapshot` → `Vec<AgentMessage>` with synthetic monotone timestamps `now_ms() - count + i` (1 ms apart) |
+| `map_stop_reason(stop)` | Gateway stop string → `StopReason` |
+| `live_usage(snapshot)` | The Footer-facing `LiveUsage` (model metadata + running token/cost totals + context utilization) |
+| `gateway_usage_to_ml(usage, model)` | A gateway `Usage` → `MlUsage` (tokens + per-tier cost via the catalog card) |
+
+Tool outputs are arbitrary `serde_json::Value`, so `tool_output_to_content` walks
+them recursively, passing already-structured `{type|kind: "text"|"image"}` parts
+through and falling back to a serialized text block. `to_args_record` coerces a
+tool input into the old `Record<string, any>` arg shape (object passes through,
+`Null` → `{}`, scalars wrap under `value`). `live_usage` reads the catalog card
+(`get_card`/`estimate_cost` from the [LLM Gateway](/rust/subsystems/llm-gateway))
+for the context window, provider label, and display name.
+
+`bridge/transcript.rs` builds the on-leave reprint: `exit_transcript_text(snapshot,
+theme)` re-renders the conversation (prompt + streamed assistant text + concise
+`[tool <name>]` / `[tool result]` summaries, in order) as one plain string the host
+`print!`s below the restored primary screen. An empty (or thinking-only) session
+returns `""`. It is built from the final `RunSnapshot`, not widget state, so it is
+reproducible and headlessly testable.
+
+## Markdown stream
+
+`markdown/` renders both settled history and live streaming turns to ratatui lines.
+The pipeline is pulldown-cmark events → `Vec<Line<'static>>` → syntect for fences →
+padded GFM tables. The TS `marked.lexer` → `formatToken` (chalk-ANSI) →
+highlight.js-HTML path becomes a `Span { content, Style }` walk; the reflow/flicker
+problem is gone (ratatui cell-diffs), but the stable-boundary split plus the FNV-1a
+LRU token cache are kept as a **CPU optimization**.
+
+| Function | Source | Role |
+|----------|--------|------|
+| `render(content, theme, highlight, dim)` | `render.rs` | The settled path: strip prompt-XML tags, run `format_token`, overlay `dim` on un-styled spans |
+| `render_streaming(content, theme, highlight)` | `render.rs` | The live path: cache the stable prefix, re-lex only the unstable tail past `last_stable_boundary` |
+| `last_stable_boundary(content)` | `render.rs` | The anti-reflow contract: byte offset of the last blank-line block boundary outside an open ``` fence; monotonic; an unterminated fence freezes it |
+| `format_token(content, theme, highlight)` | `format_token.rs` | The pulldown-cmark event walk → ratatui lines, behind the LRU cache + the plain-text fast path |
+| `has_markdown_syntax(text)` | `format_token.rs` | The `MD_SYNTAX_RE` fast structural check over the first 500 chars |
+| `get_list_number` / `pad_aligned` / `string_width` | `format_token.rs` | List marker styling (`1.`/`a.`/`i.`), GFM column padding, visible width |
+| `CliHighlight` / `language_from_path` / `scope_to_role` | `highlight.rs` | The syntect highlighter mapping scopes onto the five `Syn*` roles |
+
+`format_token` enables `Options::ENABLE_TABLES` but never
+`ENABLE_STRIKETHROUGH`, so models writing `~100` for "approximately" keep the `~`
+literal (the TS `tokenizer.del() => undefined` customization). The token cache is a
+thread-local `LruCache<String, Vec<Line<'static>>>` (cap `TOKEN_CACHE_MAX = 500`)
+keyed by an FNV-1a hash over UTF-16 code units so keys are byte-identical to the TS
+implementation. Output coloring resolves through `InkTheme` roles, so live theme
+preview restyles even cached markdown.
+
+`highlight.rs` loads a syntect `SyntaxSet` once via
+`two_face::syntax::extra_newlines()` (the base grammars plus 100+ extras), drives
+`ParseState` line-by-line, and maps each region's innermost scope onto a
+`ThemeRole` rather than syntect's own theme — so highlighted code restyles with the
+live theme too. `EXTENSION_LANGUAGES` is the highlight.js-id → syntect-name alias
+table; `scope_to_role` buckets TextMate scopes into the five syntax roles.
+
+## Diff renderer
+
+`diff/` is a structured-patch engine plus its renderer. The TS path was jsdiff
+`structuredPatch` + `diffWordsWithSpace` + `Diff.tsx`; the Rust path is the
+`similar` crate (`unicode` + `inline` features).
+
+| Name | Kind | Source | Role |
+|------|------|--------|------|
+| `build_structured_diff(old, new, file_path)` | function | `structured.rs` | Build a classified, line-numbered, word-paired diff; `None` when there is nothing to show |
+| `StructuredDiff` / `DiffHunk` / `DiffLine` / `DiffKind` | structs/enum | `structured.rs` | The diff model (`Context`/`Added`/`Removed`); `CONTEXT_LINES = 3` |
+| `classify_hunk_lines(lines, old_start, new_start)` | function | `structured.rs` | The prefixed-string entry point (jsdiff `classifyHunkLines`) |
+| `word_diff_line(old, new, side)` / `WordSpan` / `DiffSide` | function/structs | `word.rs` | Intra-line word diff; collapses to one whole-line span above `CHANGE_THRESHOLD = 0.4` |
+| `render_diff(diff, theme, indent)` | function | `view.rs` | `StructuredDiff` → `Vec<Line>` with a dim line-number gutter, `+`/`-`/space markers, themed `+`/`-` backgrounds, bold word emphasis, dim `...` hunk separators |
+
+`build_structured_diff` uses `similar::TextDiff::from_lines(...).grouped_ops(3)`
+(the diff boundary is re-baselined with `insta`, not transliterated — `similar`'s
+Patience/Myers boundaries can differ from jsdiff's Ratcliff-Obershelp on
+adversarial input). Removed→added runs are paired index-for-index so the renderer
+emphasizes only each line's changed sub-range; the `\ No newline at end of file`
+metadata line is dropped. `word_diff_line` coalesces `similar`'s per-token unicode
+diff into jsdiff-shaped `Change` runs (removed before added), and the load-bearing
+property is that concatenating a side's spans always reconstructs that side's
+line. `render_diff` resolves the `+`/`-` tints through
+`theme.role_background(DiffAddedBg, Some(DiffAddedText))` and the removed
+equivalents; ratatui's per-span truecolor backgrounds give full visual parity.
+
+## Component model
+
+`components/` is the widget library; each component is a `struct` implementing the
+`Component` trait. The chrome lives here directly; the per-message renderers in
+`messages/`; the 12 dialogs in `dialogs/`.
+
+| Name | Kind | Source | Role |
+|------|------|--------|------|
+| `MessageList` / `group_messages` / `MessageListEntry` | struct/fn/enum | `message_list.rs` | The transcript widget; groups tool-calling assistant messages with their trailing results, merges display blocks, clamps to `max_items` |
+| `Footer` / `format_tokens` / `shorten_path` / `chunk_lines` / `sanitize_status_text` | struct/fns | `footer.rs` | The bottom stats bar (cwd line, space-between token/cost/context vs model/pending, extension-status lines) with threshold colors |
+| `StatusLine` / `derive_status` | struct/fn | `status_line.rs` | One toned status line; `derive_status` reproduces the exact TS precedence (compacting → bash → pending → streaming → error) plus a braille busy spinner |
+| `TaskPanel` | struct | `task_panel.rs` | Up-to-6 running-first tool cards (keyed by `tool_call_id`), the queued-message block, the restore hint |
+| `ToolEvent` / `ToolEventStatus` / `status_marker` / `clamp_content_lines` | struct/enum/fns | `tool_event.rs` | A tool card: status marker (`>`/`=`/`!`), friendly title + summary, clamped body (`... N more line(s)`) |
+| `ChangelogBlock` / `DisplayBlockView` | structs | `changelog.rs` | Changelog rendering + the host/extension display-block dispatcher |
+
+The per-message renderers (`components/messages/`) are the `MessageRow` dispatch
+targets: `AssistantMessageView`, `UserMessageView`, `BashMessageView`,
+`ToolCallMessage` + `ToolResultBlock` (`tool.rs`), and `CompactionMessageView` /
+`BranchSummaryMessageView` / `CustomMessageView` / `SkillInvocationMessageView`
+(`misc.rs`). The list owns the tool-call / tool-result grouping: because the
+runtime→render projection already splits a turn, `group_messages` re-pairs an
+assistant message carrying `ToolCall` blocks with the separate `ToolResult`
+messages into a `MessageListEntry::ToolGroup`, and the list renders the assistant
+text, then each call's `ToolCallMessage` card + its matched (`nested`)
+`ToolResultBlock`, then any unmatched results.
+
+Where Ink returned `null` and relied on Yoga margins, each component is now
+immediate-mode: a parent carves a `Rect` sized by `Component::height`, the
+component assembles one `Vec<Line>`, and `strip-ansi` is gone (body text is plain;
+styling is a `Style` applied at paint time).
+
+## The twelve dialogs
+
+`components/dialogs/` implements all twelve modal dialogs as `Dialog` state
+machines, each wrapping `DialogFrame` (rounded border, title, subtitle, top-margin
+body, footer help row) and sharing the parity-critical `wrap_selection_index` +
+window math. The window math is the pair of free functions `window_start` /
+`max_visible` exported from `selectable.rs`: `window_start = clamp(selected -
+max_visible/2, 0, max(0, len - max_visible))`, with `max_visible = max(8, rows -
+16)` for Selectable/Model, `max(8, rows - 18)` for ScopedModels/Settings, and a
+fixed `VISIBLE_SESSION_COUNT = 5` for Session/Startup. `SelectableDialog<T>` is
+generic over a `HighlightFn` / `SearchTextFn` so each concrete dialog supplies its
+own row label + search-key closures.
+
+| Dialog | Source | Constructor | Out / role |
+|--------|--------|-------------|------------|
+| `SelectableDialog<T>` | `selectable.rs` | `new(...)` | The generic searchable single-select base with wrap-around cursor |
+| `ModelDialog` / `ModelOption` | `model.rs` | `new(models, search)` | Model picker → `(provider, id)` |
+| `ThemeDialog` / `ThemeDialogItem` | `theme.rs` | `new(themes)` / `from_tokens(...)` | Theme picker with live `highlighted_id()` preview |
+| `SettingsDialog` / `SettingsItem` / `get_next_value` | `settings.rs` | `new(items)` | Settings editor with value cycling |
+| `ScopedModelsDialog` | `scoped_models.rs` | `new(models, selected_ids)` | Per-scope model selection |
+| `LoginDialog` / `LoginMode` / `LoginChoice` | `login.rs` | `new(mode)` | API-key / provider login |
+| `OAuthDialog` | `oauth.rs` | `new(state)` | The OAuth flow over `OAuthOverlayState` |
+| `SessionDialog` / `SessionSubMode` / `SessionProgress` | `session.rs` | `new(sessions, current_session_id)` | Session browser → Select/Rename/Delete |
+| `StartupSessionPicker` | `startup.rs` | `new(sessions, total_count)` | Boot-time session chooser |
+| `TreeDialog` | `tree.rs` | `new(items)` | Session-tree navigator over `SessionTreeOption` |
+| `UserMessageDialog` | `user_message.rs` | `new(items)` | Fork-from-prior-message picker over `UserMessageOption` |
+| `DialogFrame` / `WindowedList` | `frame.rs` | `new(title)` | The shared bordered modal chrome + the windowed scroller |
+
+The live loop wires `ThemeDialog`, `ModelDialog`, and `SessionDialog` through their
+`DialogBinding`s in `interactive_app.rs`. Each dialog is pushed onto `DialogStack`
+via `AppState::open_*`, resolves to a `DialogOutcome`, and the bound effects are
+drained by `apply_dialog_effects`.
+
+## Pure helpers
+
+`utils/` is the framework-free logic feeding the widgets and dialogs.
+
+| Name | Source | Role |
+|------|--------|------|
+| `extract_tool_text` / `preview_text` / `preview_multiline` / `safe_stringify` / `parse_skill_invocation` | `message_groups.rs` | Recursive JSON tool-output extraction, preview clamping, `<skill …>` block parsing |
+| `matches_search_query` / `wrap_selection_index` | `selection.rs` | AND-term case-insensitive search match + modular cursor wrap shared by every dialog |
+| `parse_session_search_query` / `filter_and_sort_sessions` / `fuzzy_score` / `format_session_age` / `format_session_size` / `shrink_session_id` | `session_browser.rs` | The session-browser grammar (`re:` regex / `"…"` phrase / fuzzy tokens), score-filter/sort, and age/size formatting |
+| `describe_tool_call` / `describe_tool_result` / `describe_tool_execution` / `describe_tool_source` / `friendly_tool_name` | `tool_display.rs` | Per-tool friendly title/summary/body → `ToolCardDescriptor` (carrying an optional `StructuredDiff` for write/edit) |
+
+`extract_tool_text` walks an arbitrary `serde_json::Value` 1:1 with the TS
+`extractStructuredText`: recurse arrays; for objects probe
+`content`/`details` then `text`/`output`/`stdout`/`stderr`/`message`/`summary` in
+that order; parse JSON-looking strings; cycle-guard via a visited-pointer set.
+`tool_display.rs` dispatches per tool name (read/write/edit/ls/find/grep/bash/task/
+todoread/todowrite + default) into a `ToolCardDescriptor`; the highlight paradigm
+shifts — the descriptor `body` stays a *plain* string and the `preformatted` flag
+tells the renderer to apply syntax styling from the file path, since ratatui
+carries `Style` on `Span`, not ANSI in a `String`. Write/edit descriptors carry a
+real `StructuredDiff` via `build_structured_diff` when both snippets are known.
+
+`session_browser.rs`'s `build_search_text` appends a deterministic UTC
+`YYYY-MM-DD HH:MM:SS` rendering (Howard Hinnant's days-from-epoch civil-time math)
+so the timestamp is searchable without a calendar dependency.
+
+## Relationship to neighbors
+
+`tui_render` is the presentation layer of the Rust rebuild. It is driven by the
+[Runtime](/rust/subsystems/runtime) `Agent` / `RunSnapshot` / `RunEvent` (the
+bridge projects these into `AgentMessage`s), reads the model catalog from the
+[LLM Gateway](/rust/subsystems/llm-gateway) for usage/cost/context, builds on the
+host-agnostic `indusagi::tui` primitives layer (keys, width, fuzzy, theme
+contracts), and uses `crate::core::now_ms` for timestamps. The
+[Shell App](/rust/architecture) `repl` runner is the consumer that calls
+`mount_interactive`. See the [Architecture overview](/rust/architecture) for how
+the layers fit together, and the [Python](/python/ui/react-ink) and the deleted
+TypeScript `src/react-ink` editions for the cross-edition parity baseline this
+module is ported from.

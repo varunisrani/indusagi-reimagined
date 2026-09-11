@@ -1,0 +1,133 @@
+# Features
+
+> A capability summary of the `indusagi-coding-agent` CLI, derived from the subsystems that ship in the source. Everything here is built from scratch on the single `indusagi` framework dependency.
+
+## At a glance
+
+- Three run modes: interactive REPL, one-shot print, and a JSON line protocol.
+- A built-in tool deck: file read/write/edit, search, shell, background processes, web, and a task checklist.
+- External tools over **MCP** — connect to MCP servers and graft their tools into the deck.
+- Multi-provider models plus optional **external runtimes** (CLI-backed agents).
+- Loadable **skills** and **subagents**, slash commands, transcript export, and tracing.
+
+## Run modes
+
+| Invocation | Mode | What it does |
+|------------|------|--------------|
+| `indus` | interactive | Ink/React REPL — streaming replies, a live tool deck, slash commands |
+| `indus -p "…"` / `--print` | print | One request, prints the final result, exits |
+| `indus --json` / `--rpc` | line protocol | Newline-delimited JSON for a parent process to drive |
+| `indus signin` / `signout` | credentials | Store / clear an API key in the local auth vault |
+
+`indus --help` / `-h` prints the generated flag reference; `indus --version` /
+`-v` prints the version. `--interactive` / `-i` forces the REPL even when a
+prompt is supplied. See [JSON Mode](json.md) and [RPC Mode](rpc.md).
+
+## Built-in tools
+
+The capability deck exposes the framework's built-ins as agent tools, in catalog
+order. Read-only tools are available in every profile; mutating tools require an
+authoring (full-access) session.
+
+| Tool | What it does | Access |
+|------|--------------|--------|
+| `read` | Return a file's contents (optional offset + line cap; renders images inline where supported) | read-only |
+| `ls` | List a directory's entries (optional cap) | read-only |
+| `grep` | Scan files for lines matching a pattern (case, literal, context, cap) | read-only |
+| `find` | Locate files/directories by glob-style name beneath a root | read-only |
+| `websearch` | Query the live web and return ranked result snippets | read-only |
+| `webfetch` | Retrieve a URL and return its body as text, Markdown, or HTML | read-only |
+| `todoread` | Read back the session's task checklist | read-only |
+| `write` | Create or overwrite a file (makes parent dirs) | mutating |
+| `edit` | Find-and-replace an exact span in a file and report the diff | mutating |
+| `bash` | Run a shell command in the working directory, streaming output, with an optional timeout | mutating |
+| `process` | Start, list, inspect, feed, and stop long-running background commands | mutating |
+| `todowrite` | Replace or amend the session's task checklist | mutating |
+
+Limit a run to a subset with `--tools read,grep,bash` (comma-separated or
+repeated), or disable every built-in with `--no-tools`. The `bash` tool runs in
+a non-interactive shell — see [Shell Aliases](shell-aliases.md).
+
+## MCP — external tools
+
+The agent is a **client** of external Model Context Protocol servers: it
+connects to each configured server, lists its tools, and grafts them into the
+deck under qualified `"<server>__<tool>"` names. Enrollment is event-sourced, so
+servers can attach and detach over a session's life without mutating shared
+state. Attach servers from the command line with `--mcp <endpoint>`, manage them
+in an interactive session with `/mcp`, or declare them in a config file. See
+[MCP](mcp.md).
+
+## Models and runtimes
+
+- **Multi-provider.** The session defaults to `anthropic` (`defaultProvider`),
+  with the model picked by `defaultModel` and reasoning effort by
+  `defaultThinkingLevel`. Choose a model per run with `--model` / `-m`
+  (provider-qualified or bare) and reasoning with `--thinking`. List models with
+  `--list-models`. See [Providers](providers.md) and [Models](models.md).
+- **External runtimes (provider routing).** Beyond the framework's network
+  stream, the `runtime-bridge` can route a turn to a **child coding-agent
+  process** driven over its own protocol. Built-in adapters cover an
+  Anthropic-flavoured CLI (`claude-cli`), an OpenAI-flavoured CLI (`codex-cli`),
+  and a peer indusagi agent (`indusagi-cli`). A model is *annotated* with an
+  external-runtime spec; a model with no spec routes normally. A CLI runtime that
+  owns its own auth can be offered even with no API key on disk.
+
+## Authentication
+
+Set `ANTHROPIC_API_KEY` (or another supported provider key) in the environment,
+or run `indus signin`. Two methods are supported: an **API key** or a **browser
+sign-in (OAuth)** for the providers that offer it (Anthropic, OpenAI Codex,
+GitHub Copilot). `indus signin` prefers the browser path for an OAuth-capable
+provider and falls back to an API key; force one with `--method oauth` /
+`--method api-key` (shorthands `--oauth` / `--api-key`). In an interactive
+session use `/login`. Authenticate a specific run with a stored account via
+`--account`. Credentials live in the local auth vault under the profile
+directory.
+
+## Working memory
+
+A single working-memory tool lets the agent carry a persistent scratch note
+across turns within a session: `read`, `replace`, and `append` actions over one
+text buffer. It is a plain in-process note — not a vector or semantic store.
+Inspect or toggle it with `/memory`.
+
+## Composio (SaaS bridges)
+
+When `COMPOSIO_API_KEY` is set, `/composio` connects, enables, and inspects
+Composio toolkits, exposing their remote tools to the agent through the SaaS
+gateway. Without the key, the command reports the missing-key state explicitly.
+
+## Extensibility
+
+- **Skills** — on-demand capability packages discovered and (optionally)
+  surfaced as their own slash commands. See [Skills](skills.md).
+- **Subagents** — spawn specialized agents for delegated work. See
+  [Subagents](subagents.md).
+- **Addons / extensions** — loadable modules that contribute tools and commands
+  and hook lifecycle events; install sources via the `extensionPackages`
+  setting. See [Extensions](extensions.md) and [Loading Extensions](loading-extensions.md).
+- **Themes & keybindings** — name a colour scheme with `colourScheme` and rebind
+  console keys. See [Themes](themes.md) and [Keybindings](keybindings.md).
+
+## Sessions and export
+
+Sessions are persisted under the profile directory; resume one with `--resume` /
+`-r` or continue the latest in the current directory with `--continue` / `-c`.
+In a session, `/copy` puts the last reply on the clipboard, `/export [path]`
+renders the transcript to standalone HTML, and `/share` publishes it as a secret
+GitHub gist via the `gh` CLI. See [Session Format](session.md).
+
+## Observability
+
+The `insight` subsystem provides tracing with sinks, replay, and secret
+redaction. Set `INDUSAGI_DEBUG` in the environment to surface debug output;
+`/debug` toggles the reasoning display and dumps a JSONL snapshot of the session
+(stats plus every message) to a temporary file, reporting the path it wrote.
+
+## See also
+
+- [README](README.md) - Overview and quick start
+- [MCP](mcp.md) - Attaching external MCP servers
+- [Settings](settings.md) - Every preference key
+- [Development](development.md) - Building and contributing

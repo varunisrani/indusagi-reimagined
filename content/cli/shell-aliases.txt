@@ -1,0 +1,87 @@
+# Shell Aliases
+
+> The agent's `bash` tool runs each command in a **non-interactive, non-login** shell. That shell does not read your interactive rc files, so aliases and shell functions defined in `~/.zshrc` / `~/.bashrc` are not available by default. This page explains how the shell is invoked and how to get your aliases back when you need them.
+
+## How the `bash` tool runs commands
+
+When the model runs a shell command, the framework's `bash` tool spawns:
+
+```
+<shell> -c "<command>"
+```
+
+The shell is resolved once and cached:
+
+- **macOS / Linux** — `/bin/bash` if it exists, otherwise `sh`.
+- **Windows** — Git Bash (`bash.exe` from `%ProgramFiles%\Git\bin`, or one found
+  on `PATH`); if none is found the tool errors and asks you to install Git Bash.
+
+The command is passed to `-c`, so the shell starts **non-interactive and
+non-login**. Crucially:
+
+- It does **not** source `~/.zshrc`, `~/.bashrc`, `~/.profile`, or `~/.zprofile`.
+- Aliases and functions defined only in those files are therefore undefined.
+- `alias` expansion in bash is off by default in non-interactive shells.
+
+The child inherits the **parent process environment** verbatim (`PATH`,
+exported variables, and so on), so anything exported in the environment that
+launched `indus` is visible to every command.
+
+## Getting your aliases into a command
+
+There is no global "shell prefix" setting; the agent builds the `bash` tool with
+no command prefix. To use an alias, make it available *inside the command the
+model runs*. A few patterns:
+
+### Source your rc file, then run
+
+```bash
+source ~/.zshrc 2>/dev/null; my-alias
+```
+
+(Use `~/.bashrc` for bash.) This pulls in everything your interactive shell
+would define. Sourcing a heavy rc file can be slow and may print noise, so the
+narrower options below are often better.
+
+### Turn on alias expansion and source only the aliases (bash)
+
+```bash
+shopt -s expand_aliases; source ~/.bash_aliases; my-alias
+```
+
+`shopt -s expand_aliases` enables alias substitution in the non-interactive
+shell; sourcing a dedicated aliases file keeps startup cheap and quiet.
+
+### Prefer functions and scripts over aliases
+
+Aliases are an interactive-shell convenience. For anything you want the agent to
+use reliably, define a **shell function** or a small **executable script** on
+`PATH` instead — both work in a non-interactive shell with no extra steps:
+
+```bash
+# ~/bin/deploy   (chmod +x, with ~/bin on PATH)
+#!/usr/bin/env bash
+exec my-real-deploy-command "$@"
+```
+
+Then the model can just run `deploy`.
+
+## Making variables visible
+
+Because the command shell inherits the launching environment, the simplest way
+to expose a value (an API key, a tool path, a feature flag) to every command is
+to **export it before starting the agent**:
+
+```bash
+export MY_TOKEN="…"
+indus
+```
+
+For project-scoped variables, export them in the same shell you launch `indus`
+from, or wrap the launch in a script that sets them first.
+
+## See also
+
+- [Features](features.md) - The `bash` tool and the rest of the built-in toolset
+- [Settings](settings.md) - Configurable preferences
+- [Terminal Setup](terminal-setup.md) - Terminal configuration

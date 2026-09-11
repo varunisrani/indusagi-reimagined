@@ -1,0 +1,111 @@
+# Tracing
+
+> `src/tracing` is the cross-cutting observability layer — a homegrown, OTel-free
+> span tracer with a deliberately fresh vocabulary. Imported as `indusagi/tracing`,
+> or as the `tracing` namespace from `indusagi`.
+
+A trace is built from immutable `Segment` values (kinds `run` / `inference` /
+`action` / `recall` / `custom`) driven by a functional `SegmentHandle`
+(`note` / `child` / `fail` / `close`). A `Recorder` mints handles onto a
+`SignalChannel` async-iterable; sinks drain that channel and write somewhere.
+Sampled-out work collapses to the single frozen `NOOP_HANDLE`. No OpenTelemetry SDK
+is used — the data model re-derives the relevant W3C trace concepts.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-directories](#sub-directories)
+- [Recording a trace](#recording-a-trace)
+- [Sinks, redaction, and the registry](#sinks-redaction-and-the-registry)
+- [The runtime adapter](#the-runtime-adapter)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+`src/tracing/index.ts` re-exports seven layer barrels (`export *` over `signal`,
+`channel`, `redaction`, `sinks`, `recorder`, `registry`, `adapter`):
+
+| Export | Kind | Layer | Purpose |
+|--------|------|-------|---------|
+| `Recorder` | class | recorder | The tracer that mints `SegmentHandle`s onto a channel |
+| `SampleGate` | class | recorder | Admission control (`SampleStrategy` / `RatioStrategy`) |
+| `openSegment`, `withAttributes`, `closeSegment` | functions | signal | The `Segment` value constructors/derivations |
+| `openHandle`, `NOOP_HANDLE` | fn / const | signal | The sampled-in handle factory and the shared no-op |
+| `freshId`, `freshTraceId`, `freshSegmentId` | functions | signal | Id minting |
+| `SignalChannel` | class | channel | The async-iterable transport for `TraceSignal`s |
+| `SecretScrubber` | processor | redaction | Attribute scrubbing before data leaves the process |
+| `ConsoleSink`, `FileSink`, `StreamSink` | classes | sinks | Terminal consumers that drain a channel |
+| `TelemetryHub`, `getDefaultHub`, `setDefaultHub` | class / fns | registry | The named-recorder registry + process default |
+| `traceAgentRun` | function | adapter | The optional runtime `RunEvent` bridge |
+
+Types include `Segment`, `SegmentKind`, `SegmentStatus`, `TraceRecord`,
+`SegmentHandle`, `SignalSink`; `TraceSignal` (`OpenSignal` / `UpdateSignal` /
+`CloseSignal`); `Sink`, `ConsoleSinkOptions`, `FileSinkOptions`, `StreamSinkOptions`;
+`SampleStrategy`, `RatioStrategy`, `OpenOptions`, `RecorderOptions`; and
+`RunEventSubscribe`.
+
+## Sub-directories
+
+| Directory | Holds |
+|-----------|-------|
+| `signal/` | `segment.ts` (the `Segment` data model), `handle.ts` (`SegmentHandle`, `NOOP_HANDLE`) |
+| `channel/` | `signal.ts` — the `SignalChannel` transport and the `TraceSignal` union |
+| `recorder/` | `recorder.ts` (`Recorder`), `sampling.ts` (`SampleGate`) |
+| `redaction/` | `secret-scrubber.ts` — the `SecretScrubber` processor and its default rules |
+| `sinks/` | `base.ts` (`Sink`), `console.ts`, `file.ts`, `stream.ts` |
+| `registry/` | `hub.ts` — the `TelemetryHub` and default-hub accessors |
+| `adapter/` | `runtime-trace.ts` — `traceAgentRun`, the runtime bridge |
+
+## Recording a trace
+
+A `Recorder` opens a root `SegmentHandle`; `child` nests, `note` annotates, `fail`
+marks an error, and `close` ends a segment, emitting a `TraceSignal` on the channel:
+
+```ts
+import { Recorder, ConsoleSink } from "indusagi/tracing";
+
+const recorder = new Recorder(/* RecorderOptions */);
+const sink = new ConsoleSink(/* ConsoleSinkOptions */);
+// drain recorder's channel into the sink …
+
+const run = recorder.open("run", "build");
+const step = run.child("action", "edit");
+step.note({ file: "x.ts" });
+step.close();
+run.close();
+```
+
+`SampleGate` admission control decides whether work is recorded; sampled-out work
+gets the frozen `NOOP_HANDLE`, so the call sites are uniform regardless of sampling.
+
+## Sinks, redaction, and the registry
+
+A `Sink` (`drain` / optional `flush` / `close`) is a terminal consumer of a
+`SignalChannel`: `ConsoleSink` writes one pretty line per closed segment, `FileSink`
+appends NDJSON `TraceRecord`s to a path, and `StreamSink` writes JSON lines to an
+injected `Writable`. The `SecretScrubber` processor sanitizes segment attributes
+before they leave the process. `TelemetryHub` is a registry of named recorders, with
+`getDefaultHub` / `setDefaultHub` for an opt-in process default.
+
+## The runtime adapter
+
+`traceAgentRun` is the *optional* bridge that projects a runtime `RunEvent` stream
+onto a `Recorder` as nested `run` / `inference` / `action` segments. The adapter is
+the one place tracing knows the runtime's event vocabulary; the rest of the
+subsystem stays runtime-agnostic:
+
+```ts
+import { Recorder, traceAgentRun } from "indusagi/tracing";
+
+const recorder = new Recorder();
+traceAgentRun(recorder, agent.subscribe);  // agent from indusagi/runtime
+```
+
+## Relationship to neighbors
+
+Tracing is cross-cutting: it consumes the [Runtime](/docs/subsystems/runtime)'s
+`RunEvent` stream through the adapter but never the other way around — the runtime
+has no dependency on tracing. Every other layer can be observed by recording its
+own segments.
+
+Back to the [Architecture overview](/docs/architecture).

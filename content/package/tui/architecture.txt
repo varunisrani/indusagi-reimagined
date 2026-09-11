@@ -1,0 +1,95 @@
+# TUI Architecture
+
+> The rebuild renders its terminal UI with React + Ink, not a hand-rolled
+> differential renderer. Layout is Ink's flexbox; colour is applied as chalk ANSI
+> inside `<Text>` runs, which Ink passes through to the terminal verbatim.
+
+The TUI is three layers: the `indusagi/react-host` adapter that resolves React and
+Ink, the `indusagi/react-ink` component set that draws the conversation, and the
+`indusagi/tui` toolkit of pure helpers (key parsing, keybindings, autocomplete,
+ANSI text math) that the editor and slash surfaces lean on.
+
+## Rendering Model
+
+Components live under `src/react-ink/components/**` and are plain React function
+components. They compose Ink primitives — `Box` (flexbox container) and `Text`
+(styled run) — re-exported from `indusagi/react-host/ink` (`src/react-host/ink.ts`).
+Ink owns layout and the diff-to-terminal write; the components never touch the
+screen buffer directly.
+
+Colour is not applied by Ink's `color` prop in most paths. Instead each renderer
+asks an `InkThemeAdapter` (`src/react-ink/theme-adapter.ts`) for a chalk-painted
+string and embeds the resulting ANSI inside a `<Text>`. Ink forwards embedded
+ANSI to the terminal untouched, so chalk escapes survive to become real colour.
+This is why the diff and markdown blocks can paint backgrounds and word-level
+spans that a flat `color` prop could not express.
+
+## The React Host
+
+`src/react-host/loader.ts` resolves `react`, `react/jsx-runtime`, and `ink` from
+the **consumer's** package, not the framework's bundle. `candidatePackageRoots()`
+walks `INDUSAGI_REACT_HOST_ROOT`, then the realpath'd `argv[1]` directory (it
+follows a global bin symlink), then the raw `argv[1]` directory, then `INIT_CWD`,
+then `process.cwd()`, and finally the framework root as a last resort. Each
+candidate is resolved up to its nearest `package.json` and deduped, so the
+realpath and raw `argv[1]` steps usually collapse to one root.
+
+The reason is correctness, not preference: Ink is built against React 18, and if a
+component picked up a host project's React 19 the element shapes diverge and Ink
+throws `Objects are not valid as a React child`. Resolving one React for both
+sides avoids the mismatch. `loadHostReact`, `loadHostJsxRuntime`, and `loadHostInk`
+each memoise their resolved module.
+
+`src/react-host/index.ts` re-exports the resolved React's `Fragment`,
+`createElement`, `useEffect`, `useMemo`, `useState`, and the `Dispatch`,
+`PropsWithChildren`, `ReactNode`, `SetStateAction` types. `src/react-host/ink.ts`
+re-exports `Box`, `Text`, `render`, `useInput`.
+
+## Theme Adapter
+
+`createThemeAdapter(themeName, colors, roleOverrides?)` builds an `InkThemeAdapter`
+from a flat `colors: Record<string, string>` map. It exposes:
+
+- `color(key, text)` / `background(key, text, textKey?)` — paint by colour key,
+  falling back to the theme's `text` colour.
+- `dim(text)` / `muted(text)` — the dim and muted greys.
+- `role(role, text)` / `roleBackground(role, text, fgRole?)` — paint by a named
+  markdown/diff/syntax `ThemeRole`.
+
+A `ThemeRole` is one of: `codeInline`, `heading`, `blockquoteBar`, `diffAddedBg`,
+`diffRemovedBg`, `diffAddedText`, `diffRemovedText`, `synKeyword`, `synString`,
+`synNumber`, `synComment`, `synType`. Each role resolves through `DEFAULT_ROLE_KEYS`
+to a colour key in `colors`; if that key is absent it falls back through
+`ROLE_FALLBACK_KEYS` (e.g. `codeInline` → `accent`, `diffAddedBg` → `success`) and
+finally to the adapter's text colour, so a host theme that predates a role still
+renders a sensible colour. A host theme opts in simply by populating the matching
+key in its `colors` record — it never re-implements an accessor.
+
+## Layout Conventions
+
+- Message rows and dialogs are `<Box flexDirection="column">` stacks; spacing is
+  Ink margin props (`marginBottom`, `marginLeft`, `marginTop`).
+- `DialogFrame` (`src/react-ink/components/dialogs/DialogFrame.tsx`) wraps overlay
+  content in `<Box borderStyle="round" paddingX={1}>` with a title, optional
+  subtitle, and an optional footer.
+- Tables (`MarkdownTable`) and the colored diff become real flexbox column/row
+  layouts rather than raw pipe strings, with widths measured against `stripAnsi`'d
+  text so embedded styling never inflates a column.
+
+## Toolkit Contracts
+
+`src/ui/contracts.ts` defines the non-React surface the editor and overlay host
+implement:
+
+- `Component` — `render(width)`, optional `handleInput`, lifecycle hooks, `invalidate()`.
+- `TUI` — `requestRender?()` and `focus?(component | null)`.
+- `OverlayOptions` — `anchor` (one of nine `OverlayAnchor` values),
+  `row`/`col`/`offsetX`/`offsetY`, `margin`, `width`/`minWidth`/`maxHeight` as a
+  `SizeValue` (`number | "${number}%"`), and a `visible(termWidth, termHeight)`
+  predicate. `OverlayHandle` exposes `isHidden()`, `setHidden(hidden)`, `hide()`.
+
+## Next Docs
+
+- [TUI Module](/docs/tui/README)
+- [TUI Components Reference](/docs/tui/components)
+- [Input, Keys, and Autocomplete](/docs/tui/input-and-keys)

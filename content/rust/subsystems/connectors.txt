@@ -1,0 +1,719 @@
+# Connectors (SaaS)
+
+> `connectors_saas` is the Rust edition's hexagonal SaaS-connector bridge: it
+> turns a vendor catalog (Composio: GitHub, Gmail, Slack, …) into native agent
+> tools through one `SaasBackend` port, a stateful `SaasGateway` façade, a
+> declarative connection state machine, and a pure render layer. Reached as
+> `indusagi::connectors_saas::*` — a dependency-inverted core never names a
+> vendor SDK; exactly one adapter (Composio, behind the `composio` feature)
+> speaks the wire.
+
+A coding agent should be able to discover, authorize, and call third-party
+products as if they were built-in tools. This module delivers that ports-and-
+adapters way: a stateless `core` (the [`SaasBackend`] trait plus a small owned
+data vocabulary, a content-hash cache, a fluent immutable scope planner, and one
+remote-tool builder) holds all the logic, while exactly one adapter translates
+the Composio REST API into that vocabulary. The [`SaasGateway`] façade assembles
+the live pieces — a live `ToolRegistry`, a future-memoizing enable cache, the
+connect-rule driver — and hands the agent four high-level control tools
+(`saas_enable` / `saas_execute` / `saas_connect` / `saas_status`) it starts with.
+
+> Note: this SaaS connectors module is unrelated to the LLM-provider connector
+> registry inside the gateway subsystem — same word, different subsystem. See
+> [Architecture](/rust/architecture). The TypeScript origin is
+> `connectors-saas/`; the Python parity edition is at
+> [Connectors](/python/subsystems/connectors).
+
+## Table of Contents
+
+- [Module map](#module-map)
+- [Public exports](#public-exports)
+- [The backend port](#the-backend-port)
+- [The single vendor adapter](#the-single-vendor-adapter)
+- [The stateful gateway](#the-stateful-gateway)
+- [Hydration and the content-hash cache](#hydration-and-the-content-hash-cache)
+- [The connection state machine](#the-connection-state-machine)
+- [Scope planning](#scope-planning)
+- [The remote-tool builder and control table](#the-remote-tool-builder-and-control-table)
+- [The control surface](#the-control-surface)
+- [The render layer](#the-render-layer)
+- [Forbidden I/O seams](#forbidden-io-seams)
+- [Examples](#examples)
+- [Notable behaviors](#notable-behaviors)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Module map
+
+The module tree mirrors the TypeScript `connectors-saas/` subsystem
+module-for-module. Declared in `connectors_saas/mod.rs`:
+
+| Module path | Holds |
+|-------------|-------|
+| `connectors_saas::core::port` | The `SaasBackend` trait (the dependency-inversion PORT) plus the frozen data vocabulary (`ToolkitInfo`, `RemoteTool`, `RemoteResult`, `ConnectedAccount`, `ConnectionRequest`, `ConnectionState`, `ConnectionStatus`, `ExecuteOptions`, `InitiateOptions`, `JsonSchema`, `SaasError`, `SaasResult`). No vendor symbol crosses it. |
+| `connectors_saas::core::cache` | `hash_key` (sorted-key canonical-JSON SHA-256) and `HashCache<V, E>`, the future-memoizing store. |
+| `connectors_saas::core::scope_planner` | The fluent, immutable `ScopePlanner`, its `plan()` output `ResolvedScope`, and the `ScopeKind` tag. |
+| `connectors_saas::core::builder` | `build_remote_tool` (one catalog op → one `DefinedTool`), the `connector_tools()` low-level passthrough table, and core `build_control_tools`. |
+| `connectors_saas::adapter` | The lone vendor seam: `composio_backend` (gated behind the `composio` feature). |
+| `connectors_saas::control::connect` | The connection FSM: the `connect_rules()` table, pure `plan_connect`, and the impure `initiate_and_await` OAuth-poll driver. |
+| `connectors_saas::control::tools` | The `Gateway` trait, the `control_specs()` table, and the high-level `build_control_tools`. |
+| `connectors_saas::render::summarizers` | The summarizer registry + the dedupe-aware `default_summarizer`. |
+| `connectors_saas::render::format` | The `format_*` text-block renderers. |
+| `connectors_saas::gateway` | The stateful `SaasGateway` façade and `create_saas_gateway`. |
+| `connectors_saas::backends` | `forbidden_fs()` / `forbidden_shell()` — the inert I/O seams the gateway's tool context uses. |
+
+The Composio adapter is gated behind a Cargo feature so the core ships SDK-free.
+Because the merged `reqwest` transport is already present (non-optional) for the
+other leaf crates, the `composio` feature is a pure code gate over the adapter
+module — it pulls in no extra dependency:
+
+```toml
+[features]
+default = ["rustls", "mcp", "tui"]   # note: composio is NOT default
+composio = []
+full = ["mcp", "tui", "composio", "swarm"]
+```
+
+```bash
+# build the SaaS adapter in
+cargo build -p indusagi --features composio
+```
+
+## Public exports
+
+`connectors_saas/mod.rs` re-exports the bridge's intended import surface. The
+stateful façade, the port + its vocabulary, the control surface, the builder, the
+cache, the scope planner, and the render layer are all on the module root; the
+Composio adapter is re-exported only when the `composio` feature is on.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `create_saas_gateway` | fn | `gateway` | Assemble an `Arc<SaasGateway>` over any `Arc<dyn SaasBackend>` and a `SaasGatewayOptions`. |
+| `SaasGateway` | struct | `gateway` | The stateful façade: `control_tool_box` / `tool_box` / `enable_toolkit` assembly plus the `enable`/`execute`/`connect`/`status` verbs. |
+| `SaasGatewayOptions` | struct | `gateway` | Tuning knobs: `account_id` pin and `connect` (a `ConnectTuning`). |
+| `ConnectTuning` | struct | `gateway` | The pacing/bounding subset of `AwaitOptions` a host may pre-configure: `poll_interval_ms`, `max_polls`, `sleep`. |
+| `EnableReport` | struct | `gateway` | Outcome of hydrating a toolkit: `toolkit`, `hydrated` names, `tools` (`Vec<Arc<DefinedTool>>`), `cached`. |
+| `ConnectReport` | struct | `gateway` | Terminal outcome of a connect flow: `toolkit`, `action`, `request_id`, `auth_url`, `account_id`, `reason`. |
+| `StatusReport` | struct | `gateway` | Snapshot: `accounts` (`Vec<ConnectedAccount>`) and `enabled_tools` (in-scope remote tool names). |
+| `SaasBackend` | trait | `core::port` | The dependency-inversion PORT: an async trait of six methods. |
+| `SaasError` / `SaasResult<T>` | enum / alias | `core::port` | The seam error carrying the offending port method, and its `Result` alias. |
+| `ToolkitInfo` | struct | `core::port` | A connectable product: `slug`, `name`, `description`, optional `connected`. |
+| `RemoteTool` | struct | `core::port` | One callable catalog operation: `name`, `toolkit`, `description`, `input_schema` (`JsonSchema`). |
+| `RemoteResult` | struct | `core::port` | Outcome of running a `RemoteTool`: `ok`, `data`, `error`, `log_id`. |
+| `ConnectedAccount` | struct | `core::port` | A credential link: `id`, `toolkit`, `status`, `updated_at`. |
+| `ConnectionRequest` | struct | `core::port` | A freshly opened attempt: `id`, `toolkit`, `status`, `auth_url`. |
+| `ConnectionState` | struct | `core::port` | A polled snapshot: `id`, `status`, `account_id`, `auth_url`. |
+| `ConnectionStatus` | enum | `core::port` | Normalized `Active`/`Pending`/`Expired`/`Failed` the adapter folds the vendor enum into. |
+| `ExecuteOptions` / `InitiateOptions` | structs | `core::port` | Per-call execute (`account_id`) and connection-open (`auth_config_id`, `callback_url`) knobs. |
+| `JsonSchema` | alias | `core::port` | `serde_json::Value` — a JSON-Schema object for tool parameters. |
+| `HashCache` / `hash_key` | struct / fn | `core::cache` | The future-memoizing enable cache and its content-hash key function. |
+| `ScopePlanner` / `ResolvedScope` / `ScopeKind` | struct / enum / enum | `core::scope_planner` | Fluent immutable scope resolution. |
+| `build_remote_tool` / `build_control_tools` / `coin_remote_name` | fns | `core::builder` | The single remote-tool builder, the core control-table factory, and the `ext:<toolkit>.<slug>` name minter. |
+| `connect_rules` / `plan_connect` / `initiate_and_await` / `is_terminal` | fns | `control::connect` | The FSM table, the pure planner, the impure driver, and the terminality test. |
+| `AwaitOptions` / `ConnectAction` / `ConnectOutcome` | structs / enum | `control::connect` | Driver inputs, the five-variant action union, the terminal outcome. |
+| `Gateway` | trait | `control::tools` | The four verbs the high-level control tools delegate to (implemented by `SaasGateway`). |
+| `summarize_result` / `default_summarizer` | fns | `render::summarizers` | One-line result rendering with a pluggable registry and a dedupe-aware fallback. |
+| `format_toolkit_list` / `format_tool_list` / `format_connected_accounts` / `format_connection_request` / `format_connection_state` | fns | `render::format` | Pure data-in / string-out roster, catalog, accounts, and link renderers. |
+| `create_composio_backend` / `ComposioBackend` / `ComposioBackendOptions` | fn / struct / struct | `adapter::composio_backend` | Build the lone Composio-backed `SaasBackend` (only with `--features composio`). |
+
+## The backend port
+
+`SaasBackend` (`core::port`) is the dependency-inversion seam — the only thing
+core logic depends on. It is an `#[async_trait]` trait so the gateway can hold an
+`Arc<dyn SaasBackend>`, and its six methods cover the three jobs the bridge does:
+
+```rust
+#[async_trait]
+pub trait SaasBackend: Send + Sync {
+    // discovery
+    async fn list_toolkits(&self) -> SaasResult<Vec<ToolkitInfo>>;
+    async fn list_tools(&self, toolkit: &str) -> SaasResult<Vec<RemoteTool>>;
+    // execution
+    async fn execute(&self, tool_name: &str, args: Value, opts: ExecuteOptions)
+        -> SaasResult<RemoteResult>;
+    // linking / auth
+    async fn list_connected_accounts(&self) -> SaasResult<Vec<ConnectedAccount>>;
+    async fn initiate_connection(&self, toolkit: &str, opts: InitiateOptions)
+        -> SaasResult<ConnectionRequest>;
+    async fn check_connection(&self, id: &str) -> SaasResult<ConnectionState>;
+}
+```
+
+Every shape it traffics in is a derive-`Serialize`/`Deserialize` struct or enum
+owned by the bridge. Rust's `Option<T>` models the TS optional fields; absence is
+`None`, with `#[serde(skip_serializing_if = "Option::is_none")]` so an omitted
+field round-trips faithfully. Wire-name parity is preserved with explicit
+`#[serde(rename = "…")]` (`inputSchema`, `authUrl`, `accountId`, `updatedAt`,
+`logId`, `authConfigId`, `callbackUrl`).
+
+`ConnectionStatus` is the normalized closed enum — `Active`, `Pending`,
+`Expired`, `Failed` (`#[serde(rename_all = "lowercase")]`) — so core logic only
+ever branches on a four-member set it owns. The adapter folds the catalog's
+richer enum down to these buckets.
+
+```rust
+pub type JsonSchema = Value;             // a JSON-Schema object
+pub type SaasResult<T> = Result<T, SaasError>;
+
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum SaasError {
+    #[error("{message}")]
+    Backend { method: String, message: String },
+}
+```
+
+`SaasError::backend(method, message)` mirrors the TS
+`new ComposioBackendError(method, message)`; `SaasError::method()` returns the
+port method that could not be satisfied. The contract is that `execute` never
+surfaces an `Err` for *operational* failures — those become a
+`RemoteResult { ok: false }` — so an `Err` is reserved for true plumbing faults
+at the seam. Because the port is a trait, a test backend is just a small struct
+implementing it; no SDK install required (see the fake-backend example below).
+
+## The single vendor adapter
+
+`ComposioBackend` (`adapter::composio_backend`, gated `#[cfg(feature =
+"composio")]`) is the **lone** implementation of the port and the only place a
+vendor catalog leaks in. There is no official Composio Rust SDK, so the adapter
+speaks the Composio REST API directly via `reqwest`, re-deriving the six method
+mappings and folding the vendor's snake-/camel-cased shapes down to the port
+vocabulary. The base is `COMPOSIO_BASE = "https://backend.composio.dev/api"`; the
+default user scope is `DEFAULT_USER = "default"`.
+
+It is constructed from a `ComposioBackendOptions { api_key: String, user_id:
+Option<String> }` — the API key the client authenticates with, plus the
+single-user scope the catalog is queried under (blank/absent `user_id` falls
+back to `"default"`). The struct is `pub` but the public constructor is
+`create_composio_backend(api_key)`, which leaves `user_id` unset.
+
+| Port method | Composio REST call |
+|-------------|--------------------|
+| `list_toolkits` | `GET /v3/toolkits` |
+| `list_tools` | `GET /v3/tools?toolkits=<slug>` |
+| `execute` | `POST /v3/tools/execute/<slug>` (body `{ userId, arguments, connectedAccountId? }`) |
+| `list_connected_accounts` | `GET /v3/connected_accounts?userIds=<user>` |
+| `initiate_connection` | `POST /v3/connected_accounts/link` (body `{ userId, toolkit, authConfigId?, callbackUrl? }`) |
+| `check_connection` | `GET /v3/connected_accounts/<id>` |
+
+Requests carry the key as an `x-api-key` header; the query string is encoded by
+hand (`encode_component` keeps the RFC-3986 unreserved set, escapes the rest) so
+the adapter needs no extra reqwest feature. `get_json`/`post_json` chain
+`error_for_status` and fold any reqwest error into a `SaasError::backend` tagged
+with the transport method (`"composio.get"` / `"composio.post"`), passing the
+reqwest error string through `error_message`. Argument-guard failures (a blank
+slug / request id) instead surface a `SaasError::backend` tagged with the *port*
+method name (`"listTools"`, `"initiateConnection"`, `"checkConnection"`).
+Internal list responses are unwrapped by `list_items` (a bare array, else the
+array nested under `items`). Vendor shapes are re-narrowed by pure projector
+functions before anything untyped escapes:
+
+| Projector | Folds | Notes |
+|-----------|-------|-------|
+| `normalize_status(&str)` | vendor status → `ConnectionStatus` | `ACTIVE`→Active; `INITIALIZING`/`INITIATED`→Pending; `EXPIRED`→Expired; `FAILED`/`INACTIVE`/`REVOKED`→Failed; **unknown→Pending** (never silently active). |
+| `pick_auth_url(&Value)` | `redirectUrl` (camel) then `redirect_url` (snake) → `Option<String>` | The actionable redirect URL. |
+| `to_toolkit_info(&Value)` | raw item → `ToolkitInfo` | description from `meta.description` then top-level. |
+| `to_remote_tool(&Value, hint)` | raw catalog tool → `RemoteTool` | `inputParameters` → `input_schema`, else an empty object schema. |
+| `to_connected_account(&Value)` | raw record → `ConnectedAccount` | accepts `updatedAt`/`updated_at`, `toolkit.slug`/`toolkitSlug`; missing status → Pending. |
+| `clean_string(Option<&Value>)` | a JSON field → `Option<String>` | trim, drop blank/non-string. The workhorse every other projector leans on. |
+| `error_message(&str)` | error string → tidy line | trims; blank falls back to `"the Composio SDK reported an unspecified error"`. |
+
+The `execute` mapping reads the vendor response by field: `successful == true`
+sets `RemoteResult.ok`, the `data` key becomes the payload, `logId` becomes
+`log_id`, and on a non-success the `error` key (or a synthesized
+`"<slug> reported a failure"`) becomes `error`. A blank slug short-circuits to a
+flagged `RemoteResult` rather than calling the wire. When `post_json` itself
+returns an `Err`, that fault is folded to `RemoteResult { ok: false, error:
+Some(error_message(err.method())) }` — note the surfaced error line is the seam
+**method tag** (e.g. `"composio.post"`), not the underlying transport message.
+
+`create_composio_backend(api_key)` is keyword-shaped via `impl Into<String>`,
+trims the key, and returns `Err(SaasError::backend("createComposioBackend", …))`
+if it is blank; otherwise it returns an `Arc<dyn SaasBackend>`.
+
+```rust
+# #[cfg(feature = "composio")]
+use indusagi::connectors_saas::create_composio_backend;
+# #[cfg(feature = "composio")]
+let backend = create_composio_backend("comp_...")?; // Arc<dyn SaasBackend>
+# Ok::<(), indusagi::connectors_saas::SaasError>(())
+```
+
+## The stateful gateway
+
+`create_saas_gateway(backend, opts)` returns an `Arc<SaasGateway>` — the concrete
+façade that owns the state the stateless core deliberately lacks:
+
+```rust
+pub struct SaasGateway {
+    backend: Arc<dyn SaasBackend>,
+    account_id: Option<String>,
+    connect_opts: ConnectTuning,
+    control_tools: OnceLock<Vec<Arc<DefinedTool>>>,
+    remote_tools: Mutex<IndexMap<String, Arc<DefinedTool>>>,
+    enable_cache: HashCache<Vec<Arc<DefinedTool>>, SaasError>,
+    self_weak: OnceLock<Weak<SaasGateway>>,
+}
+```
+
+- a live tool set (`remote_tools`, an `IndexMap` so iteration mirrors the JS
+  `Map` order used by `tool_box()` and `status().enabled_tools`),
+- the four control tools, built once via `OnceLock` and registered up front so
+  `control_tool_box()` works before any toolkit is hydrated,
+- a `HashCache<Vec<Arc<DefinedTool>>, SaasError>` of enable results,
+- a `self_weak` `Weak<SaasGateway>` set right after construction so the
+  `Gateway`-trait re-entry (which arrives as `&self`) can recover the
+  `self: &Arc<Self>` receiver the hydration path needs — without a reference
+  cycle.
+
+It exposes three assembly methods and four verbs (the verbs are surfaced both as
+inherent methods and through the `Gateway` trait the control tools call):
+
+| Method | Returns | Purpose |
+|--------|---------|---------|
+| `control_tool_box()` | `ToolBox` | Just the four control tools — the surface an agent starts with. |
+| `tool_box()` | `ToolBox` | The control tools plus every hydrated remote tool. |
+| `enable_toolkit(name, only)` | `Result<Vec<Arc<DefinedTool>>, SaasError>` | Hydrate a toolkit into the live registry; content-hash cached. |
+| `enable_report(toolkit, only)` | `EnableReport` | The verb behind `saas_enable` (reads `cached` *before* hydrating). |
+| `execute_op(tool, args, account_id)` | `ToolResult` | The verb behind `saas_execute` — run one operation by slug. |
+| `connect_flow(toolkit, callback_url, auth_config_id)` | `ConnectReport` | The verb behind `saas_connect` — drive auth to a terminal state. |
+| `status_report()` | `StatusReport` | The verb behind `saas_status`. |
+| `backend()` | `&Arc<dyn SaasBackend>` | Borrow the underlying port (an accessor, not a verb). |
+
+Each tool box is built by `box_of`, which registers the tools into a scratch
+`ToolRegistry` and boxes it with a `ContextFactory` of `inert_context` — a
+tail-windowed (`OutputBudget::new(ClipEnd::Tail, 1 << 20)`), never-aborting
+(`CancellationToken::new()`) context whose `fs`/`shell` are the forbidden seams
+(see [Forbidden I/O seams](#forbidden-io-seams)). The SaaS tools route entirely
+through the port and never touch the filesystem, so a future tool that does fails
+loudly.
+
+`SaasGatewayOptions` carries an `account_id` pin and an optional `ConnectTuning`
+(`poll_interval_ms`, `max_polls`, `sleep`). Only the pacing fields are stored on
+the gateway; `auth_config_id`/`callback_url` always come from the per-call
+`connect_flow(...)` arguments.
+
+## Hydration and the content-hash cache
+
+*Hydration* is the act of turning a toolkit's remote operations into native
+tools. `enable_toolkit` normalizes the request into an `EnableShape`
+(`{ toolkit, only }` with `only` planner-normalized — trimmed, deduped, sorted),
+runs it through the cache, lists the scoped operations, mints one `DefinedTool`
+per op via `build_remote_tool`, and registers them by name. Hydrated tools are
+named `ext:<toolkit>.<slug>` by `coin_remote_name` so they never collide with
+built-ins and their origin is obvious in a tool list.
+
+The headline invariant is **identity-stable hydration**: enabling the same
+toolkit twice calls `backend.list_tools` exactly once and returns the **same**
+`Arc<DefinedTool>` identities — the second enable is served from the cache. This
+follows from how `HashCache<V, E>` works (`core::cache`):
+
+```rust
+pub struct HashCache<V: Clone + Send + Sync + 'static,
+                     E: Send + Sync + 'static = SaasError> { /* slots */ }
+
+pub async fn take<F>(&self, shape: &Value, factory: F) -> Result<V, Arc<E>>
+where F: FnOnce() -> BoxFuture<'static, Result<V, Arc<E>>>;
+```
+
+The cache keys on `hash_key(shape)` and **memoizes in-flight futures, not
+values**: it stores a `futures::future::Shared<BoxFuture<…>>`, so concurrent
+callers asking for the same shape share one backing computation and every awaiter
+observes the identical resolved `V` (the same `Arc`s for `V =
+Vec<Arc<DefinedTool>>`). On a settled `Err`, a chained `inspect` evicts the slot
+so a later call can retry rather than re-serving the failure forever; a cancelled
+caller dropping its clone never poisons the shared computation. `has` /
+`drop_slot` / `clear` / `size` round out the store.
+
+`hash_key` is canonicalization-parity-faithful with the TS: it `canonicalize`s
+the value (sorting object keys with a string sort, keeping array order, passing
+scalars through), encodes it with the core's character-faithful
+[`canonical_json`](/rust/subsystems/core), and takes the **full 64-char** hex
+SHA-256 digest (not the truncated `content_hash`):
+
+```rust
+pub fn hash_key(value: &Value) -> String {
+    let canonical = canonical_json(&canonicalize(value));
+    hex::encode(Sha256::digest(canonical.as_bytes()))
+}
+```
+
+`EnableReport.cached` is read *before* the (possibly cache-filling) enable, via
+`enable_cache.has(shape)`, exactly mirroring the TS ordering — so a first enable
+reports `cached: false` and an identical repeat reports `true`.
+
+## The connection state machine
+
+`control::connect` expresses the OAuth-style link flow as **policy-as-data**.
+`connect_rules()` returns a `[ConnectRule; 4]` — exactly one row per
+`ConnectionStatus` member, so the matrix is total by construction. Each row pairs
+a `when: ConnectionStatus` with a `decide: fn(&ConnectionState) -> ConnectAction`.
+
+`plan_connect(state)` is pure — state in, action out, no I/O — consulting the
+rule table; the closed enum makes the match total. `ConnectAction` is a five-
+variant union, serialized with `#[serde(tag = "kind", rename_all =
+"kebab-case")]`:
+
+| Variant | Meaning | Terminal? |
+|---------|---------|-----------|
+| `AwaitAuth { auth_url }` | The user must visit `auth_url`; keep polling. | no |
+| `Poll` | Progressing on the backend; check again shortly. | no |
+| `Done { account_id }` | The link is active; the account id is ready. | yes |
+| `Expired` | The attempt lapsed; the caller may re-initiate. | yes |
+| `Failed { reason }` | The attempt terminally failed. | yes |
+
+`is_terminal` returns `true` for the last three.
+
+`initiate_and_await(backend, toolkit, options)` is the **one** impure driver. It
+opens a connection once, then loops up to `max_polls`: consult `plan_connect`,
+track `last_auth_url`, return on a terminal action (checked *before* the sleep),
+else `sleep_for(...)` and `check_connection` again. Exhausting the budget yields
+a `Failed` outcome (`"connection did not become active within N checks"`) rather
+than hanging. It does **not** re-initiate on `expired` — that decision is left to
+the caller.
+
+`AwaitOptions` carries `auth_config_id`, `callback_url`, `poll_interval_ms`
+(default 1500), `max_polls` (default 40), and an injectable `sleep: Option<SleepFn>`:
+
+```rust
+pub type SleepFn =
+    Arc<dyn Fn(Duration) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+```
+
+When `sleep` is `None`, the driver falls back to `tokio::time::sleep`; injecting
+a custom `SleepFn` lets tests drive the loop without real time passing. The
+gateway's `connect_flow` maps the terminal `ConnectAction` onto a `ConnectReport`
+via `report_action` (`Poll`/`AwaitAuth` → `"await-auth"`, others pass through),
+and surfaces a seam fault opening the connection as a `"failed"` report carrying
+the error line.
+
+## Scope planning
+
+`ScopePlanner` (`core::scope_planner`) is a fluent, **immutable** builder — every
+mutator returns a new instance. Start with `ScopePlanner::create()`, narrow with
+`include(toolkits)` and `only(tool_names)`, resolve once with `plan()`, and probe
+with `is_empty()` (true until something is declared). Both mutators `normalize`
+their accumulated intent through a `BTreeSet<String>` — trim, drop blanks, dedup,
+sort — in one step.
+
+`plan()` resolves into one of three `ResolvedScope` shapes (no nested branching),
+each tagged by `kind()` → `ScopeKind`:
+
+- `ByTools { tools, toolkits }` — pinned tool slugs win (the most specific
+  intent; the included toolkits ride along as context),
+- `ByToolkits { toolkits }` — one or more whole toolkits in scope,
+- `Empty` — nothing declared.
+
+The gateway uses the planner inside `normalize_pins` to canonicalize an enable
+request's pinned ops into the sorted, deduped `EnableShape.only` before
+content-hashing it — which is why two differently-ordered pin lists hash to the
+same enable cache slot.
+
+## The remote-tool builder and control table
+
+`core::builder` holds the **one** place a catalog operation becomes a native
+tool, plus the low-level control passthrough table — never a family of
+near-identical factories.
+
+`build_remote_tool(reference, backend, account_id)` mints a `DefinedTool` that
+advertises the operation's own `input_schema` and, on invocation, forwards the
+parsed arguments to `backend.execute(ref.name, input, { account_id })`, folding
+the `RemoteResult` onto a `ToolResult` via `render_remote_result` (success → a
+status line plus a JSON content block of the payload; failure → a single flagged
+error line; `is_error` mirrors `result.ok`). All tool behavior is captured in a
+single `ClosureTool` adapter (`Tool` whose `run` is a boxed async closure), so
+neither the remote builder nor either control table needs a bespoke `Tool` impl
+per operation:
+
+```rust
+pub fn build_remote_tool(
+    reference: RemoteTool,
+    backend: Arc<dyn SaasBackend>,
+    account_id: Option<String>,
+) -> DefinedTool;
+
+pub fn coin_remote_name(reference: &RemoteTool) -> String; // "ext:<toolkit>.<name>"
+```
+
+The namespace prefix is the public constant `REMOTE_PREFIX = "ext"` (re-exported
+from `core`); `coin_remote_name` preserves toolkit/slug casing verbatim. The
+single `ClosureTool` adapter is fed by small loose-argument readers — `read_str`
+(a trimmed non-empty string field, `pub(crate)`) and the public
+`read_string_list` (a string array, dropping non-strings/blanks) — so both
+control tables parse their `Value` input the same way. `render_remote_result`
+turns a `RemoteResult` into a `ToolResult`: success → a `"<slug> completed."` line
+plus a JSON block of the payload (omitted when `data` is `None`); failure →
+`"<slug> failed: <why>"` flagged `is_error`.
+
+`connector_tools()` returns the four low-level passthrough tools as a declarative
+`Vec<ControlToolSpec>` — `id`, `description`, `parameters: fn() -> JsonSchema`,
+and a `run: fn(Arc<dyn SaasBackend>, Value) -> BoxFuture<…>` that routes straight
+through the bare port: `saas.attach` (list a toolkit's ops), `saas.run` (execute
+by slug), `saas.link` (open a connection), `saas.status` (list accounts or poll a
+request id). The core `build_control_tools(backend)` maps the table into
+`DefinedTool`s. This is a **distinct** surface from the high-level control tools
+(see below) — note the dotted names (`saas.attach`) versus the underscored
+gateway-facing ones (`saas_enable`).
+
+## The control surface
+
+`control::tools` defines the four high-level control tools an agent uses to
+manage SaaS connectors as a whole. They delegate to the `Gateway` trait rather
+than reimplement logic:
+
+```rust
+#[async_trait::async_trait]
+pub trait Gateway: Send + Sync {
+    async fn enable(&self, toolkit: &str, only: Option<Vec<String>>) -> EnableReport;
+    async fn execute(&self, tool: &str, args: Value, account_id: Option<String>) -> ToolResult;
+    async fn connect(&self, toolkit: &str, callback_url: Option<String>,
+                     auth_config_id: Option<String>) -> ConnectReport;
+    async fn status(&self) -> StatusReport;
+}
+```
+
+`control_specs()` is the declarative table — one `ControlSpec` row per tool
+(`id`, `description`, `parameters`, and a `run: fn(Arc<dyn Gateway>, Value) ->
+BoxFuture<…>`) — and `build_control_tools(gateway)` maps it into `DefinedTool`s,
+one `ClosureTool` per row. `SaasGateway` implements `Gateway` (recovering its
+owning `Arc<Self>` through `self_weak` for the hydration path), so each verb
+forwards to the inherent method:
+
+| Tool | Verb | Result rendering |
+|------|------|------------------|
+| `saas_enable` | `Gateway::enable` | `render_enable` — "Enabled N tool(s) from …" (or "No tools were enabled from …" when nothing hydrated) + the `EnableReport` JSON. |
+| `saas_execute` | `Gateway::execute` | the raw `ToolResult` from `execute_op`. |
+| `saas_connect` | `Gateway::connect` | `render_connect` — an actionable line + the `ConnectReport` JSON (`is_error` only when `action == "failed"`). |
+| `saas_status` | `Gateway::status` | "N connected account(s); M operation(s) in scope." + the `StatusReport` JSON. |
+
+`ConnectReport::to_json` is parity-critical on field presence: `authUrl` only
+when present, `accountId` only when `action == "done"` and present, `reason` only
+when `action == "failed"`.
+
+## The render layer
+
+`render/` is pure presentation — no I/O, no vendor SDK.
+
+`render::summarizers` turns a `RemoteResult` into *one short line*. `summarizers()`
+is a process-wide `&'static HashMap<&str, Summarizer>` (a `OnceLock`), seeded
+with collection-counting rows for `github`, `gmail`, and `slack`. A `Summarizer`
+is an `Arc<dyn Fn(&RemoteResult) -> String + Send + Sync>`. `summarize_result`
+selects most-specific-first: an exact toolkit-slug entry, then the longest
+matching `prefix:*` glob, then `default_summarizer`. `toolkit_of` extracts the
+lower-cased toolkit slug implied by a `<toolkit>_<op>` or `<toolkit>.<op>` name.
+
+`default_summarizer` renders a failure as `error: <line>`, and a success as a
+**dedupe-aware** payload preview (`ok: <preview>`). The `preview_payload` walk is
+*iterative* and **breadth-first** (an explicit `VecDeque` used as a FIFO —
+`push_back` / `pop_front`, never recursion, so a deep or cyclic response cannot
+blow the stack). Every container is content-hashed via `hash_key`: the first
+sighting emits `#i` plus a `tag_of` tag, any later container with the same hash
+collapses to a `=#i` back-reference. Each node's `tag_of` shows only its
+*immediate* shape — objects as `{key,key,…}` (first 6 keys, keys only), arrays as
+`[n]`, scalars as their JSON (numbers via the core encoder). Children enqueue
+arrays in order and objects by sorted key; the walk caps at `MAX_NODES` (24)
+distinct nodes, `clamp_line` trims the whole line to `MAX_LINE` (200) chars with a
+trailing `…`, and an un-drained queue appends a ` …` marker. The seeded toolkit
+rows (via `count_summarizer`) prepend a `count_hint` (a bare array → "N item(s)";
+else the first of `items|data|results|messages|issues` holding an array → "N
+<key>") before falling back to the preview.
+
+`render::format` exposes pure data-in / string-out renderers, each returning a
+single `\n`-joined text block with a status glyph per `ConnectionStatus`
+(`● ◐ ○ ✗`):
+
+| Function | Renders |
+|----------|---------|
+| `format_toolkit_list(&[ToolkitInfo])` | the connectable-toolkit roster |
+| `format_tool_list(&[RemoteTool])` | one toolkit's operation catalog |
+| `format_connected_accounts(&[ConnectedAccount])` | the user's credential links |
+| `format_connection_request(&ConnectionRequest)` | a freshly opened link |
+| `format_connection_state(&ConnectionState)` | a polled link snapshot |
+
+## Forbidden I/O seams
+
+`connectors_saas::backends` provides `forbidden_fs()` and `forbidden_shell()`
+(both `pub(crate)` — an internal seam, not part of the public export surface) —
+an `Arc<dyn Fs>` and an `Arc<dyn Shell>` backed by zero-sized `ForbiddenFs` /
+`ForbiddenShell` structs whose every fallible method returns `io::Error::other(…)`
+(`"SaaS tools have no access to the filesystem."` / `"… to the shell."`); the one
+infallible probe, `Fs::exists`, simply answers `false`. The gateway's
+`inert_context` installs them so any SaaS tool that reaches for `ctx.fs` or
+`ctx.shell` fails loudly instead of silently mis-operating. This is the Rust
+analogue of the TS `forbidden<T>` Proxy.
+
+## Examples
+
+### Wire a gateway to Composio and hand its control tools to an agent
+
+```rust
+use indusagi::connectors_saas::{
+    create_saas_gateway, create_composio_backend, SaasGatewayOptions,
+};
+
+let backend = create_composio_backend("comp_...")?; // requires --features composio
+let gateway = create_saas_gateway(backend, SaasGatewayOptions::default());
+
+// Before any toolkit is hydrated, the agent only sees the four control tools:
+let box_ = gateway.control_tool_box(); // saas_enable / saas_execute / saas_connect / saas_status
+
+// Drive an OAuth flow to a terminal state:
+let report = gateway.connect_flow("github", None, None).await;
+match report.action.as_str() {
+    "await-auth" => println!("Authorize here: {:?}", report.auth_url),
+    "done"       => println!("linked account: {:?}", report.account_id),
+    _            => println!("{}", report.reason.unwrap_or_default()),
+}
+# Ok::<(), indusagi::connectors_saas::SaasError>(())
+```
+
+### Hydrate a toolkit into native tools (content-hash cached)
+
+```rust
+let pins = ["GITHUB_CREATE_ISSUE".to_string()];
+let enable = gateway.enable_report("github", Some(&pins)).await;
+println!("{:?}", enable.hydrated); // ["ext:github.GITHUB_CREATE_ISSUE"]
+println!("{}", enable.cached);     // false the first time, true on an identical repeat
+
+// tool_box() now carries the control tools PLUS the hydrated remote tools:
+let full_box = gateway.tool_box();
+
+// Or run an operation directly without hydrating it first:
+let result = gateway
+    .execute_op("GITHUB_CREATE_ISSUE", serde_json::json!({ "repo": "o/r", "title": "hi" }), None)
+    .await;
+```
+
+### Implement a fake `SaasBackend` for tests (no vendor SDK)
+
+Any struct implementing the trait satisfies the port — no Composio feature, no
+network:
+
+```rust
+use std::sync::Arc;
+use async_trait::async_trait;
+use serde_json::Value;
+use indusagi::connectors_saas::{
+    SaasBackend, SaasResult, ToolkitInfo, RemoteTool, RemoteResult,
+    ConnectedAccount, ConnectionRequest, ConnectionState, ConnectionStatus,
+    ExecuteOptions, InitiateOptions, create_saas_gateway, SaasGatewayOptions,
+};
+
+struct FakeBackend;
+
+#[async_trait]
+impl SaasBackend for FakeBackend {
+    async fn list_toolkits(&self) -> SaasResult<Vec<ToolkitInfo>> {
+        Ok(vec![ToolkitInfo {
+            slug: "gh".into(), name: "GitHub".into(),
+            description: "git".into(), connected: None,
+        }])
+    }
+    async fn list_tools(&self, _toolkit: &str) -> SaasResult<Vec<RemoteTool>> {
+        Ok(vec![RemoteTool {
+            name: "GH_X".into(), toolkit: "gh".into(),
+            description: "do x".into(),
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        }])
+    }
+    async fn execute(&self, _t: &str, args: Value, _o: ExecuteOptions) -> SaasResult<RemoteResult> {
+        Ok(RemoteResult { ok: true, data: Some(serde_json::json!({ "echo": args })), ..Default::default() })
+    }
+    async fn list_connected_accounts(&self) -> SaasResult<Vec<ConnectedAccount>> {
+        Ok(vec![ConnectedAccount {
+            id: "a1".into(), toolkit: "gh".into(),
+            status: ConnectionStatus::Active, updated_at: None,
+        }])
+    }
+    async fn initiate_connection(&self, toolkit: &str, _o: InitiateOptions) -> SaasResult<ConnectionRequest> {
+        Ok(ConnectionRequest {
+            id: "r1".into(), toolkit: toolkit.into(),
+            status: ConnectionStatus::Pending, auth_url: Some("https://x".into()),
+        })
+    }
+    async fn check_connection(&self, id: &str) -> SaasResult<ConnectionState> {
+        Ok(ConnectionState {
+            id: id.into(), status: ConnectionStatus::Active,
+            account_id: Some("a1".into()), auth_url: None,
+        })
+    }
+}
+
+# async fn demo() {
+let gateway = create_saas_gateway(Arc::new(FakeBackend), SaasGatewayOptions::default());
+let status = gateway.status_report().await; // StatusReport { accounts: [...], enabled_tools: [] }
+# let _ = status;
+# }
+```
+
+### Plan scope, summarize a result, and format a roster (pure helpers)
+
+```rust
+use indusagi::connectors_saas::{
+    ScopePlanner, ResolvedScope, summarize_result, format_toolkit_list,
+    RemoteResult, ToolkitInfo,
+};
+
+let scope = ScopePlanner::create()
+    .include(["github"])
+    .only(["GH_CREATE", "GH_LIST"])
+    .plan();
+assert!(matches!(scope, ResolvedScope::ByTools { .. }));
+
+let line = summarize_result(
+    "github_list_issues",
+    &RemoteResult { ok: true, data: Some(serde_json::json!({ "issues": [1, 2, 3] })), ..Default::default() },
+);
+println!("{line}"); // "github ok: 3 issues"
+
+println!("{}", format_toolkit_list(&[ToolkitInfo {
+    slug: "gh".into(), name: "GitHub".into(),
+    description: "git host".into(), connected: Some(true),
+}]));
+```
+
+## Notable behaviors
+
+- **Two functions named `build_control_tools`.** `core::builder`'s takes an
+  `Arc<dyn SaasBackend>` and builds the low-level passthrough tools (`saas.attach`
+  / `saas.run` / `saas.link` / `saas.status`, dotted). `control::tools`'s takes
+  an `Arc<dyn Gateway>` and builds the four agent-facing control tools
+  (`saas_enable` / `saas_execute` / `saas_connect` / `saas_status`, underscored).
+  The gateway uses the latter; the dotted core set is a separate passthrough
+  surface. Both are re-exported from the module root.
+- **Feature-gated, dependency-free adapter.** The `composio` feature is a pure
+  code gate over the adapter module — `reqwest` is already present. With the
+  feature off, `create_composio_backend` / `ComposioBackend` simply do not
+  exist; the rest of the bridge compiles and runs against any custom
+  `SaasBackend`.
+- **Identity-stable hydration.** A repeat `enable` of the same shape returns the
+  *identical* `Arc<DefinedTool>` references and re-lists nothing — the cache
+  stores a `Shared` future of `Vec<Arc<DefinedTool>>`, and registration is
+  idempotent by tool name.
+- **Failures surface as flagged results, not errors.** The adapter's `execute`
+  folds a transport `Err` into `RemoteResult { ok: false }` whose `error` line is
+  the seam **method tag** (`error_message(err.method())`, e.g. `"composio.post"`),
+  and a `successful != true` response into an `ok: false` carrying the vendor
+  `error` key; `execute_op` and the builder then collapse any of these to a single
+  flagged `ToolResult`, so the model boundary sees a flagged result rather than a
+  raised error. (Genuinely unsatisfiable requests — a blank toolkit slug or
+  request id — still raise `Err(SaasError::backend)` from the discovery/link
+  methods.)
+- **Adapter identity quirk.** The Composio adapter treats the connection-request
+  id and the connected-account id as the same handle (`check_connection` polls
+  `GET /v3/connected_accounts/<id>`).
+- **Status normalization is conservative.** `normalize_status` maps
+  `INACTIVE`/`REVOKED` to `Failed` and any unknown vendor state to `Pending` —
+  never silently `Active`.
+- **Inert, forbidden context.** Every gateway-issued tool box dispatches through
+  a never-aborting, tail-windowed context whose `fs`/`shell` deny all access.
+
+## Relationship to neighbors
+
+The bridge builds on the capabilities kernel for the tool surface (`DefinedTool`,
+`Tool`, `ToolContext`, `ToolResult`, `ToolContentBlock`, `ToolRegistry`,
+`ToolBox`, `OutputBudget`, `ClipEnd`, `Framework`, `define_tool`, plus the `Fs` /
+`Shell` seams), on [`core`](/rust/subsystems/core) for `canonical_json` (the
+content-hash key encoder) and `CancellationToken`, and on `reqwest` for the lone
+Composio transport. It is one of the SaaS-facing leaves of the
+[Architecture](/rust/architecture) stack, the Rust parity port of the TypeScript
+`connectors-saas/` subsystem and the Python
+[Connectors](/python/subsystems/connectors) edition.

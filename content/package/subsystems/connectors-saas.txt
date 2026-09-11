@@ -1,0 +1,95 @@
+# SaaS Connectors
+
+> `src/connectors-saas` is the L3 External SaaS-connector bridge. A stateful
+> `SaasGateway` façade hydrates remote SaaS operations into native tools through a
+> `SaasBackend` port, with a single Composio adapter. Imported as
+> `indusagi/connectors-saas`, or as the `saas` namespace from `indusagi`.
+
+The bridge inverts the vendor dependency: its `core/` layer depends only on the
+`SaasBackend` port and our own contracts — no `@composio/core` symbol crosses it.
+The one vendor adapter that satisfies the port lives outside `core/`, and the
+gateway is the stateful thing that wires the pieces together.
+
+## Table of Contents
+
+- [Public exports](#public-exports)
+- [Sub-directories](#sub-directories)
+- [The gateway and its tool surfaces](#the-gateway-and-its-tool-surfaces)
+- [The backend port and Composio adapter](#the-backend-port-and-composio-adapter)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Public exports
+
+From `src/connectors-saas/index.ts`:
+
+| Export | Kind | Source | Purpose |
+|--------|------|--------|---------|
+| `createSaasGateway` | function | `saas/gateway.ts` | Build a gateway over any `SaasBackend` |
+| `createComposioGateway` | function | `saas/gateway.ts` | Convenience: a gateway paired with the Composio adapter |
+| `createComposioBackend` | function | `saas/adapter/composio-backend.ts` | The single vendor adapter |
+| `ComposioBackendError` | class | `saas/adapter/composio-backend.ts` | Adapter-level error |
+| `ScopePlanner` | class | `saas/core/scope-planner.ts` | Fluent, immutable scope resolution |
+
+Types: `SaasGateway`, `SaasGatewayOptions`, `EnableReport`, `ConnectReport`,
+`StatusReport` (gateway); the backend port vocabulary `SaasBackend`, `ToolkitInfo`,
+`RemoteTool`, `RemoteResult`, `ConnectedAccount`, `ConnectionStatus`,
+`ConnectionRequest`, `ConnectionState`, `ExecuteOptions`, `InitiateOptions`;
+`ComposioBackendOptions`; and `ResolvedScope`, `ScopeKind`.
+
+## Sub-directories
+
+| Directory | Holds |
+|-----------|-------|
+| `saas/core/` | The dependency-inverted core: `port.ts` (the `SaasBackend` PORT), `scope-planner.ts`, `cache.ts` (`HashCache`/`hashKey`), `builder.ts` (`buildRemoteTool`/`buildControlTools`/`CONNECTOR_TOOLS`) |
+| `saas/adapter/` | `composio-backend.ts` — the one adapter that satisfies the port |
+| `saas/control/` | `tools.ts` (the four control tools), `connect.ts` (the connection driver) |
+| `saas/render/` | `format.ts`, `summarizers.ts` — pure report rendering |
+| `saas/gateway.ts` | The stateful `SaasGateway` façade |
+
+## The gateway and its tool surfaces
+
+The gateway owns state: a live `ToolRegistry` that hydrated remote tools register
+into, a `ScopePlanner` that records what is in scope, and a `HashCache` that dedupes
+repeated enable work by content hash. It exposes three tool surfaces:
+
+- **`controlToolBox`** — just the four control tools (`saas_enable`, `saas_execute`,
+  `saas_connect`, `saas_status`), the surface an agent starts with before any
+  toolkit is hydrated.
+- **`enableToolkit`** — list a toolkit's remote operations, wrap each into a native
+  `DefinedTool` via the core builder, register them, and content-hash-cache the
+  result so a second enable of the same shape returns the same tools.
+- **`toolBox`** — the control tools plus every remote tool hydrated so far.
+
+```ts
+import { createComposioGateway } from "indusagi/connectors-saas";
+
+const gateway = createComposioGateway({ apiKey: "<composio-api-key>" });
+const tools = gateway.controlToolBox();  // hand the model the control tools first
+```
+
+The four control tools delegate to the gateway's verbs: `saas_enable` hydrates a
+toolkit's operations into the live tool set; `saas_execute` runs any remote
+operation by slug as a direct fallback; `saas_connect` starts and drives an
+authorization flow; `saas_status` lists connected accounts and the operations in
+scope.
+
+## The backend port and Composio adapter
+
+`SaasBackend` is the port the gateway depends on, with a data vocabulary of
+`ToolkitInfo`, `RemoteTool`, `RemoteResult`, `ConnectedAccount`, `ConnectionStatus`,
+`ConnectionRequest`, `ConnectionState`, `ExecuteOptions`, and `InitiateOptions`.
+`createComposioBackend` is the single adapter satisfying it, built against the
+`@composio/core` SDK surface; `createComposioGateway` is the convenience that pairs
+the gateway with it. `ScopePlanner` resolves which operations are in scope
+(`ResolvedScope` / `ScopeKind`) immutably and fluently.
+
+## Relationship to neighbors
+
+Hydrated remote tools are native [Capabilities](/docs/subsystems/capabilities)
+`DefinedTool`s registered into a `ToolRegistry`, so they reach the
+[Runtime](/docs/subsystems/runtime) through the same `ToolBox` surface as built-ins
+and MCP tools. The bridge shares the gateway's `JsonSchema` contract for tool
+schemas. Like [Interop](/docs/subsystems/interop-mcp), it adds external capability
+to an agent — but over SaaS APIs rather than the Model Context Protocol.
+
+Back to the [Architecture overview](/docs/architecture).

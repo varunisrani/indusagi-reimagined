@@ -1,0 +1,170 @@
+# Built-in Tool Reference
+
+> Every tool the agent exposes to the model is a `Capability` — an alias of the framework `AgentTool` — assembled by the **capability deck** (`src/capability-deck`). The deck is the single source of truth: one catalog, three profiles, plus dynamically-grafted MCP tools. By default a session runs the full deck.
+
+The agent does not invent a parallel tool descriptor. A `Capability` carries the framework contract verbatim — `name`, `label`, `description`, a TypeBox `parameters` schema, and an async `execute` — so the conductor consumes the deck's output directly as `SessionConductorOptions.tools`.
+
+The deck draws from two card sources, kept in separate arrays:
+
+- **Built-in bridge** — the framework's native file/search/shell/web/process/checklist tools, re-exposed through `src/capability-deck/builtin-bridge.ts`. This is the `CAPABILITY_CARDS` catalog (`manifest.ts`): today it is exactly the built-ins, projected from the bridge table.
+- **App-novel cards** — five in-house tools the deck builds itself, the `APP_NOVEL_CARDS` array in `src/capability-deck/cards/index.ts`.
+
+The two are not pre-merged into one catalog: `provisionDeck` concatenates `APP_NOVEL_CARDS` onto the selected built-ins only for the `all` profile (`provision.ts`), so the full deck is the union of both.
+
+## Table of Contents
+
+- [How Tools Are Selected](#how-tools-are-selected)
+- [Deck Profiles](#deck-profiles)
+- [Built-in Tools (framework bridge)](#built-in-tools-framework-bridge)
+- [App-Novel Tools](#app-novel-tools)
+- [MCP (dynamically grafted) Tools](#mcp-dynamically-grafted-tools)
+- [Source Files](#source-files)
+
+## How Tools Are Selected
+
+When a session is built (`boot/runners/session.ts`), `selectTools(cwd, inv)` provisions the **full** deck:
+
+```typescript
+const all = provisionDeck("all", { cwd }).tools();
+```
+
+Two flags narrow it:
+
+| Flag | Effect |
+|------|--------|
+| `--no-tools` | The deck is empty — the model gets no tools. |
+| `--tools name1,name2` | Allow-list: keep only the named tools. Ids match case-insensitively with `_` and `-` stripped, so `--tools web_fetch,todo_read` lines up with the `webfetch` / `todoread` ids. |
+
+Any `--mcp` endpoints are connected and their tools concatenated onto the deck. With no flags, the model sees all 17 catalog tools (12 built-ins + 5 app-novel).
+
+## Deck Profiles
+
+`provisionDeck(profile, ctx)` assembles a `ToolDeck` from one of three profiles. Each built-in is tagged with the profiles it belongs to (`READ_ONLY` = observe-only, `MUTATING` = full-access); the profile table maps a deck profile onto those tags.
+
+| Profile | Built-ins included | App-novel cards |
+|---------|--------------------|-----------------|
+| `authoring` | The observe-only subset (read / ls / grep / find / websearch / webfetch / todoread). No mutation, no shell. | No |
+| `survey` | Every built-in, mutating tools included (write / edit / bash / process / todowrite). | No |
+| `all` | Every built-in. | Yes — todo, bg-process, task, saas-action, memory. |
+
+> Note: the deck `authoring` profile maps to the read-only built-in membership and the deck `survey` profile to the full built-in set — a deck profile is a *selection policy*, distinct from the per-tool membership tags the built-in catalog carries. The session runner always provisions `all`, then filters with `--tools` / `--no-tools`.
+
+The assembled deck exposes two reads:
+
+```typescript
+const deck = provisionDeck("all", { cwd: process.cwd() });
+deck.tools();   // AnyCapability[] — the flat list for inspection / selection
+deck.box();     // the same AgentTool[] the conductor consumes as options.tools
+```
+
+## Built-in Tools (framework bridge)
+
+These are the framework's native tools, bound to the session's `cwd` by `builtin-bridge.ts` and re-exposed as capabilities. The `name` the model invokes is the framework's own wire contract, kept verbatim. The web tools take no `cwd`; the checklist tools (`todoread` / `todowrite`) are the framework's in-memory singletons.
+
+### Read-only (`READ_ONLY`: authoring + survey)
+
+| Tool name | Title | What it does |
+|-----------|-------|--------------|
+| `read` | Read file | Return the contents of a file at a path, optionally from an offset and capped to a line limit; renders images inline where supported. |
+| `ls` | List directory | Enumerate the entries of a directory, with an optional cap on how many are returned. |
+| `grep` | Search file contents | Scan files for lines matching a pattern, with optional case-insensitivity, literal matching, surrounding context, and a result cap. |
+| `find` | Find files by name | Locate files and directories whose names match a glob-style pattern beneath a root, capped to a result limit. |
+| `websearch` | Web search | Query the live web for a string and return a ranked set of result snippets, capped to a requested count. |
+| `webfetch` | Fetch URL | Retrieve a single URL and return its body as text, Markdown, or HTML, with an optional request timeout. |
+| `todoread` | Read checklist | Read back the session's running task checklist (framework's default in-memory store). |
+
+### Mutating / stateful (`MUTATING`: authoring only at the built-in tag level)
+
+| Tool name | Title | What it does |
+|-----------|-------|--------------|
+| `write` | Write file | Create or overwrite a file at a path with the given contents, making parent directories as needed. |
+| `edit` | Edit file | Apply a find-and-replace edit to a file, swapping an exact span of old text for new, and report the resulting diff. |
+| `bash` | Run shell command | Execute a shell command in the working directory, streaming its output and honoring an optional timeout. |
+| `process` | Manage background processes | Start, list, inspect, feed input to, and stop long-running background commands without blocking the agent. |
+| `todowrite` | Update checklist | Replace or amend the session's task checklist, setting each item's text, status, and priority. |
+
+The built-in factories (`createReadTool`, `createBashTool`, `createWebFetchTool`, `todoReadTool`, `todoWriteTool`, …) are imported from `indusagi/agent`. The bridge binds `ctx.cwd` and re-labels each; it never reimplements the tool.
+
+## App-Novel Tools
+
+These five cards are written in-house against the framework `AgentTool` contract (`src/capability-deck/cards/`). Each folds its operations onto an `action` discriminant in the TypeBox `parameters` schema. They are only included in the `all` profile.
+
+### `todo` — Checklist
+
+An in-memory checklist the agent rewrites wholesale across a run. Card-owned `TodoLedger`, one per built capability (one per session); no file persistence.
+
+| Param | Type | Notes |
+|-------|------|-------|
+| `action` | `"read"` \| `"set"` | `read` returns the current checklist; `set` replaces it. |
+| `items` | array of `{ task, state, weight }` | The complete desired list. Required for `set` (send the whole list, not a delta); ignored for `read`. |
+
+Item `state` is one of `pending` / `active` / `done` / `dropped`; `weight` is `low` / `normal` / `high`.
+
+### `bg-process` — Background process
+
+Start, poll, and stop long-lived child processes that outlive a single tool call (dev servers, watchers). Wraps Node's `child_process.spawn` directly; output is captured into bounded ring buffers. Per-session `DaemonTable` scoped to the context `cwd`.
+
+| Param | Type | Notes |
+|-------|------|-------|
+| `action` | `"start"` \| `"poll"` \| `"stop"` \| `"list"` | `start` launches a command; `poll` reads its captured output; `stop` terminates it; `list` shows all tracked processes. |
+| `command` | string | Shell command to launch. Required for `start`. |
+| `id` | string | Handle returned by `start`. Required for `poll` and `stop`. |
+| `sinceLast` | boolean | On `poll`, return only output appended since the previous poll. Defaults to false. |
+
+> Use the `bash` tool for ordinary one-shot commands that finish on their own; reserve `bg-process` for processes you start once and observe over time.
+
+### `task` — Delegate task
+
+Hand a self-contained objective to a sub-agent that runs its own tool loop and returns a single report, keeping the parent's context clean. The runner is **not** owned by the card — a host wires a `DelegateRunner` into the context under `DeckContext.framework["delegate"]` (`DELEGATE_HANDLE_KEY`). When no runner is wired, the tool builds anyway and returns a typed, non-throwing stub stating delegation is unavailable.
+
+| Param | Type | Notes |
+|-------|------|-------|
+| `objective` | string | A complete, self-contained statement of what the sub-agent should accomplish (it does not see your conversation). |
+| `agent` | string (optional) | Named sub-agent profile to run as. Omit for the default profile. |
+| `context` | string (optional) | Extra background the sub-agent should start with. |
+
+### `saas-action` — SaaS action
+
+Discover and run third-party SaaS actions (GitHub, Slack, Gmail, …) through the framework's connector gateway. A thin adapter over a `SaasGatewayPort` injected under `DeckContext.framework["saasGateway"]` (`SAAS_GATEWAY_KEY`); degrades to a typed stub when no gateway is configured.
+
+| Param | Type | Notes |
+|-------|------|-------|
+| `action` | `"discover"` \| `"execute"` | `discover` lists available remote tool slugs; `execute` runs one slug. |
+| `slug` | string | Vendor tool slug to run (e.g. `GITHUB_CREATE_ISSUE`). Required for `execute`; case-sensitive. |
+| `arguments` | record | Arguments object for the remote tool, as the connector expects. |
+| `toolkits` | string[] | On `discover`, restrict results to these toolkit names. |
+| `query` | string | On `discover`, free-text filter over available tools. |
+
+### `memory` — Working memory
+
+A small working-memory note that persists across turns — durable facts, decisions, or reminders that survive context scroll-out. A single mutable text buffer; an `InMemoryStore` by default, or a framework-backed `MemoryStore` injected under `DeckContext.framework["memoryStore"]` (`MEMORY_HANDLE_KEY`).
+
+| Param | Type | Notes |
+|-------|------|-------|
+| `action` | `"read"` \| `"replace"` \| `"append"` | `read` returns the note; `replace` overwrites it; `append` adds a line. |
+| `content` | string | New note body (for `replace`) or the line to add (for `append`). Ignored for `read`. |
+
+## MCP (dynamically grafted) Tools
+
+External MCP server tools are **not** part of the static catalog — they are attached at runtime. Two distinct mechanisms exist, and the live `--mcp` CLI flag uses the simpler one:
+
+**The session `--mcp` path (what `indus --mcp …` actually runs).** `loadMcpTools` in `boot/runners/session.ts` loads each `--mcp` endpoint through the framework's own MCP layer (`loadMCPConfig` / `MCPClientPool` / `createMCPAgentToolFactory`, imported from `indusagi/mcp`), then concatenates the resulting `AgentTool`s onto the deck's flat tool list. A server that fails to connect (or yields no servers) is skipped so the session stays usable. This path does **not** go through the bridge ledger below.
+
+**The deck's bridge ledger (`src/capability-deck/bridge-ledger/`).** A separate, event-sourced enrollment model the deck owns for grafting MCP tools as first-class catalog rows. It is exported from the `capabilityDeck` subsystem but is not wired into the boot/session path:
+
+- Enrollment is event-sourced: a `BridgeLedger` is the fold (`reduceLedger`) of an append-only stream of `BridgeEntry` events (`enroll` / `retire`), keyed by a content-hash / ULID `BridgeKey`.
+- The wire name a model sees for a grafted tool is the qualified `<server>__<tool>` (the framework `QUALIFIER` from `indusagi/interop`); servers are mounted via the framework's `mountProtocolBridge`.
+- A `DeckFault` (`kind: "bridge"`) surfaces a connect/list/graft failure; the other `DeckFault` kinds are `unknown_capability`, `build_failed`, and `backend`.
+
+## Source Files
+
+Internal source (`indus-code-rebuild/src`):
+
+- `capability-deck/contract.ts` — the frozen tooling contract: `Capability`, `CapabilityCard`, `DeckProfile`, `DeckContext`, the bridge-ledger types + `reduceLedger`, `ToolDeck`, and `DeckFault`.
+- `capability-deck/builtin-bridge.ts` — the `BUILTIN_BRIDGE` table; binds the framework's native factories (`createReadTool` … `todoWriteTool`) and tags their profiles.
+- `capability-deck/manifest.ts` — `CAPABILITY_CARDS` (the single catalog), `CAPABILITY_INDEX`, `CARD_PROFILES`, and `cardsForProfile`.
+- `capability-deck/provision.ts` — `provisionDeck` and the `PROFILE_TABLE` (`authoring` / `survey` / `all`).
+- `capability-deck/cards/index.ts` — `APP_NOVEL_CARDS`; re-exports the five card modules.
+- `capability-deck/cards/{todo,bg-process,task,saas,memory}-card.ts` — the five in-house tools.
+- `capability-deck/bridge-ledger/` — the event-sourced MCP enrollment (ledger, keys, network).
+- `boot/runners/session.ts` — `selectTools` (`--tools` / `--no-tools`) and `loadMcpTools` (`--mcp`).

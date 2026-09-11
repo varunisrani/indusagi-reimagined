@@ -1,0 +1,66 @@
+# Models and Registry
+
+Models are defined in `src/facade/ml/models.generated.ts` and loaded into an
+in-memory registry in `src/facade/ml/models.ts`.
+
+## Model Structure
+
+Each `Model<TApi>` (from `src/facade/ml/types.ts`) includes:
+
+- `id` and `name`
+- `api` and `provider`
+- `baseUrl`
+- `reasoning` (boolean support flag)
+- `input` types — an array of `"text"` and/or `"image"`
+- `cost` per million tokens: `input`, `output`, `cacheRead`, `cacheWrite`
+- `contextWindow` and `maxTokens`
+- optional `headers`
+- optional `compat` (only for `openai-completions` / `openai-responses` APIs)
+
+## Registry Functions
+
+- `getModel(provider, modelId)` returns a single model, throwing if unknown.
+- `tryGetModel(provider, modelId)` returns the model or `undefined`.
+- `getModels(provider)` returns all models for a provider.
+- `getProviders()` returns the catalog's provider names.
+- `findModels(filters?)` filters by `provider`, `api`, `reasoning`,
+  `supportsImageInput`, and `nameIncludes`.
+- `registerCustomModel(model)` adds one model; `loadCustomModels(models)` adds many.
+
+These delegate to the shared `modelRegistry` singleton (an instance of the
+exported `ModelRegistry` class). You can also construct your own `ModelRegistry`
+with a custom seed.
+
+```ts
+import { findModels } from "indusagi/ai";
+
+const reasoningModels = findModels({ reasoning: true, supportsImageInput: true });
+```
+
+## Cost Calculation
+
+- `estimateCost(model, { inputTokens, outputTokens, cacheReadTokens?, cacheWriteTokens? })`
+  returns a `{ input, output, cacheRead, cacheWrite, total }` breakdown.
+- `calculateCost(model, usage)` mutates and returns `usage.cost`, computing each
+  component from the per-million `model.cost` rates.
+
+Cache reads and cache writes are priced separately from input and output tokens.
+
+## Reasoning Levels
+
+- `supportsXhigh(model)` returns `true` only for `gpt-5.1-codex-max`, `gpt-5.2`,
+  and `gpt-5.2-codex`.
+- Providers that do not support `"xhigh"` clamp it to `"high"` (see
+  `clampReasoning` in [Streaming Model](/docs/ai/streaming)).
+
+## Comparing Models
+
+`modelsAreEqual(a, b)` returns `true` when both models share the same `id` and
+`provider` (and both are non-null).
+
+## Compatibility Overrides
+
+`Model.compat` overrides endpoint behavior for OpenAI-compatible providers. It is
+typed as `OpenAICompletionsCompat` for the `openai-completions` API and
+`OpenAIResponsesCompat` for `openai-responses`. See [AI Providers](/docs/ai/providers)
+for the full field list.

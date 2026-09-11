@@ -1,0 +1,223 @@
+# Dialogs & Overlays
+
+> The twelve modal overlays the interactive console raises over the transcript — model picker, scoped models, settings, theme, session browser, tree navigator, prior-turn fork, sign-in/out, OAuth, and plugin surfaces. Reached inside `pindus` via slash commands (`/model`, `/settings`, `/resume`, `/login`, …) or app chords; implemented under `induscode.console.overlays`.
+
+## Table of Contents
+
+- [How an overlay is raised](#how-an-overlay-is-raised)
+- [The twelve modal kinds](#the-twelve-modal-kinds)
+- [The dispatch table](#the-dispatch-table)
+- [OverlayServices: the runtime handles](#overlayservices-the-runtime-handles)
+- [Picker overlays](#picker-overlays)
+- [Session overlays](#session-overlays)
+- [Auth overlays](#auth-overlays)
+- [The plugin overlay](#the-plugin-overlay)
+- [Modal bookkeeping](#modal-bookkeeping)
+- [Reaching each overlay](#reaching-each-overlay)
+
+## How an overlay is raised
+
+The console is deliberately thin: an overlay is **an awaited flow run in a Textual worker**, not a callback-driven component that stays mounted. Two things can raise one — an `overlay:open` intent (an app chord like `Ctrl+L`) or a slash command's `SlashContext.open_modal(kind, payload)`. Both funnel into `ConsoleApp._raise_overlay(kind, payload)`, which:
+
+1. dispatches a `ModalOpen` reducer event so `ConsoleState.modal` records the kind (and any opaque payload),
+2. runs `_overlay_flow` in a worker (`group="console-overlay"`) — a worker is required because the framework's `push_screen_wait` only resolves inside one,
+3. awaits `open_overlay(self, kind, payload, services)`, folds the returned events through the reducer, and
+4. dispatches `ModalClose` in a `finally` so the modal state always returns to the composer.
+
+```python
+def _raise_overlay(self, kind: ModalKind, payload: object | None = None) -> None:
+    if kind == "none":
+        return
+    self.dispatch(ModalOpen(kind=kind, payload=payload))
+    self.run_worker(self._overlay_flow(kind, payload), group="console-overlay")
+
+async def _overlay_flow(self, kind: ModalKind, payload: object | None) -> None:
+    try:
+        outcome = await open_overlay(self, kind, payload, self._services)
+        for event in outcome.events:
+            self.dispatch(event)
+    finally:
+        self.dispatch(ModalClose())
+```
+
+While a dialog owns the screen, `check_action` declines every intent binding except `Ctrl+C` (clear-then-exit must always be reachable), so app chords are inert until the overlay dismisses. See [Console Overview](/python-cli/console/overview) for the surrounding surface and [Slash Commands](/python-cli/console/slash-commands) for the verbs that open overlays.
+
+## The twelve modal kinds
+
+`ModalKind` (in `console/contract.py`) is a closed `Literal` union; `MODAL_KINDS` is its runtime tuple, used by the dispatch table and pinned by a key-coverage test (the Python analogue of union exhaustiveness).
+
+| Kind | Overlay | Flow | Source |
+|------|---------|------|--------|
+| `none` | inert — nothing raised | `_run_none` | `overlays/router.py` |
+| `settings` | the settings list | `run_settings_picker` | `overlays/pickers.py` |
+| `models` | single-model picker | `run_model_picker` | `overlays/pickers.py` |
+| `scopedModels` | per-scope model picker | `run_scoped_models` | `overlays/pickers.py` |
+| `theme` | colour-scheme picker (live preview) | `run_theme_picker` | `overlays/pickers.py` |
+| `sessions` | session resume / list browser | `run_session_picker` | `overlays/sessions.py` |
+| `tree` | transcript-tree navigator | `run_tree_navigator` | `overlays/sessions.py` |
+| `userTurns` | prior-user-turn fork picker | `run_prior_turns` | `overlays/sessions.py` |
+| `signIn` | provider sign-in launcher | `run_sign_in` | `overlays/auth.py` |
+| `signOut` | sign-out confirmation | `run_sign_out` | `overlays/auth.py` |
+| `oauth` | in-flight OAuth / api-key entry | `run_oauth_flow` | `overlays/auth.py` |
+| `plugin` | host/plugin-supplied surface | `run_plugin` | `overlays/auth.py` |
+
+`ModalState(kind, payload)` carries the active kind plus an opaque payload each dialog narrows at its own boundary; `NO_MODAL` is the inert `none` state. `transition_modal(next_kind, payload)` is the pure helper computing the next `ModalState` — opening `none` (or closing) returns `NO_MODAL`, any other kind raises that overlay carrying the optional payload.
+
+## The dispatch table
+
+`open_overlay` is the single dispatch point. It looks the requested kind up in `OVERLAY_HANDLERS`, awaits the matching flow, and boxes whatever reducer events the flow accumulated into a typed `OverlayOutcome`:
+
+```python
+@dataclass(frozen=True, slots=True)
+class OverlayOutcome:
+    kind: ModalKind
+    events: tuple[ConsoleEvent, ...] = ()
+```
+
+`events` are **never** `modal:*` events — those stay the App's bookkeeping around the await. A flow returns only the side-effect events the reducer should fold once the overlay closes (a committed `scheme:set`, settings `toggle:*` flips, a sign-in `status:set`). An unknown kind, the `none` kind, and any kind opened without the runtime `services` it needs all settle inert with an empty `OverlayOutcome` — the same surfaces that rendered nothing before.
+
+```python
+async def open_overlay(app, kind, payload=None, services=None) -> OverlayOutcome:
+    handler = OVERLAY_HANDLERS.get(kind)
+    if handler is None:
+        return OverlayOutcome(kind=kind)
+    events = await handler(app, payload, services)
+    return OverlayOutcome(kind=kind, events=events)
+```
+
+Every flow has the signature `async def run_*(app, payload, services) -> tuple[ConsoleEvent, ...]`: it loads its data, pushes one or more framework dialogs via `push_screen_wait`, awaits the dismissal result, applies side effects **after** the await, and returns the reducer events to fold. The framework dialog bodies (`ModelDialog`, `ThemeDialog`, `SessionDialog`, `OAuthDialog`, …) come from [react-ink](/python/ui/react-ink); see [Theming](/python-cli/console/theming) for how the theme picker re-skins live.
+
+## OverlayServices: the runtime handles
+
+The surface itself knows nothing about settings files, the session catalog, or the credential store. The handles an overlay needs are bundled in `OverlayServices` and threaded through `ConsoleProps.services`. It is **optional**: headless and test mount paths run without it, and any overlay that finds `services is None` returns `()` immediately (the `plugin` overlay is the one kind that renders without it).
+
+| Field | Type | What overlays do with it |
+|-------|------|--------------------------|
+| `conductor` | `SessionConductor` | select model, resume / navigate / fork the transcript, list models |
+| `settings` | `PreferenceStore` | read/write+save preferences behind the settings, scoped-models, and theme overlays |
+| `sessions` | `SessionLibrary` | list/open saved sessions, build the tree and prior-turn rows, delete/rename |
+| `list_login_providers` | `Callable[[], list[LoginProvider]]` | enumerate the merged sign-in directory |
+| `start_oauth_login` | `StartOAuthLogin` | drive a browser sign-in and persist the result via the vault |
+| `open_login_url` | `Callable[[str], Awaitable[bool]]` | open the consent URL in the user's browser (Chrome-first) |
+| `vault` | `AuthVault` | list / put / remove credentials behind sign-in and sign-out |
+
+See [Conductor](/python-cli/subsystems/conductor), [Sessions](/python-cli/subsystems/sessions), [Launch](/python-cli/subsystems/launch), [Settings](/python-cli/configuration/settings), and [Auth](/python-cli/configuration/auth) for the subsystems these reach.
+
+## Picker overlays
+
+`overlays/pickers.py` owns the four selection dialogs.
+
+### Model picker (`models`)
+
+`run_model_picker` reads the conductor catalog as `ModelCardRef` rows, probes the vault for which providers the user has authenticated (`authenticated_providers`, awaited **before** the dialog opens so there is no probe race), and restricts the list to models from signed-in providers — falling back to the whole catalog if none are authenticated, rather than showing an empty picker. Each ref is lifted into a framework `ModelCard` via `ref_to_card`; selecting a card binds it on the conductor with `select_model(card_catalog_id(chosen))` (canonical `provider/modelId` key). Esc leaves the session untouched. No reducer events — the model change shows through the conductor snapshot.
+
+### Scoped models (`scopedModels`)
+
+`run_scoped_models` edits the per-scope `enabledModels` preference (empty means "every model"). The payload, narrowed by `read_scoped_payload`, selects the sub-mode:
+
+- `{"intent": "reset"}` — clears the override, persists, and returns a `StatusSet` **without** ever presenting the list (the early-return one-shot).
+- `{"focus": "summary"}` or no payload — opens the `ScopedModelsDialog` seeded from the current selection; saving stores the chosen ids (everything selected is normalized back to empty = "no restriction").
+
+### Theme picker (`theme`)
+
+`run_theme_picker` offers the four schemes from `THEME_CHOICES` (`midnight`, `daylight`, plus the two color-blind-safe variants) and is **preview-before-commit**. The `ThemeDialog` captures `app.theme` as the revert target on first highlight, sets `app.theme` live on each highlight (Textual themes re-skin instantly), restores the original on Esc, and dismisses with the committed scheme token on Enter. The flow then persists `colourScheme` and returns a single `SchemeSet(scheme=token)` event. See [Theming](/python-cli/console/theming).
+
+### Settings (`settings`)
+
+`run_settings_picker` builds the rows via `build_settings_items` and presents the framework `SettingsDialog` (Enter/Left/Right cycle a row's value, Esc closes). Each row reads its current value from the preference store and its `on_change` writes back and saves **immediately**; reducer-backed rows also append their live event to an accumulator the flow returns after the dialog closes. A row-building fault yields no dialog at all.
+
+| Row id | Preference key | Values | Live event |
+|--------|----------------|--------|------------|
+| `colour-scheme` | `colourScheme` | the four schemes | `SchemeSet` (+ live `app.theme`) |
+| `show-images` | `showImages` | on/off | `ToggleImages` |
+| `image-auto-resize` | `imageAutoResize` | on/off | — |
+| `block-images` | `blockImages` | on/off | — |
+| `show-reasoning` | `showReasoning` | on/off | `ToggleReasoning` |
+| `skill-commands` | `enableSkillCommands` | on/off | — |
+| `steering-mode` | `steeringMode` | delivery modes | — |
+| `follow-up-mode` | `followUpMode` | delivery modes | — |
+| `auto-compact` | `autoCompact` | on/off | — |
+| `collapse-changelog` | `collapseChangelog` | on/off | — |
+| `quiet-startup` | `quietStartup` | on/off | — |
+| `logo-sweep` | `logoSweep` | on/off | — |
+| `reduced-motion` | `reducedMotion` | on/off | — |
+| `hardware-cursor` | `showHardwareCursor` | on/off | — |
+| `editor-padding` | `editorPaddingX` | `0`–`3` | — |
+
+## Session overlays
+
+`overlays/sessions.py` owns the three transcript-navigation dialogs. Each maps the app's session vocabulary onto a framework shape (`SavedSession` → `SessionInfo`, `BranchNode` → `SessionTreeOption`, `PriorTurn` → `UserMessageOption`) and loads its data **before** pushing the dialog, then drives the matching conductor verb after the await.
+
+### Session browser (`sessions`)
+
+`run_session_picker` seeds the `SessionDialog` with a shallow current-folder listing and the current session's path; an all-scope toggle loads the deep listing on demand (`on_load_all_sessions`). Picking a row calls `conductor.resume(chosen.id)`. Delete and rename remain callbacks the framework dialog invokes mid-flight, routed through the `SessionLibrary` (`remove` / `rename`); faults stay silent — the conductor emits a fault signal on a bad resume.
+
+### Tree navigator (`tree`)
+
+`run_tree_navigator` opens the active session's store, flattens it to depth-annotated `SessionTreeOption` rows via `sessions.tree(store)`, and on selection jumps the conductor's head with `navigate_tree(node.id)`.
+
+### Prior-turn fork (`userTurns`)
+
+`run_prior_turns` lists the past user turns of the active session as `UserMessageOption` fork candidates and, on selection, forks the transcript at that entry with `conductor.fork(turn.entryId)`.
+
+## Auth overlays
+
+`overlays/auth.py` owns the four credential-tied flows.
+
+### Sign-in (`signIn`)
+
+`run_sign_in` lists the merged login directory as `LoginProviderOption` rows and routes the chosen entry by its `authKind` into the shared `_run_auth_entry` flow — a `browser` provider opens the OAuth choreography, an `apiKey` provider opens the inline key input. When the payload names a known provider (`{"providerId": "anthropic"}`, e.g. from `/login anthropic`) the picker is skipped and that provider's entry flow opens straight away. The sign-in → oauth hand-off is an **awaited sub-flow**, so the reducer sees exactly one `modal:open`/`modal:close` pair per user-raised overlay.
+
+### OAuth / api-key entry (`oauth`)
+
+`_run_browser_login` drives the launch adapter's browser sign-in through the framework `OAuthDialog`. The launch `OAuthLoginCallbacks` bag is bridged onto the dialog's seams:
+
+- `on_auth` → `update_state(authInfo=…, progress=…)` and an automatic browser launch via `services.open_login_url`,
+- `on_prompt` → the dialog's `ask()` (a parked `asyncio.Future` that Enter resolves),
+- `on_progress` → `update_state(progress=…)`.
+
+On success the flow binds a model for the provider (`select_provider_model`, newest catalog entry preferred) and returns a `StatusSet` success event. A failed flow posts "Sign-in did not complete." and keeps the dialog open (Esc cancels).
+
+`_run_api_key_entry` collects an API key through the same dialog (`seed_oauth_state` seeds the `OAuthOverlayState`), re-raising on an empty submit until a non-empty key is entered or the user cancels, then persists it via `vault.put_api_key`, binds a model, and returns a success/error `StatusSet`.
+
+### Sign-out (`signOut`)
+
+`run_sign_out` enumerates every saved account across the known providers (`saved_account_rows`, label `"{provider} · {accountId}"`) and removes the chosen one with `vault.remove(provider, accountId)`. Closing the overlay is the right end state regardless of a remove fault.
+
+See [Auth & Credentials](/python-cli/configuration/auth) and [Launch](/python-cli/subsystems/launch) for the OAuth machinery, and [framework facade](/python/facades/ai) for the providers behind it.
+
+## The plugin overlay
+
+`run_plugin` is the only flow that renders without runtime services. `read_plugin_request` narrows the opaque payload into a `PluginRequest(surface, title, text)`, and `PluginOverlayScreen` renders the command-gathered body line-by-line inside a labelled `DialogFrame` (footer "esc to close"). A request with no text falls back to naming the surface so the frame is never empty. The integration slash commands raise it to show MCP servers, memory, and Composio surfaces — see [Runtime Bridge](/python-cli/subsystems/runtime-bridge) and [MCP](/python-cli/configuration/mcp).
+
+## Modal bookkeeping
+
+The reducer is the modal authority: `ConsoleState.modal` mirrors the screen stack exactly. The App brackets every overlay run with `ModalOpen` before the await and `ModalClose` after folding the outcome — one open/close pair per user-raised overlay, even for flows that chain sub-flows internally (sign-in → oauth). This is the Python redesign of the prior callback-prop host: instead of an always-mounted component routed by modal state and driving callback props, each kind maps to an awaited `push_screen_wait` flow that returns a typed `OverlayOutcome`. Because the reducer never sees `modal:*` events from a flow, dialog side effects and modal lifecycle stay cleanly separated.
+
+```python
+from induscode.console.contract import transition_modal, NO_MODAL
+
+state = transition_modal("settings")            # ModalState(kind="settings", payload=None)
+state = transition_modal("signIn", {"providerId": "anthropic"})
+state = transition_modal("none")                # NO_MODAL
+```
+
+## Reaching each overlay
+
+Most overlays are reached through a [slash command](/python-cli/console/slash-commands); two also have app chords.
+
+| Overlay | Slash command(s) | App chord |
+|---------|------------------|-----------|
+| `models` | `/model` (alias `/models`) | `Ctrl+L` |
+| `scopedModels` | `/models-for` (alias `/scoped-models`; `edit` / `show` / `reset`) | — |
+| `settings` | `/settings` | — |
+| `theme` | via the settings `colour-scheme` row | — |
+| `sessions` | `/resume` (alias `/sessions`) | `Ctrl+R` |
+| `tree` | `/timeline` (alias `/tree`) | — |
+| `userTurns` | `/branch` (alias `/fork`) | — |
+| `signIn` | `/login [provider]` | — |
+| `signOut` | `/logout` | — |
+| `oauth` | (sub-flow of `signIn`) | — |
+| `plugin` | `/mcp`, `/memory`, `/composio` surfaces | — |
+
+The chord verbs come from `INTENT_TABLE` (`Ctrl+R` → `overlay:open` with `overlay="sessions"`, `Ctrl+L` → `overlay:open` with `overlay="models"`); the slash commands call `SlashContext.open_modal(kind, payload)`, validated against `MODAL_KINDS` before raising.

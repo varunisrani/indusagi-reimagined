@@ -1,0 +1,338 @@
+# MCP Facade
+
+> `indusagi.mcp` is the Model Context Protocol support layer — a compatibility
+> facade that owns no transport of its own. It is imported as `import indusagi.mcp`
+> (or `from indusagi.mcp import MCPClient, initializeMCP, ...`) and delegates every
+> real connection to the core [Interop](/python/subsystems/interop) protocol bridge.
+
+The facade recreates a stable, camelCase public surface — `MCPClient`, a pool, a
+server, tool factories, schema converters, config loaders, and an `MCPError`
+vocabulary — as a thin shim. Each `MCPClient` maps to one interop
+`ServerEndpointImpl`; each `MCPServer` maps to interop's `create_provider_host`.
+The shim only translates vocabulary at the boundary; interop is ground truth for
+the wire.
+
+## Table of Contents
+
+- [What it is](#what-it-is)
+- [Public exports](#public-exports)
+- [The client side](#the-client-side)
+- [The pool](#the-pool)
+- [Adapting MCP tools into the agent](#adapting-mcp-tools-into-the-agent)
+- [Exposing agent tools as a server](#exposing-agent-tools-as-a-server)
+- [Configuration](#configuration)
+- [Schema conversion](#schema-conversion)
+- [Errors](#errors)
+- [Relationship to interop](#relationship-to-interop)
+- [Notable behaviors](#notable-behaviors)
+
+## What it is
+
+The package is two files. `__init__.py` is a pure barrel re-exporting ~70 names
+with their camelCase spelling preserved. `client.py` (~2135 lines) holds 100% of
+the logic, organized in banner-delimited sections: Errors, Types, internal
+facade-to-core translation, `MCPClient`, `MCPClientPool`, Configuration, Schema
+conversion, Tool factory, `MCPServer`, and `initializeMCP`.
+
+The facade does two complementary jobs:
+
+- **Client side** — connect to external MCP servers (stdio subprocess or
+  HTTP/SSE), enumerate their tools, and mint each as an `AgentTool` the runtime
+  can call.
+- **Server side** — publish the agent's own tools out to external MCP clients
+  over stdio.
+
+Both halves route through interop. The facade exists for API parity: it keeps the
+exact observable names and shapes (camelCase methods, frozen dataclass fields,
+string-tagged content blocks) while the already-green interop endpoint/host
+machinery does the transport work.
+
+## Public exports
+
+From `indusagi/mcp/__init__.py`:
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `MCPClient` | class | `client.py` | One connection to one MCP server: `connect`/`disconnect`/`listTools`/`callTool` plus resource & prompt ops, backed by one interop endpoint |
+| `MCPClientOptions` | dataclass | `client.py` | Frozen options: `name`, `config`, `timeout`, `logger`, `enableServerLogs`, `enableProgressTracking`, `roots` |
+| `MCPClientPool` | class | `client.py` | Many `MCPClient`s keyed by name; `connectAll`/`disconnectAll`/`getClient`/`getStatus`/`addServer`/`removeServer`/`reload` |
+| `MCPClientPoolOptions` | dataclass | `client.py` | Frozen pool options: `servers` (`Sequence[MCPConnectionOptions]`) |
+| `MCPServerStatus` | dataclass | `client.py` | Per-server status: `name`, `connected`, `toolCount`, `resourceCount`, `promptCount` |
+| `MCPServer` | class | `client.py` | Exposes facade `AgentTool`s as an MCP server over `create_provider_host`; `startStdio`/`stop`/`addTool`/`removeTool`/`listTools` |
+| `createMCPServer` | function | `client.py` | Factory: `MCPServer(options)` |
+| `MCPServerOptions` | dataclass | `client.py` | Frozen server options: `name`, `tools`, `version`, `description` |
+| `createMCPAgentToolFactory` | function | `client.py` | Builds a zero-arg factory that mints an `AgentTool` from an `MCPToolDefinition` + `MCPToolClient` |
+| `registerMCPToolsInRegistry` | async function | `client.py` | Registers all of a client's tools into a duck-typed `ToolRegistry`; returns the count |
+| `createMCPToolsMap` | function | `client.py` | Returns `dict[namespaced_name -> AgentTool]` |
+| `createMCPToolsRecord` | function | `client.py` | Same as `createMCPToolsMap` (Record analogue) |
+| `MCPToolClient` | type | `client.py` | `Protocol` a client must satisfy for the tool factory: `serverName`, `connected`, `callTool` |
+| `jsonSchemaToTypeBox` | function | `client.py` | Normalizes a JSON Schema to TypeBox-equivalent JSON form (`integer` maps to `number`) |
+| `applyPassthrough` | function | `client.py` | Recursively sets `additionalProperties: true` on every object node |
+| `convertMCPInputSchema` | function | `client.py` | Main entry: `applyPassthrough(jsonSchemaToTypeBox(inputSchema))` |
+| `convertMCPOutputSchema` | function | `client.py` | Same conversion for `outputSchema`; returns `None` for falsy input |
+| `loadMCPConfig` | function | `client.py` | Loads/merges configs from a file or, given a cwd, from `.indusvx/mcp.json`, XDG user config, and legacy paths |
+| `getUserConfigPath` / `getProjectConfigPath` | function | `client.py` | Resolve the user (`$XDG_CONFIG_HOME/indusvx/mcp.json`) and project (`<cwd>/.indusvx/mcp.json`) config paths |
+| `ensureUserConfigDir` / `ensureProjectConfigDir` | function | `client.py` | `makedirs` the config dir and return it |
+| `saveConfig` / `saveUserConfig` / `saveProjectConfig` | function | `client.py` | JSON-dump a config (dropping `None` fields) to a path / user / project location |
+| `createDefaultConfig` | function | `client.py` | Returns an empty `MCPConfigFile(servers=[])` |
+| `EXAMPLE_CONFIG` | const | `client.py` | Documentation config with filesystem, github, and a disabled remote example |
+| `MCPError` | class | `client.py` | Structured `Exception` with `code`, `details`, `serverName`, `toolName`; `toJSON()` serializer |
+| `MCPErrorCode` | enum | `client.py` | `StrEnum` of error codes (see [Errors](#errors)) |
+| `isMCPError` / `isSessionError` | function | `client.py` | Guards: instance check, and "needs reconnect" check (`SESSION_ERROR` or `NOT_CONNECTED`) |
+| `createConnectionError` … `createSchemaConversionError` | function | `client.py` | Factory helpers that build an `MCPError` with the matching code and context |
+| `StdioServerConfig` | dataclass | `client.py` | Frozen stdio config: `command`, `args`, `env`, `cwd` (see [Notable](#notable-behaviors)) |
+| `HttpServerConfig` | dataclass | `client.py` | Frozen HTTP/SSE config: `url`, `headers`, `fetch` (accepted-but-ignored) |
+| `MCPServerConfig` | type | `client.py` | `TypeAlias = StdioServerConfig \| HttpServerConfig` |
+| `MCPConnectionOptions` | dataclass | `client.py` | Frozen per-server connect spec: `name`, `config`, `timeout` |
+| `MCPToolDefinition` | dataclass | `client.py` | Frozen: `name`, `inputSchema`, `description`, `outputSchema` |
+| `MCPResource` / `MCPPrompt` | dataclass | `client.py` | Frozen resource (`uri`, `name`, `mimeType`, `description`) and prompt (`name`, `description`, `arguments`) |
+| `MCPInitializeResult` | dataclass | `client.py` | Frozen: `protocolVersion`, `serverInfo`, `capabilities` |
+| `MCPClientState` | dataclass | `client.py` | Frozen snapshot: `connected`, `serverName`, `tools`, `resources`, `prompts` |
+| `MCPToolCallRequest` | dataclass | `client.py` | Frozen: `name`, `arguments` |
+| `MCPContentBlock` | type | `client.py` | `TypeAlias = dict[str, Any]`; tagged-dict union (`text`/`image`/`resource`) |
+| `MCPToolCallResult` | dataclass | `client.py` | Frozen: `content`, `isError`, `structuredContent` (always `None`) |
+| `MCPServerConfigEntry` | dataclass | `client.py` | Frozen named config-file entry: `name`, `command`, `args`, `env`, `url`, `headers`, `timeout`, `enabled` |
+| `MCPConfigFile` | dataclass | `client.py` | Frozen `servers` as a `Sequence` (array form) or `Mapping` (object form) |
+| `MCPLoggingLevel` / `MCPLogMessage` / `MCPLogHandler` | type / dataclass / type | `client.py` | Syslog-style level literal, a log record, and its handler callable |
+| `MCPProgressNotification` / `MCPProgressHandler` | dataclass / type | `client.py` | Progress record and its handler callable |
+| `MCPElicitRequest` / `MCPElicitResult` / `MCPElicitationHandler` | dataclass / dataclass / type | `client.py` | Elicitation request, result (`accept`/`decline`/`cancel`), and async handler |
+| `MCPRoot` | dataclass | `client.py` | Frozen filesystem root: `uri` (must be `file://`), `name` |
+| `BaseServerOptions` | dataclass | `client.py` | Frozen common options shared by client/server option types |
+| `initializeMCP` | async function | `client.py` | One-shot: `loadMCPConfig` → `MCPClientPool` → `connectAll` → register all tools into a registry |
+| `InitializedMCP` | type | `client.py` | `NamedTuple(pool, toolCount)` — the wiring result |
+
+## The client side
+
+`MCPClient.__init__` stores the facade config but mints nothing. `connect()` calls
+an internal `_mint_endpoint()`, which reads `command`/`url` off the facade config,
+builds a core stdio or SSE config, and calls `interop.create_server_endpoint()` to
+obtain a `ServerEndpointImpl`, then awaits its connect. Endpoints are
+**single-shot** — terminal once closed or faulted (`is_terminal_phase`) — so a
+reconnect mints a fresh one. The one facade knob the core config lacks (`cwd`) is
+routed through a sanctioned session-factory seam that spins an `mcp` SDK
+`stdio_client` + `ClientSession`.
+
+`listTools()` and `callTool()` wrap `endpoint.list_tools()` / `endpoint.invoke()`
+in `asyncio.timeout(self.timeout / 1000)` and translate results: core tools become
+`MCPToolDefinition`, and a core `RemoteCallResult` becomes an `MCPToolCallResult`
+with each block projected into the tagged-dict shape.
+
+```python
+import asyncio
+from indusagi.mcp import MCPClient, MCPClientOptions, StdioServerConfig
+
+async def main():
+    client = MCPClient(MCPClientOptions(
+        name="filesystem",
+        config=StdioServerConfig(
+            command="npx",
+            args=["-y", "@modelcontextprotocol/server-filesystem", "."],
+        ),
+    ))
+    await client.connect()
+    tools = await client.listTools()           # list[MCPToolDefinition]
+    print([t.name for t in tools])
+    result = await client.callTool("read_file", {"path": "./README.md"})
+    print(result.content, result.isError)      # MCPToolCallResult
+    await client.disconnect()
+
+asyncio.run(main())
+```
+
+Resource and prompt traffic (`listResources`/`readResource`/`listPrompts`/
+`getPrompt`) falls outside the core endpoint's narrow tools-only contract, so
+those methods reach into the endpoint's live `ClientSession` via an internal
+`_require_session()` (a documented same-package pact) and gate on
+`get_server_capabilities()`, returning `[]` for unsupported capabilities.
+
+## The pool
+
+`MCPClientPool` holds a name-keyed dict of `MCPClient`s, each riding its own
+isolated endpoint. `connectAll` iterates and **swallows per-server failures**
+(logging to stderr) so one bad server never sinks the fleet. `addServer` /
+`removeServer` give the incremental lifecycle the core fleet's all-at-once start
+lacks. `getStatus` also swallows count errors per server.
+
+```python
+import asyncio
+from indusagi.mcp import (
+    MCPClientPool, MCPClientPoolOptions, MCPConnectionOptions,
+    StdioServerConfig, HttpServerConfig,
+)
+
+async def main():
+    pool = MCPClientPool(MCPClientPoolOptions(servers=[
+        MCPConnectionOptions("fs", StdioServerConfig(command="my-fs-server")),
+        MCPConnectionOptions("remote", HttpServerConfig(url="http://localhost:8080/mcp")),
+    ]))
+    await pool.connectAll()                 # per-server failures are logged, not fatal
+    all_tools = await pool.listAllTools()   # dict[server_name -> list[MCPToolDefinition]]
+    print({k: len(v) for k, v in all_tools.items()})
+    await pool.addServer(MCPConnectionOptions("gh", StdioServerConfig(command="gh-server")))
+    await pool.disconnectAll()
+
+asyncio.run(main())
+```
+
+## Adapting MCP tools into the agent
+
+`createMCPAgentToolFactory(mcp_tool, client)` returns a factory producing a frozen
+`AgentTool` whose name is `<serverName>_<toolName>` (single underscore — the
+facade convention, deliberately distinct from the core's `__` qualifier), whose
+`parameters` come from `convertMCPInputSchema(inputSchema)`, and whose async
+`execute` checks `client.connected` and the abort signal, calls `client.callTool`,
+and maps the result into `{content, details, isError}` with text truncated to 4
+lines / 500 chars.
+
+`registerMCPToolsInRegistry`, `createMCPToolsMap`, and `createMCPToolsRecord` are
+the bulk variants. `initializeMCP` wires the whole pipeline end to end:
+
+```python
+import asyncio
+from indusagi.mcp import initializeMCP
+
+async def main(registry):
+    # registry just needs .register(meta_dict, factory)
+    result = await initializeMCP(registry, cwd=".")
+    print(f"connected pool, registered {result.toolCount} tools")
+    for status in await result.pool.getStatus():
+        print(status.name, status.connected, status.toolCount)
+    await result.pool.disconnectAll()
+
+# asyncio.run(main(my_registry))
+```
+
+`initializeMCP` returns an empty pool with `toolCount=0` when no servers are
+configured. The agent's `ToolRegistry` is only duck-typed (`register(meta,
+factory)`), never imported.
+
+## Exposing agent tools as a server
+
+`MCPServer.__init__` converts each `AgentTool`-shaped input into an internal
+converted tool, stores them in a mutable table, wraps the table in a live tool
+box (descriptors are read at call time, so `addTool`/`removeTool` show up in the
+next `tools/list`) plus a runner that routes `tools/call` into the facade
+`execute`, and hands the box to `interop.create_provider_host` with a
+`ProviderHostInfo(name, version)`. `startStdio()` opens the `mcp` SDK
+`stdio_server` and runs the host in the foreground, so the call lasts exactly as
+long as the stdio session.
+
+```python
+import asyncio
+from indusagi.mcp import createMCPServer, MCPServerOptions
+
+async def echo_execute(tool_call_id, params, signal=None, on_update=None):
+    return {"content": [{"type": "text", "text": params.get("msg", "")}], "isError": False}
+
+server = createMCPServer(MCPServerOptions(
+    name="my-agent",
+    version="1.0.0",
+    tools=[{
+        "name": "echo",
+        "description": "Echo a message",
+        "parameters": {"type": "object", "properties": {"msg": {"type": "string"}}},
+        "execute": echo_execute,
+    }],
+))
+server.addTool({"name": "ping", "parameters": {}, "execute": echo_execute})
+# asyncio.run(server.startStdio())  # serves until the client closes stdin
+```
+
+## Configuration
+
+`loadMCPConfig(cwd)` merges MCP server configs from `.indusvx/mcp.json` (project),
+the XDG user config, and two legacy `~/.indusvx/agent` paths, returning a
+`list[MCPConnectionOptions]`. `getUserConfigPath` / `getProjectConfigPath` resolve
+the locations; `ensureUserConfigDir` / `ensureProjectConfigDir` create them. The
+`save*` helpers JSON-dump a config and drop `None` fields (mimicking
+`JSON.stringify` dropping `undefined`). `EXAMPLE_CONFIG` is a documentation
+`MCPConfigFile` with filesystem, github (env `GITHUB_TOKEN`), and a disabled
+remote-server example.
+
+## Schema conversion
+
+The converters are pure functions over plain JSON-Schema dicts. `jsonSchemaToTypeBox`
+normalizes primitives, objects, arrays, enums/consts, and `oneOf`/`anyOf`/`allOf`
+to a TypeBox-equivalent JSON form — preserving the quirk that both `number` and
+`integer` map to type `"number"`. `applyPassthrough` recursively sets
+`additionalProperties: true` so servers may return extra fields.
+`convertMCPInputSchema` composes the two; `convertMCPOutputSchema` does the same
+for output schemas and returns `None` for falsy input.
+
+```python
+from indusagi.mcp import convertMCPInputSchema, jsonSchemaToTypeBox
+
+schema = {
+    "type": "object",
+    "properties": {"count": {"type": "integer"}, "name": {"type": "string"}},
+    "required": ["name"],
+}
+print(jsonSchemaToTypeBox(schema))     # note: integer becomes type 'number'
+print(convertMCPInputSchema(schema))   # same, plus additionalProperties: True everywhere
+```
+
+## Errors
+
+Every error is an `MCPError` — a structured `Exception` carrying a `code`
+(`MCPErrorCode`), `details`, `serverName`, `toolName`, a `toJSON()` serializer,
+and the original cause on the native `__cause__` chain. The internal translation
+layer maps every core `ProtocolFault` to an `MCPError`, every SDK `McpError` to a
+session error, and timeouts to a timeout error. `MCPErrorCode` is a `StrEnum`:
+
+```
+CONNECTION_FAILED, TIMEOUT, TOOL_NOT_FOUND, INVALID_PARAMETERS,
+SERVER_ERROR, TRANSPORT_ERROR, NOT_CONNECTED, PROTOCOL_ERROR,
+CONFIG_ERROR, SCHEMA_CONVERSION_ERROR, RESOURCE_NOT_FOUND,
+PROMPT_NOT_FOUND, SESSION_ERROR
+```
+
+`isMCPError(error)` is an `isinstance` guard; `isSessionError(error)` is `True`
+when the code is `SESSION_ERROR` or `NOT_CONNECTED` (i.e. the connection needs a
+reconnect). The `create*Error` factory helpers build an `MCPError` with the
+matching code and server/tool context.
+
+## Relationship to interop
+
+Everything delegates downward to [Interop](/python/subsystems/interop). The client
+imports `create_server_endpoint`, `ServerEndpointImpl`, `EndpointPhase`,
+`is_terminal_phase`, `ProtocolFault`, the core `SseServerConfig` /
+`StdioServerConfig` (aliased internally to avoid colliding with the facade's own
+same-named dataclasses), `create_provider_host`, and `ProviderHostInfo`.
+
+Sideways, it shares the `JsonSchema` and `ToolDescriptor` contract from the
+[LLM Gateway](/python/subsystems/llm-gateway) and speaks `ToolCall` / `ToolOutcome`
+from the [Runtime](/python/subsystems/runtime) on the server side. It depends on
+the third-party `mcp` SDK for transports. The interop layer is the engine; this
+facade is the consumer-facing entry point, intended to be driven by the agent
+runtime via `initializeMCP`. For the lower-level bridge — endpoints, the fleet,
+the provider host, and schema normalization — see [Interop](/python/subsystems/interop).
+
+The sibling [AI](/python/facades/ai), [Agent](/python/facades/agent), and
+[Memory](/python/facades/memory) facades follow the same shim pattern: a stable
+public surface over a core subsystem. See the [Architecture](/python/architecture)
+overview for how the facades sit above the kernel.
+
+## Notable behaviors
+
+- **Name collision by design.** The facade defines its own `StdioServerConfig`
+  (with a `cwd` field) and `HttpServerConfig`, distinct from interop's
+  `StdioServerConfig` / `SseServerConfig`, which it imports under internal
+  aliases. Do not conflate them.
+- **HTTP is actually SSE.** The facade keeps the `HttpServerConfig` surface, but
+  the core speaks SSE on the wire. Same config, different transport.
+- **Signature-parity stubs.** `HttpServerConfig.fetch` is accepted but ignored,
+  and the elicitation / progress / resource-changed handler setters are
+  placeholders that only log.
+- **Memoized tool list.** `listTools` is cached for a connection's lifetime;
+  reconnect (disconnect then connect) mints a fresh endpoint and re-enumerates.
+  `reload()` leans on this.
+- **`structuredContent` is always `None`** — the core `RemoteCallResult` has no
+  such field.
+- **Cancellation discipline.** `asyncio.CancelledError` is never wrapped, mapped,
+  or swallowed (always re-raised); only the cooperative `CancelledByToken` is
+  caught in a minted tool's `execute` and turned into an `isError` result.
+- **Single-underscore namespacing.** Minted tools are named
+  `<serverName>_<toolName>`, deliberately different from the core fleet's `__`
+  qualifier.
+- **Pool failure isolation** is intentional: `connectAll` / `addServer` /
+  `listAll*` catch and log per-server, never aborting the fleet.

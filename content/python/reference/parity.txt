@@ -1,0 +1,197 @@
+# Parity Report
+
+> `PARITY_REPORT.md` is the rebuild's self-audit: an item-by-item record proving
+> the Python `indusagi` package reaches feature parity with the TypeScript source
+> it was rebuilt from. It is prose, not importable code — but every claim cites
+> concrete evidence (`file:line` into `src/indusagi/` and `tests/`).
+
+This page summarizes that audit. The Python build is an **independent rebuild**:
+it reuses no third-party application source and implements each subsystem from
+primary specifications. The parity check walks a 26-item milestone checklist
+against the rebuilt tree and records the result, plus eight deliberate waivers
+where the Python build intentionally diverges or where the original checklist
+miscounted.
+
+## Table of Contents
+
+- [Summary](#summary)
+- [Gate results](#gate-results)
+- [Area-by-area parity](#area-by-area-parity)
+- [Deliberate waivers](#deliberate-waivers)
+- [Version drift](#version-drift)
+- [Follow-ups](#follow-ups)
+- [Relationship to the rest of the docs](#relationship-to-the-rest-of-the-docs)
+
+## Summary
+
+The audit walks the M8 feature-parity checklist item by item against
+`src/indusagi/`, `tests/`, and `dist/`. All rows resolve to **done**.
+
+| | count |
+|---|---:|
+| Checklist items | 26 |
+| Done | 26 |
+| Partial | 0 |
+| Missing | 0 |
+
+**Verdict: parity achieved.** All 26 rows are implemented and evidenced. The
+three rows that were once partial (exit-transcript print, `AWS_REGION` registry
+routing, and the lineage scan plus a checked-in pyright config) have been closed.
+
+## Gate results
+
+The report records the state of each release gate at audit time:
+
+| Gate | Result | Source |
+|---|---|---|
+| Test suite | 755 passed (pytest, network-free; mock connector + respx) | `tests/` |
+| Typecheck | pyright 1.1.405, standard mode, clean over a ratchet subset | `pyrightconfig.json` |
+| Lineage scan | exit 0 — "LINEAGE GATE PASSED: no lineage markers in src/indusagi" | `scripts/lineage_scan.py` |
+| Packaging | wheel + sdist build; fresh-venv install gate (`[mcp,tui]`) passes | `dist/` |
+
+The pyright gate is a **coverage ratchet**, not a blanket strict pass.
+`pyrightconfig.json` deliberately includes only the packages that check clean
+today (`__init__.py`, `memory.py`, `_internal`, `interop`, `react_host`,
+`runtime`) in standard mode. The report self-corrects an earlier ad-hoc claim of
+"strict, 0 errors over all of `src`" — that run had analyzed 0 files and did not
+reproduce (strict mode actually surfaces 907 errors). The ratchet policy is to
+expand the include list over time, never to add per-rule ignores or remove
+entries, which keeps the gate reproducible. See [Testing](/python/reference/testing).
+
+## Area-by-area parity
+
+The checklist is grouped by the milestone that delivered each area. Every row is
+**done**; the evidence column below is condensed from the report.
+
+### Gateway
+
+| Area | Evidence |
+|---|---|
+| Connectors | `CONNECTOR_REGISTRY` maps all 11 `ApiKind`s; `bedrock` is a fail-fast `unsupported` stub (W-1). 41 gateway tests pass. |
+| Emission protocol | 8-variant `Emission` union with error-as-terminal-emission; re-iterable `Channel`; `fold_reply` orders thinking → text → tool calls and reassembles split JSON args. |
+| Catalog + credentials | `MODEL_CARDS` (13, see W-5), fluent `models()` query, `estimate_cost`; env `SECRET_TABLE`; OAuth 2.0 + PKCE S256. |
+| Wire framing | SSE (WHATWG edge cases) + NDJSON framers; HTTP status → error-kind mapping (401/403 → `auth`, 429 → `rate_limit`). 29 streaming tests. |
+
+See [LLM Gateway](/python/subsystems/llm-gateway).
+
+### Runtime and tools
+
+| Area | Evidence |
+|---|---|
+| Pure FSM | `RunPhase` = idle → invoking → streaming → dispatching → compacting → settled/faulted; 7 signals, 5 effects, 7 run events; reducer purity tested. |
+| Steering + budget | steering folds into a live run; abort; 64-turn budget; compaction (`trigger_ratio` / `keep_recent`, cut-point never orphans a `tool_result`). |
+| Session DAG | content-addressed SHA-256 DAG + append-only JSONL store + resume + branch; ledger pub/sub. |
+| Tools | 12 tools registered (read/write/edit/ls/grep/find/bash/process/todo_set/todo_read/websearch/webfetch — see W-6) with byte-budget clamp, Myers diffs, background process table. |
+| Collections | `read-only` / `coding` / `all` collections; `tool_box()` one-call assembly. |
+
+See [Runtime](/python/subsystems/runtime) and [Capabilities](/python/subsystems/capabilities).
+
+### Bridges and connectors
+
+| Area | Evidence |
+|---|---|
+| MCP client | stdio + SSE endpoints, `server__tool` namespacing, schema normalization, per-server fault isolation. 48 interop/mcp tests. |
+| MCP provider host | publishes the agent's ToolBox over `tools/list` / `tools/call`; in-memory round-trip tests. |
+| SaaS control | enable / execute / connect / status control tools, OAuth polling state machine, identity-stable hydration cache. |
+
+See [Interop](/python/subsystems/interop) and [Connectors](/python/subsystems/connectors).
+
+### Swarm and builder
+
+| Area | Evidence |
+|---|---|
+| Kernel | `JsonCell` / `JsonlLog` with locking + atomic publish, ULID ids, 6 fault kinds. |
+| Coordination | dependency-gated `ready()` + cycle rejection, cursor-exact mailbox, git-worktree isolation, `run_round`. |
+| Builder | interview + profiles + blueprint validation + knowledge pack + transcript redaction. |
+
+See [Swarm](/python/subsystems/swarm) and [Smithy](/python/subsystems/smithy).
+
+### CLI
+
+| Area | Evidence |
+|---|---|
+| Flag grammar | 10-flag table and all 4 error strings byte-identical to the source; mode precedence (help / version / print / wire / repl) verbatim. |
+| Wire + auth | NDJSON wire protocol byte-compatible with existing hosts; `auth login/refresh/status` over a compatible `auth.json` format (state dir is port-local, see W-2). |
+| Settings | 3-layer merge, idempotent upgrades, `INDUSAGI_HOME` override, exit codes returned (never a `process.exit` analogue). |
+
+See [Shell App](/python/subsystems/shell-app) and [CLI Reference](/python/reference/cli).
+
+### TUI
+
+| Area | Evidence |
+|---|---|
+| Rendering | flicker-free streaming markdown (tables, highlighted fences, literal `~`); word-level diffs; tool cards with clamp/expand. |
+| Dialogs | all 12 dialogs map 1:1 to the source (model, scoped-models multi-select, session browser, startup picker, settings, theme with live preview, login, OAuth, tree, fork-from-message). |
+| Chrome | footer stats with 70/90 % context thresholds, TaskPanel, StatusLine; Esc abort / Ctrl-C exit; queued-message restore. |
+| Persistence | live theme switching; alternate-screen scrollback + exit transcript print. |
+
+See [TUI](/python/ui/tui) and [React-Ink](/python/ui/react-ink).
+
+### Compat surface
+
+| Area | Evidence |
+|---|---|
+| Facades | `indusagi.ai` / `.agent` / `.mcp` shims export the original vocabulary (106 / 97 / 65 names) and pass 142 tests; `indusagi.memory` ships empty (W-4); a single model catalog seeds the `ai` registry; legacy v3 session JSONL is readable. |
+
+See [ai](/python/facades/ai), [agent](/python/facades/agent), [mcp](/python/facades/mcp), and [memory](/python/facades/memory).
+
+### Cross-cutting
+
+| Area | Evidence |
+|---|---|
+| Cancellation | `CancelToken` honored end-to-end (model stream, tool runners, web tools); MCP invokes do a pre-flight check only (W-7). |
+| Env registry | a single registry module (`_internal/env.py`) owns every env read — `INDUSAGI_HOME`, provider key probes, `AWS_REGION`, Vertex project/location; no config read touches `os.environ` directly. |
+| Distribution hygiene | `py.typed` shipped; lineage scan green; `NOTICE` / `CREDITS.md` packaged into the wheel under `dist-info/licenses/`. |
+
+See [Tracing](/python/subsystems/tracing) for the cross-cutting observability seam.
+
+## Deliberate waivers
+
+The report records eight intentional deviations or checklist corrections. These
+are decisions, not gaps:
+
+| ID | Waiver |
+|---|---|
+| W-1 | Bedrock is a fail-fast `unsupported` stub — it assembles body/region, then raises, matching the source connector. |
+| W-2 | On-disk state is fully port-local: the Python build uses its own `~/.pindusagi` state dir (override `INDUSAGI_HOME`) and never reads or writes the original `~/.indusagi`. The `auth.json` format stays compatible, but the store is not shared. |
+| W-3 | `react_host` collapses to a backend-pinning shim; loader probing and the jsx-runtime subpath are removed and re-documented. |
+| W-4 | `indusagi.memory` ships intentionally empty (`__all__ = []`), guarded by a parity test. |
+| W-5 | `MODEL_CARDS` count is 13, not 14 — the checklist's "14" was a miscount; the source catalog also has 13 with identical ids. |
+| W-6 | Tool count is 12, not 11 — the checklist row said "11" but listed 12 names; the registry carries the same 12. |
+| W-7 | MCP invoke cancellation is pre-flight-only; in-flight calls are not interrupted, matching the source behavior. |
+| W-8 | TUI key decoding at runtime is Textual's; the full pure-Python key port (`tui/keys.py`) is kept for the key-id vocabulary and test corpus but is not in the live input path. |
+
+## Version drift
+
+The non-code meta files disagree on a few numbers because they were written at
+different points in the rebuild. When in doubt, **`pyproject.toml` is the single
+source of truth** — the runtime reads its version via
+`importlib.metadata.version("indusagi")`, and the version string is never
+hardcoded in code.
+
+| Fact | Authoritative value | Where drift appears |
+|---|---|---|
+| Package version | `0.1.2` (`pyproject.toml`, `dist/`) | `CHANGELOG.md` is still headed `0.1.0`; the parity report cites `dist/indusagi-0.1.0*`. |
+| Test count | varies by snapshot | parity report: 755 passed; the changelog cites a different figure. |
+| Model count | 13 curated `MODEL_CARDS` (W-5) | a larger "models / providers" figure elsewhere counts the full routed catalog, not the curated cards — these count different things. |
+| Tool count | 12 registered tools (W-6) | the checklist row text says "11". |
+
+The example filenames listed in some READMEs are also stale relative to the
+on-disk names; trust the files in `examples/`. See [Examples](/python/reference/examples).
+
+## Follow-ups
+
+The three formerly-partial rows are resolved with evidence in their checklist
+rows. One item remains outstanding and is **not** a checklist row: the actual
+PyPI publish has not been executed. The wheel and sdist in `dist/` built and
+passed a fresh-venv install gate locally, but the release workflow (pytest,
+lineage scan, pyright ratchet, then publish) has not run.
+
+## Relationship to the rest of the docs
+
+The parity report sits above every code subpackage and points down into all of
+them — it narrates the same tree this documentation set covers area by area, with
+`file:line` citations into `src/indusagi/` and `tests/`. For the live runtime
+surfaces it audits, start at [Getting Started](/python/getting-started) and the
+[Architecture overview](/python/architecture); for the packaging metadata it
+relies on, see [Package Exports](/python/reference/package-exports).

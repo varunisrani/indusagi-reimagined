@@ -1,0 +1,164 @@
+# Themes
+
+> The console ships four built-in colour schemes. Switch between them in `/settings` — there are no theme files to write.
+
+The console's theme system is code-defined, not file-defined. Each scheme is built at module load from a small raw colour ramp, which is expanded into a closed set of semantic tokens and then projected onto the framework's colour adapter. There is no JSON theme format, no `~/.indusagi/.../themes/` directory, and no `--theme` flag — a scheme is selected by name and resolved against the shipped table.
+
+The theme engine lives in `src/console/theme`. The public barrel is `src/console/theme/index.ts`.
+
+## Table of Contents
+
+- [The four schemes](#the-four-schemes)
+- [Selecting a scheme](#selecting-a-scheme)
+- [The pipeline](#the-pipeline)
+- [Palettes](#palettes)
+- [Semantic tokens](#semantic-tokens)
+- [Framework colour keys](#framework-colour-keys)
+- [Resolving a scheme](#resolving-a-scheme)
+- [Color-blind schemes](#color-blind-schemes)
+
+## The four schemes
+
+Every scheme name is a `ThemeScheme` (`src/console/contract.ts`):
+
+| Scheme | Label | For |
+|--------|-------|-----|
+| `midnight` | Midnight | dark terminals (the default) |
+| `daylight` | Daylight | light terminals |
+| `midnight-cb` | Midnight (color-blind) | deuteran-safe, dark |
+| `daylight-cb` | Daylight (color-blind) | deuteran-safe, light |
+
+`DEFAULT_SCHEME` is `midnight`. These four are the complete shipped set; they are listed in this order by both the theme picker (`THEME_CHOICES` in `src/console/overlays/pickers.tsx`) and the `THEME_SCHEMES` table.
+
+## Selecting a scheme
+
+The scheme is stored under the `colourScheme` preference. Its default value is the literal `"default"`, which is not a known scheme name and therefore resolves to `midnight` (see [Resolving a scheme](#resolving-a-scheme)).
+
+Set it from `settings.json`:
+
+```json
+{
+  "colourScheme": "daylight"
+}
+```
+
+Or change it interactively in the **Settings** overlay (`/settings` → "Colour scheme"). Writing the value there persists it immediately and re-themes the live surface.
+
+The console also defines a dedicated colour-scheme picker (the `theme` modal, rendered by `ThemePicker` in `src/console/overlays/pickers.tsx` via the framework `ThemeDialog`). In this build the picker has no opener wired — no slash command and no keybinding raises the `theme` modal — so the **Settings** overlay above is the reachable way to switch schemes. When the `theme` modal is raised, its semantics are:
+
+- **Enter** — commit: dispatch `scheme:set` to re-theme the live surface *and* persist `colourScheme`.
+- **Esc / cancel** — close the picker, reverting to the scheme that was on screen when it opened.
+
+The picker captures the opening scheme as a revert target, but it does not wire the framework dialog's optional `onHighlight` callback, so moving the highlight does **not** live-preview a scheme — nothing changes until Enter commits.
+
+## The pipeline
+
+A scheme is assembled once at module load (`src/console/theme/resolve.ts`):
+
+```
+palette  ──deriveTokens──▶  tokens  ──themeAdapter──▶  framework adapter
+   └──────────────────────────┴───────────────────────────┘
+                       ConsoleTheme
+```
+
+A `ConsoleTheme` carries the `scheme` name, the raw `palette`, the derived `tokens`, and the framework `adapter` the components render against. The heavy work (building the chalk-backed adapter) happens at load time, so the render path only ever reads an already-built theme.
+
+## Palettes
+
+A `ThemePalette` (`src/console/theme/palette.ts`) is the raw nine-stop ramp a scheme is built from: three accent hues (a cool primary, a warm secondary, a muted-support tertiary), a three-stop neutral text gradient (`ink`/`body`/`muted`), and three status hues (`affirm`/`caution`/`alarm`).
+
+```typescript
+export interface ThemePalette {
+  primary: string;    // cool accent (focus, selection, headings)
+  secondary: string;  // warm accent (composer tint, card gutters)
+  tertiary: string;   // muted-support accent (borders, info, types)
+  ink: string;        // high-contrast text on an accent
+  body: string;       // default answer foreground
+  muted: string;      // timestamps, hints, metadata
+  affirm: string;     // success
+  caution: string;    // warning
+  alarm: string;      // error / fault
+}
+```
+
+The two base ramps are `MIDNIGHT_PALETTE` and `DAYLIGHT_PALETTE`; `PALETTES` maps every `ThemeScheme` to its ramp. Every colour the console renders is computed from these stops — no module downstream of the palette writes a literal hex.
+
+## Semantic tokens
+
+`deriveTokens` (`src/console/theme/tokens.ts`) expands a palette into the `ThemeTokens` the console body actually names. The console never names a hex or a palette stop; it names a *role*. The mapping is pure and total — every token key is assigned exactly once.
+
+Core roles:
+
+| Token | ← palette stop | Purpose |
+|-------|----------------|---------|
+| `signal` | `primary` | dominant accent (focus, selection) |
+| `frame` | `tertiary` | default structural borders |
+| `quietFrame` | `muted` | de-emphasised separators |
+| `promptSurface` | `secondary` | composer's active tint |
+| `cardAccent` | `secondary` | row gutters and headers |
+| `bodyText` | `body` | default answer foreground |
+| `mutedText` | `muted` | timestamps, hints, metadata |
+| `inkText` | `ink` | high-contrast text on an accent |
+| `notice` | `tertiary` | informational tone |
+| `affirm` | `affirm` | success tone |
+| `caution` | `caution` | warning tone |
+| `alarm` | `alarm` | error / fault tone |
+| `pending` | `primary` | busy / in-flight tone |
+
+Rich-render roles (markdown / diff / syntax) are derived from the same nine stops so styled transcripts, colored diffs, and fenced code recolour with the scheme:
+
+| Token | ← derived from | Purpose |
+|-------|----------------|---------|
+| `codeInline` | `primary` | inline code accent |
+| `heading` | `primary` | heading accent |
+| `blockquoteBar` | `muted` | dim quote bar |
+| `diffAddedBg` | `affirm` blended toward the bg | added-line tint |
+| `diffRemovedBg` | `alarm` blended toward the bg | removed-line tint |
+| `diffAddedText` | `affirm` | added foreground / `+` |
+| `diffRemovedText` | `alarm` | removed foreground / `-` |
+| `synKeyword` | `primary` | keywords |
+| `synString` | `affirm` | strings |
+| `synNumber` | `caution` | numbers |
+| `synComment` | `muted` | comments |
+| `synType` | `tertiary` | types / classes |
+
+The two diff backgrounds are computed by blending the status hue ~22% over the scheme's implied terminal background (toward black on a dark scheme, toward white on a light one), so every scheme — including the color-blind variants — gets a legible `+`/`-` tint that tracks its own success/alarm hue.
+
+## Framework colour keys
+
+The framework's `InkThemeAdapter` looks colours up by *its own* key vocabulary. `frameworkColors` (`src/console/theme/adapter.ts`) is the one place each framework key is filled from a console token, and `themeAdapter` hands the resulting record to `createThemeAdapter` from `indusagi/react-ink`:
+
+| Framework key | ← console token |
+|---------------|-----------------|
+| `text` | `bodyText` |
+| `dim` | `mutedText` |
+| `muted` | `mutedText` |
+| `accent` | `signal` |
+| `borderMuted` | `quietFrame` |
+| `bashBorder` | `frame` |
+| `userMessage` | `promptSurface` |
+| `customMessage` | `cardAccent` |
+| `success` | `affirm` |
+| `warning` | `caution` |
+| `error` | `alarm` |
+| `info` | `notice` |
+| `highlight` | `inkText` |
+
+The markdown/diff/syntax role keys (`codeInline`, `heading`, `blockquoteBar`, `diffAddedBg`, `diffRemovedBg`, `diffAddedText`, `diffRemovedText`, `synKeyword`, `synString`, `synNumber`, `synComment`, `synType`) carry through under the same names so the framework's rich-render path resolves them straight from the derived tokens.
+
+## Resolving a scheme
+
+`resolveTheme` (`src/console/theme/resolve.ts`) is the single sanctioned way to turn a scheme name into a `ConsoleTheme`:
+
+```typescript
+import { resolveTheme, THEME_SCHEMES, isThemeScheme } from "src/console";
+
+const theme = resolveTheme("daylight");   // → the daylight ConsoleTheme
+const fallback = resolveTheme("nonsense"); // → the midnight (default) ConsoleTheme
+```
+
+An unrecognised or absent name falls back to `DEFAULT_SCHEME` rather than throwing, so a corrupt `colourScheme` preference never blanks the console. `isThemeScheme(value)` narrows an arbitrary string to a known scheme; `THEME_SCHEMES` is the picker-ordered list of every scheme.
+
+## Color-blind schemes
+
+`midnight-cb` and `daylight-cb` clone their base ramps but re-derive the three *status* hues so a red-green color-blind user can tell success from failure without relying on the red-green axis. Success moves off green onto a vivid blue, the red alarm is deepened, and the amber warning is nudged in lightness — so the three status tones separate by *lightness*, not hue alone. The accent hues and neutral gradient carry over unchanged, so the overall look stays the parent scheme.

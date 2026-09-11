@@ -1,0 +1,346 @@
+# Package Exports
+
+> The top-level `indusagi` package is a lazy namespace re-exporter: `import indusagi`
+> binds almost nothing eagerly, and friendly aliases (`indusagi.gateway`,
+> `indusagi.runtime`, `indusagi.capabilities`, ...) resolve to real subpackages on
+> first access. The actual API lives in each subpackage, which you import directly
+> as `import indusagi.llmgateway` (and friends).
+
+## Table of Contents
+
+- [Root package](#root-package)
+- [Subpackage map](#subpackage-map)
+- [Green-core subsystems](#green-core-subsystems)
+- [Old-vocabulary facades](#old-vocabulary-facades)
+- [UI stack](#ui-stack)
+- [CLI application](#cli-application)
+- [Stubs and internals](#stubs-and-internals)
+- [Import discipline](#import-discipline)
+- [Console scripts](#console-scripts)
+
+## Root package
+
+`src/indusagi/__init__.py` is intentionally near-empty. It binds exactly two
+eager names and a lazy attribute hook:
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `__version__` / `VERSION` | const | `__init__.py` | Read from `importlib.metadata.version("indusagi")`; falls back to `"0.0.0.dev0"` when run from a source tree without an install. The **only** eagerly-bound value names on the root package. |
+| `__getattr__` | function | `__init__.py` | PEP 562 lazy re-export. Maps nine aliases to real subpackages and `importlib.import_module`s the target on first attribute access. |
+| `__dir__` | function | `__init__.py` | Advertises both module globals and the nine alias names so `dir(indusagi)` lists them (they only materialize when accessed). |
+
+The alias table (`_SUBSYSTEMS`) is:
+
+| Alias | Resolves to |
+|-------|-------------|
+| `indusagi.gateway` | `indusagi.llmgateway` |
+| `indusagi.runtime` | `indusagi.runtime` |
+| `indusagi.capabilities` | `indusagi.capabilities` |
+| `indusagi.interop` | `indusagi.interop` |
+| `indusagi.saas` | `indusagi.connectors` |
+| `indusagi.swarm` | `indusagi.swarm` |
+| `indusagi.smithy` | `indusagi.smithy` |
+| `indusagi.tracing` | `indusagi.tracing` |
+| `indusagi.shell` | `indusagi.shell_app` |
+
+```python
+import indusagi
+
+print(indusagi.VERSION)             # e.g. "0.1.2" (or "0.0.0.dev0" from a source tree)
+
+# Friendly aliases resolve lazily to the real subpackages:
+gateway = indusagi.gateway          # -> indusagi.llmgateway
+saas = indusagi.saas                # -> indusagi.connectors
+shell = indusagi.shell              # -> indusagi.shell_app
+print(gateway.__name__)             # 'indusagi.llmgateway'
+
+# NOTE: `from indusagi import stream` FAILS — the root exports only
+# VERSION/__version__. Import from the subpackage instead:
+from indusagi.llmgateway import stream
+```
+
+Importing the root forces no heavy subpackage (no `textual`, no MCP); those load
+only when you touch the alias or import the subpackage directly.
+
+## Subpackage map
+
+Every importable subpath, what it holds, and where its public surface is curated.
+Each subpackage `__init__.py` is an explicit `__all__` barrel — it imports curated
+names from its submodules and re-lists every one — except `tracing`, which
+aggregates `__all__` from `from .layer import *`.
+
+| Subpath | Alias | Source | Holds |
+|---------|-------|--------|-------|
+| `indusagi.llmgateway` | `indusagi.gateway` | `llmgateway/__init__.py` | LLM gateway core; frozen type contract + dispatch + catalog. |
+| `indusagi.runtime` | — | `runtime/__init__.py` | Agent runtime; `create_agent` + run vocabulary + transition machine. |
+| `indusagi.capabilities` | — | `capabilities/__init__.py` | Built-in tools; `define_tool` kernel + eleven tool objects. |
+| `indusagi.connectors` | `indusagi.saas` | `connectors/__init__.py` | SaaS connector bridge; `SaasGateway` + Composio adapter. |
+| `indusagi.swarm` | — | `swarm/__init__.py` | Crew/swarm coordination; `create_crew` + domain services. |
+| `indusagi.smithy` | — | `smithy/__init__.py` | Agent-builder meta-tool; `Forge` + `AgentBlueprint`. |
+| `indusagi.interop` | — | `interop/__init__.py` | MCP protocol bridge (client + provider host). |
+| `indusagi.tracing` | — | `tracing/__init__.py` | OTel-free tracer; signal/channel/redaction/sinks/recorder. |
+| `indusagi.ai` | — | `ai/__init__.py` | Old-vocabulary LLM facade (~106 names) over `llmgateway`. |
+| `indusagi.agent` | — | `agent/__init__.py` | High-level `Agent` facade (~97 names) + tool factories + sessions. |
+| `indusagi.mcp` | — | `mcp/__init__.py` | Old-vocabulary MCP facade (camelCase) over `interop`. |
+| `indusagi.tui` | — | `tui/__init__.py` | Framework-agnostic TUI primitives (37 names, no `textual`). |
+| `indusagi.react_ink` | — | `react_ink/__init__.py` | Textual component library (~183 names); pulls in `textual`/`rich`. |
+| `indusagi.ui_bridge` | — | `ui_bridge/__init__.py` | On-screen bridge; lazy app + eager adapter projections. |
+| `indusagi.react_host` | — | `react_host/__init__.py` | Backend `HostUI` Protocol seam. |
+| `indusagi.shell_app` | `indusagi.shell` | `shell_app/__init__.py` | CLI application; `main`/`run` + runners + settings. |
+| `indusagi.memory` | — | `memory.py` | Phantom stub (`__all__ = []`); no value-level exports. |
+| `indusagi._internal` | — | `_internal/__init__.py` | Non-public shared utilities; **not** documented API. |
+
+## Green-core subsystems
+
+These four use snake_case Pythonic names and form the foundation everything else
+layers on. Each refuses to re-export its neighbor's contract so every type has one
+canonical import site.
+
+### indusagi.llmgateway
+
+The LLM core and single source of truth for the type contract. Selected names from
+its `__all__`:
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `stream`, `complete` | function | Streaming / one-shot dispatch by model id. |
+| `stream_with_card`, `complete_with_card` | function | Dispatch against a pre-resolved `ModelCard`. |
+| `MODEL_CARDS`, `models`, `get_card`, `curated_card`, `CardSelection` | const/function/class | Static catalog + fluent query + lookup. |
+| `estimate_cost` | function | Price a `Usage` figure against a card. |
+| `CONNECTOR_REGISTRY`, `connector_for_api`, `Connector`, `CredentialResolver` | const/function/type | Connector routing table and ports. |
+| `ProviderId`, `ApiKind`, `Modality`, `CostSheet`, `ModelCard`, `JsonSchema` | type | Card vocabulary. |
+| `Conversation`, `Turn` (`UserTurn`/`AssistantTurn`/`ToolTurn`), `Block` family, `ToolDescriptor` | type | Conversation vocabulary. |
+| `Reply`, `Usage`, `StopReason`, `Emission` family, `Channel` | type | Reply / streaming vocabulary. |
+| `StreamOptions`, `ThinkingLevel`, `ToolChoice` | type | Invocation options. |
+| `GatewayError`, `GatewayErrorKind`, `gateway_error` | class/type/function | Fail-fast error contract. |
+
+```python
+from indusagi.llmgateway import MODEL_CARDS, models, get_card, estimate_cost, complete
+from indusagi.llmgateway import Conversation, UserTurn, TextBlock, StreamOptions
+
+card = get_card("anthropic", "claude-sonnet-4-5")
+for c in models():            # fluent query over MODEL_CARDS
+    pass
+```
+
+Full detail in [LLM Gateway](/python/subsystems/llm-gateway).
+
+### indusagi.runtime
+
+The agent runtime. Exports `create_agent`, `Agent`, `AgentDeps`,
+`AgentEventHandler`; the run vocabulary `RunSnapshot`, `RunPhase`, `RunEvent`,
+`PendingTool`, `AgentConfig`, `CompactionPolicy`, `ToolBox`, `ToolRunner`,
+`ToolCall`, `ToolOutcome`, `ModelInvoker`, `RunError`, `RunErrorKind`,
+`run_error`; and the pure transition machine `step`, `cadence`,
+`initial_snapshot`, `StepFn`, `Transition`. It deliberately does **not**
+re-export gateway types. See [Runtime](/python/subsystems/runtime).
+
+### indusagi.capabilities
+
+The built-in tools layer. Authoring shape `define_tool` plus the kernel vocabulary
+(`ToolSpec`, `ToolContext`, `ToolResult`, `Fs`, `Shell`, `ToolRegistry`,
+`DefinedTool`), local backends (`local_fs`, `local_shell`, `make_local_context`,
+`resolve_path`), the eleven built-in tool objects (`read_tool`, `write_tool`,
+`edit_tool`, `ls_tool`, `grep_tool`, `find_tool`, `bash_tool`, `process_tool`,
+`todo_read_tool`, `todo_set_tool`, `web_search_tool`, `web_fetch_tool`),
+`TodoStore`/`TodoItem`/`TodoStatus`, and the assembled `builtin_registry`,
+`tool_box`, `ToolCollection`. See [Capabilities](/python/subsystems/capabilities).
+
+### indusagi.interop
+
+The MCP protocol bridge core (client + provider host). Exports
+`create_server_endpoint`/`ServerEndpointImpl`, `start_server_fleet`/`ServerFleetImpl`,
+`mount_protocol_bridge`, `create_provider_host`, `ProtocolFault`/`protocol_fault`
+plus guards, and contract types (`ServerConfig`, `StdioServerConfig`,
+`SseServerConfig`, `RemoteTool`, `RemoteToolRef`, `EndpointStatus`, `FleetStatus`,
+`MountedBridge`). See [Interop](/python/subsystems/interop).
+
+### Other core subsystems
+
+`indusagi.connectors` (SaaS bridge: `create_saas_gateway`, `create_composio_gateway`,
+`SaasGateway`, `SaasBackend`, `create_composio_backend`, `ScopePlanner`),
+`indusagi.swarm` (crew coordination: `create_crew`, `Crew`, `CrewManifest`,
+`TicketBoard`, `Channel`, `ActivityLog`, `Workspace`, `JsonCell`, `JsonlLog`,
+`new_id`, `SwarmFault`), `indusagi.smithy` (agent builder: `FlagReader`,
+`read_flags`, `AgentBlueprint`, `PROFILES`, `define_agent`, `to_agent_config`,
+`validate_blueprint`, `KnowledgePack`, `ToolLedger`, `Forge`, `create_forge`), and
+`indusagi.tracing` (`Segment`, `SegmentHandle`, `TraceSignal`, `NOOP_HANDLE`,
+`SignalChannel`, `SecretScrubber`, `Recorder`, `TelemetryHub`, `trace_agent_run`).
+See [Connectors](/python/subsystems/connectors),
+[Swarm](/python/subsystems/swarm), [Smithy](/python/subsystems/smithy), and
+[Tracing](/python/subsystems/tracing).
+
+## Old-vocabulary facades
+
+`indusagi.ai`, `indusagi.agent`, and `indusagi.mcp` keep the original
+TypeScript-parity names so code written against the prior package layout keeps
+importing. `ai` and `agent` use the same message/event spelling; `mcp` keeps
+camelCase exactly.
+
+### indusagi.ai
+
+Thin LLM shims over `llmgateway` (~106 names). Message/content models
+(`UserMessage`, `AssistantMessage`, `TextContent`, `ThinkingContent`,
+`ImageContent`, `ToolCall`, `ToolResultMessage`, `Context`, `Usage`, `Model`,
+`Tool`), the `AssistantMessageEvent` streaming union + `EventStream` /
+`AssistantMessageEventStream`, `ModelRegistry` / `ProviderRegistry` +
+`get_model` / `find_models` / `estimate_cost` / `calculate_cost`, env-key probing
+(`get_env_api_key`), and dispatch (`stream`, `complete`, `stream_simple`,
+`complete_simple`, `stream_by_api`).
+
+```python
+import asyncio
+from indusagi.ai import Context, UserMessage, get_model, stream
+
+async def main():
+    context = Context(messages=[UserMessage(content="hi", timestamp=0)])
+    events = stream(get_model("anthropic", "claude-sonnet-4-5"), context)
+    async for event in events:
+        ...
+    reply = await events.result()
+    print(reply)
+
+asyncio.run(main())
+```
+
+See [ai facade](/python/facades/ai).
+
+### indusagi.agent
+
+The high-level `Agent` facade (~97 names): `Agent`
+(`prompt`/`steer`/`follow_up`/`wait_for_idle`/`abort`), the `AgentEvent` union +
+`AGENT_EVENT_GROUPS`, the `create_*_tool` factories (`create_coding_tools`,
+`create_bash_tool`, `create_read_tool`, ...) and pre-built collections, plus
+`SessionManager` (append-only JSONL) and the `register_message_type` registry.
+
+```python
+import asyncio
+from indusagi.agent import Agent, create_coding_tools
+
+async def main():
+    agent = Agent()
+    agent.set_tools(create_coding_tools("/path/to/project"))
+    await agent.prompt("explain this repository")
+
+asyncio.run(main())
+```
+
+See [agent facade](/python/facades/agent).
+
+### indusagi.mcp
+
+Old-vocabulary MCP facade — camelCase TS-parity names kept exactly, shimming over
+`indusagi.interop`. Exports `MCPClient`/`MCPClientPool` (+`Options`),
+`MCPServer`/`createMCPServer`, tool factories (`createMCPAgentToolFactory`,
+`createMCPToolsMap`), schema conversion (`jsonSchemaToTypeBox`,
+`convertMCPInputSchema`), config loaders (`loadMCPConfig`, `getUserConfigPath`),
+error factories (`MCPError`, `createConnectionError`), and
+`initializeMCP`/`InitializedMCP`.
+
+```python
+import asyncio
+from indusagi.mcp import MCPClientPool, MCPClientPoolOptions, loadMCPConfig
+
+async def main():
+    configs = loadMCPConfig()                       # .indusvx/mcp.json et al.
+    pool = MCPClientPool(MCPClientPoolOptions(servers=configs))
+    await pool.connectAll()
+    for client in pool.getAllClients():
+        tools = await client.listTools()
+
+asyncio.run(main())
+```
+
+See [mcp facade](/python/facades/mcp).
+
+## UI stack
+
+Four subpackages compose the terminal-UI stack with deliberately different import
+costs.
+
+| Subpath | Import cost | Surface |
+|---------|-------------|---------|
+| `indusagi.tui` | none (textual-free) | `AutocompleteProvider`, `CombinedAutocompleteProvider`, `SlashCommand`, structural contracts (`Component`, `TUI`, `OverlayOptions`), theme contracts, `fuzzy_match`/`fuzzy_filter`, editor keybindings, key decoding (`Key`, parsing helpers), width math. |
+| `indusagi.react_ink` | pulls `textual` + `rich` | ~183 names: types, `ThemeAdapter`/`create_theme_adapter`, components (`Footer`, `StatusLine`, `MessageList`, `TaskPanel`, `ToolEventBlock`), dialogs (`LoginDialog`, `ModelDialog`, `OAuthDialog`, `SessionDialog`, `SettingsDialog`, ...), diff, markdown, utils. |
+| `indusagi.ui_bridge` | lazy app, eager adapter | Lazily (PEP 562) exports `InteractiveApp`/`create_theme`/`mount_interactive`/`exit_transcript_text`; eagerly exports adapter projections (`to_agent_messages`, `turn_to_agent_messages`, `reply_to_assistant_message`, `live_usage`, `gateway_usage_to_ml`, `LiveUsage`) and the facade message vocab re-export. |
+| `indusagi.react_host` | none | `HostUI` (runtime_checkable Protocol: `box`/`text`/`render`/`use_input`), `set_host`, `get_host`. |
+
+`ui_bridge` keeps its data adapter importable without `textual` by resolving the
+textual-backed names through its own `__getattr__`. See [tui](/python/ui/tui),
+[react-ink](/python/ui/react-ink), and [ui-bridge](/python/ui/ui-bridge).
+
+## CLI application
+
+`indusagi.shell_app` (alias `indusagi.shell`) wires everything together and is the
+bin entry point.
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `run` | function | Synchronous console-script shim both `indusagi` and `pindusagi` bins map to; drives `main`. |
+| `main` | function | The async CLI entry. |
+| `build_boot_context` | function | Assemble the `BootContext`/`CliBootContext`. |
+| `RUNNERS`, `select_runner` | const/function | Runner registry + selector (`OneShotRunner`, `ReplRunner`, `WireRunner`). |
+| `tokenize_invocation`, `Invocation`, `RunnerMode`, `FLAG_SPECS` | function/type | Flag/invocation parser. |
+| `Locator`, `Brand`, `BRAND` | class/type/const | Path/brand locator. |
+| `load_settings`, `resolve_model_id`, `Settings`, `DEFAULT_SETTINGS` | function/type/const | Settings layer. |
+| `apply_upgrades`, `UPGRADES` | function/const | Settings migrations. |
+| `run_auth_command`, `AuthIO` | function/type | `auth` subcommand. |
+
+```python
+# pyproject [project.scripts]: indusagi = pindusagi = indusagi.shell_app.cli:run
+from indusagi.shell_app import run, main, select_runner, load_settings
+
+run()   # synchronous console-script shim; drives main()
+```
+
+See [Shell App](/python/subsystems/shell-app) and the [CLI reference](/python/reference/cli).
+
+## Stubs and internals
+
+| Subpath | Status | Notes |
+|---------|--------|-------|
+| `indusagi.memory` | phantom stub | `__all__ = []` by design. Importing succeeds but yields nothing at value level; real conversational memory lives in `indusagi.runtime`. Do not add symbols. |
+| `indusagi._internal` | non-public | Underscore-prefixed. Exports `CancelToken` and `CancelledByToken` (cooperative cancellation). **Not** part of the documented API surface despite having an `__all__`. |
+
+See [memory facade](/python/facades/memory).
+
+## Import discipline
+
+A few rules govern the surface:
+
+- **The root exports almost nothing eagerly.** `from indusagi import X` only works
+  for `VERSION` / `__version__`. For anything else, use the lazy alias attribute
+  (`indusagi.gateway`) or import the subpackage directly (`import indusagi.llmgateway`).
+- **`saas` and `shell` are aliases.** `indusagi.saas` is `indusagi.connectors` and
+  `indusagi.shell` is `indusagi.shell_app` — both spellings resolve to the same
+  module object.
+- **Two naming styles coexist.** The green core (`llmgateway`, `runtime`,
+  `capabilities`, `swarm`, `smithy`, `tracing`, `tui`) is snake_case; the facades
+  (`indusagi.ai`, `indusagi.agent`, and especially `indusagi.mcp`) keep the original
+  camelCase (`MCPClientPool`, `loadMCPConfig`, `createMCPServer`, `jsonSchemaToTypeBox`).
+- **Some names surface from more than one barrel.** `get_env_api_key` appears via
+  both `ai.env_keys` and `ai.stream`; `read_tool`/`bash_tool`/etc. appear in both
+  `capabilities` and the `agent` facade. These are the same underlying objects.
+- **One source of truth.** Areas refuse to re-export their neighbor's types
+  (`runtime` omits gateway types; `capabilities` omits both runtime and gateway
+  contracts) so each type has exactly one canonical import site.
+
+## Console scripts
+
+The package is installed from PyPI as `indusagi` (version `0.1.2`, hatchling wheel
+over `src/indusagi`, Python 3.11+). It provides two console scripts, both pointing
+at the same synchronous entry point:
+
+```toml
+[project.scripts]
+indusagi  = "indusagi.shell_app.cli:run"
+pindusagi = "indusagi.shell_app.cli:run"
+```
+
+```bash
+pip install indusagi
+pindusagi --help
+```
+
+Back to the [Architecture overview](/python/architecture) or the
+[Getting Started](/python/getting-started) guide.

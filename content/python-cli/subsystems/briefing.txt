@@ -1,0 +1,267 @@
+# Briefing
+
+> The briefing subsystem is `induscode`'s typed seam between the coding agent's runtime state and the LLM-facing system prompt. It folds an ordered, self-gating section recipe over a typed context into the final prompt, and owns two adjacent disk-discovered capabilities: slash macros (`*.md` templates with `{{arg.…}}` placeholders) and Agent-Skills capability cards (`SKILL.md`). Reach it with `from induscode.briefing import compose_briefing, ...`; it is built on `indusagi`'s [`AgentTool`/`AgentState`](/python/facades/agent) and [content types](/python/facades/ai).
+
+The system prompt is **not** a string template with `{{TOKEN}}` holes. It is an ordered list of `BriefingSection` descriptors, each of which decides for itself whether it applies to a given `BriefingContext` and renders its own fragment. `compose_briefing` is a small pure reducer over that recipe. Reshaping the prompt is a data edit to `BRIEFING_SECTIONS` — never a change to the composer.
+
+The package is four modules with no I/O in the type seam: `contract.py` (frozen shapes), `compose.py` (the reducer + the default recipe), `macros.py` (the single-pass macro scanner and loader), and `skills.py` (the `SKILL.md` walker/validator). Filesystem discovery of project-context files and roots lives one layer up, in the [console startup](/python-cli/console/overview) layer; this package holds only shapes and pure renderers.
+
+## Table of Contents
+
+- [Architecture](#architecture)
+- [The Public Surface](#the-public-surface)
+- [The Declarative Section Pipeline](#the-declarative-section-pipeline)
+- [The Default Recipe](#the-default-recipe)
+- [BriefingContext](#briefingcontext)
+- [Slash Macros](#slash-macros)
+- [Skill Cards](#skill-cards)
+- [Faults](#faults)
+- [The Live Call Site](#the-live-call-site)
+- [Framework Anchors](#framework-anchors)
+- [Source Layout](#source-layout)
+
+## Architecture
+
+```
+induscode/briefing/
+├── contract.py   # FROZEN type surface: sections, macros, skills, ContextDoc, BriefingFault
+├── compose.py    # compose_briefing reducer + BRIEFING_SECTIONS default recipe
+├── macros.py     # single-pass {{arg.…}} scanner + *.md macro loader
+└── skills.py     # SKILL.md / *.md walk, validate, gather into SkillCards
+```
+
+`contract.py` is the single typed seam: it declares every dataclass and alias, imports its two framework anchors at the top (`AgentState`/`AgentTool` from `indusagi.agent`, `TextContent`/`ImageContent` from `indusagi.ai`), and re-exports them without re-declaring. Everything downstream — the composer, the macro scanner, the skill loader — is written against the names declared there. The `__init__.py` barrel re-exports the whole briefing-owned vocabulary; consumers import from `induscode.briefing`, never from individual modules.
+
+## The Public Surface
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `compose_briefing` | function | `compose.py` | Fold a section recipe + `BriefingContext` (or a full `BriefingInputs`) into the final system-prompt string. |
+| `BRIEFING_SECTIONS` | const | `compose.py` | The default 9-tuple recipe, in render order. |
+| `BriefingSection` | dataclass | `contract.py` | One declarative section: `id`, optional `title`, optional `applies(ctx)` predicate, pure `render(ctx)`. |
+| `BriefingContext` | dataclass | `contract.py` | All-optional render context (tools, context_docs, skills, subagents, cwd, workspace, now, extras). |
+| `BriefingInputs` | dataclass | `contract.py` | Bundle of a `Briefing` recipe + context + optional `prelude`/`append` text. |
+| `Briefing` | type alias | `contract.py` | `Sequence[BriefingSection]` — an ordered section recipe. |
+| `ContextDoc` | dataclass | `contract.py` | A project-context document (`path` + verbatim `body`) inlined under the project-context section. |
+| `SubagentBrief` | dataclass | `contract.py` | A named delegate role (`name`, `purpose`, optional `when`) advertised in the delegates section. |
+| `Macro` | dataclass | `contract.py` | A loaded slash macro: `name`, `description`, `body`, `origin`, `source`. |
+| `MacroScope` | dataclass | `contract.py` | Argument environment: `args` tuple, joined `all`, verbatim `raw`. |
+| `MacroToken` | type alias | `contract.py` | Discriminated `LiteralToken \| PositionalToken \| AllToken \| SliceToken`, keyed by a `kind` ClassVar. |
+| `MacroOrigin` | type alias | `contract.py` | `Literal["user","project","path","builtin"]`. |
+| `SkillCard` | dataclass | `contract.py` | A validated `SKILL.md` card — documentation the model reads, not a callable. |
+| `SkillFrontmatter` | dataclass | `contract.py` | Parsed `SKILL.md` header (name, description, license, compatibility, metadata, allowed_tools, disable_model_invocation). |
+| `SkillLoad` | dataclass | `contract.py` | Aggregate load result: deduped `cards` tuple + per-candidate `diagnostics` tuple. |
+| `SkillDiagnostic` | dataclass | `contract.py` | One per-candidate outcome: `kind` / `location` / `detail`. |
+| `SkillOutcomeKind` | type alias | `contract.py` | `Literal["loaded","skipped","invalid","collision"]`. |
+| `SKILL_NAME_LIMIT` / `SKILL_DESCRIPTION_LIMIT` | const | `contract.py` | Agent-Skills format limits: `64` and `1024` characters. |
+| `BriefingFault` | exception | `contract.py` | Typed `Exception` with `kind` / `message` / optional `cause`; shared with transcript-export. |
+| `briefing_fault` | function | `contract.py` | The single sanctioned constructor for a `BriefingFault`. |
+| `scan_macro_body` | function | `macros.py` | Single left-to-right scan of a body into a flat `MacroToken` stream. |
+| `resolve_tokens` | function | `macros.py` | Concatenate a token stream resolved against a `MacroScope`. |
+| `build_macro_scope` | function | `macros.py` | Quote-aware split of a raw argument line into a `MacroScope`. |
+| `apply_macros` | function | `macros.py` | One-shot `scan` + `scope` + `resolve`: `apply_macros(body, raw) -> str`. |
+| `expand_invocation` | function | `macros.py` | Expand a `/<name> rest…` line against loaded macros (first name match wins). |
+| `load_macros` | function | `macros.py` | Load the direct `*.md` children of a dir (non-recursive) into deduped `Macro` records. |
+| `read_macro_file` | function | `macros.py` | Parse one macro file; raises `macro_invalid` on read failure. |
+| `split_frontmatter` | function | `macros.py` | Minimal `---`-fenced YAML-ish reader returning `FrontmatterSplit`. |
+| `set_legacy_macro_reporter` | function | `macros.py` | Install/clear the callback fired when the compat shim sees a legacy `$arg` form. |
+| `gather_skill_cards` | function | `skills.py` | Load + merge `SkillCard`s from several `SkillRoot`s, dedup by name (first wins). |
+| `load_skill_cards` | function | `skills.py` | Walk one root, validate every candidate into a `SkillLoad` (no cross-root dedup). |
+| `model_invocable_cards` | function | `skills.py` | Filter out cards flagged `disable-model-invocation`. |
+| `SkillRoot` | dataclass | `skills.py` | One skill directory root with its origin tag, fed to `gather_skill_cards`. |
+
+## The Declarative Section Pipeline
+
+A `BriefingSection` is the unit of the pipeline:
+
+```python
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BriefingSection:
+    id: str                                              # stable identifier
+    title: str | None = None                             # optional heading
+    applies: Callable[[BriefingContext], bool] | None = None  # None == always
+    render: Callable[[BriefingContext], str]             # pure: reads ctx, returns fragment
+```
+
+`compose_briefing` is the reducer. It walks the recipe in order, skips any section whose `applies(ctx)` is `False`, calls `render(ctx)`, drops empty/whitespace-only fragments, and joins survivors with blank lines. A `prelude` is prepended and an `append` is appended when the caller passes a full `BriefingInputs`:
+
+```python
+def compose_briefing(value: BriefingContext | BriefingInputs) -> str: ...
+```
+
+Passing a bare `BriefingContext` wraps it with the default `BRIEFING_SECTIONS` recipe; passing `BriefingInputs` lets the caller name its own sections and bracket them with `prelude`/`append` override text. `render` is pure with respect to the context — it reads, never mutates, and performs no I/O.
+
+## The Default Recipe
+
+`BRIEFING_SECTIONS` is a module-level 9-tuple of `BriefingSection` constants, in render order. Each row lists its gate; sections with no gate always render.
+
+| Section | id | Gate (`applies`) | What it renders |
+|---------|----|------------------|-----------------|
+| Role | `role` | always | Establishes the agent's purpose and stance. |
+| Tools | `tools` | at least one tool present | Lists each advertised tool with a one-liner from `TOOL_SUMMARIES`, falling back to `AgentTool.description`. |
+| Working guidance | `guidelines` | always (each bullet gated) | Behavioral guidelines; each bullet is gated on the matching tool (`read`/`edit`/`write`/`grep`/`find`/`ls`/`bash`) so the model is never told to use a capability it lacks. |
+| Task tracking | `tasks` | `todowrite` or `todoread` present | How to keep the shared checklist current. |
+| Delegates | `subagents` | `subagents` non-empty | Each `SubagentBrief` the primary agent may hand work to. |
+| Connectors | `connectors` | any tool name starts `connector_`/`saas_` | Guidance for external-service connector tools. |
+| Project context | `project-context` | `context_docs` non-empty | Inlines each `ContextDoc` under `## {path}` as standing instructions. |
+| Skills | `skills` | `skills` non-empty | XML-escapes each card into an `<available_skills>` block. |
+| Footer | `footer` | always | Stamps the working directory (`cwd` or `workspace`) and an ISO-8601 millisecond UTC time. |
+
+The footer time format mirrors `Date.toISOString()` exactly — UTC, millisecond precision, trailing `Z` — and the timestamp is injectable via `BriefingContext.now` for deterministic renders. Adding, removing, or reordering a section is a data edit to this tuple; the composer never changes.
+
+## BriefingContext
+
+`BriefingContext` is the all-optional, immutable bag a section reads. Every field defaults to `None`/absent so a caller composes a partial briefing without populating the whole shape.
+
+| Field | Read by |
+|-------|---------|
+| `workspace: str \| None` | footer (fallback), skill path resolution |
+| `tools: Sequence[AgentTool] \| None` | tools + guidelines + connectors gates |
+| `cwd: str \| None` | footer (preferred over `workspace`) |
+| `skills: Sequence[SkillCard] \| None` | skills block |
+| `subagents: Sequence[SubagentBrief] \| None` | delegates block |
+| `context_docs: Sequence[ContextDoc] \| None` | project-context block |
+| `now: datetime \| None` | footer timestamp (defaults to "now, UTC") |
+| `extras: Mapping[str, object] \| None` | open bag for app-novel sections |
+
+```python
+from induscode.briefing import (
+    BriefingContext, ContextDoc, SubagentBrief, compose_briefing,
+)
+
+ctx = BriefingContext(
+    workspace="/repo",
+    context_docs=(ContextDoc(path="AGENTS.md", body="Use 2-space indent."),),
+    subagents=(SubagentBrief(name="reviewer", purpose="review diffs", when="a PR is ready"),),
+)
+system = compose_briefing(ctx)  # now also emits # Project context and # Delegates
+```
+
+## Slash Macros
+
+A macro is a named prompt body discovered from a `*.md` file. Invoking `/<name> rest-of-line` resolves the body against the line's arguments. Substitution is **one left-to-right scan**, never a sequence of regex passes: `scan_macro_body` walks the body once into a flat `MacroToken` stream, and `resolve_tokens` substitutes against a `MacroScope`. Expanded argument text is inserted verbatim and is **never re-scanned**, which avoids the classic multi-pass re-interpretation footgun; tokens are cacheable (scan once, resolve many).
+
+### Placeholder syntax
+
+The primary syntax is the indus double-curly `{{arg.…}}` form, so placeholders never collide with stray `$` in prose:
+
+| Placeholder | Resolves to |
+|-------------|-------------|
+| `{{arg.1}}`, `{{arg.2}}`, … | one positional argument (1-based) |
+| `{{arg.all}}` | every positional, re-joined with single spaces |
+| `{{arg.slice N L}}` | at most `L` positionals from the 1-based offset `N` |
+| `{{arg.slice N}}` | positionals from `N` onward (inclusive) |
+| `{{arg.rest N}}` | positionals from `N` onward; `N` defaults to `2` so `{{arg.rest}}` is "everything after `arg.1`" |
+| `{{{{` | a literal `{{` (escape) |
+
+A compatibility shim also recognizes the legacy `$1` / `$@` / `$ARGUMENTS` / `${@:N:L}` forms (`$$` escapes a literal `$`). When the shim sees a legacy form it fires the callback installed via `set_legacy_macro_reporter` so a host can surface a deprecation notice; the expansion still produces the expected text. A positional reference out of range resolves to empty; a slice clamps its 1-based start to the argument vector.
+
+### Loading and expansion
+
+`load_macros(dir, origin, label)` reads the direct `*.md` children of a directory (**non-recursive** — slash macros are flat files), parses each via `read_macro_file`, and dedupes by name (first wins). A missing directory yields `[]`; an unreadable file raises a `macro_invalid` `BriefingFault`. `read_macro_file` derives the macro name from the basename and the description from frontmatter (or a 72-char-capped first body line) using `split_frontmatter`.
+
+```python
+from induscode.briefing import load_macros, expand_invocation, apply_macros
+
+macros = load_macros("/repo/.pindusagi/commands", origin="project", label="project")
+expand_invocation("/deploy staging us-east", macros)
+# body "{{arg.1}} -> {{arg.2}}" yields "staging -> us-east"
+
+apply_macros("all: {{arg.all}} | rest: {{arg.rest}}", "a b c")
+# "all: a b c | rest: b c"
+```
+
+`expand_invocation` only rewrites lines that open with `/` and name a known macro (first match by name wins); ordinary user turns pass straight through. These macros become dynamic `/template` slash commands — see [slash commands](/python-cli/console/slash-commands).
+
+## Skill Cards
+
+A `SkillCard` is *documentation the model reads*, not a callable: a markdown file in the Agent-Skills format whose frontmatter names a skill and one-line-describes when it applies, with a body of on-demand instructions. The model decides from the `description` whether a task matches, then loads the file's `location` with the reader to read the full body. Paths a skill mentions are relative to that skill's own directory.
+
+### Discovery and validation
+
+`load_skill_cards(dir, origin)` walks one root; `gather_skill_cards(roots)` merges several `SkillRoot`s. The walk recognizes the format's two shapes with a generic recursive directory walk that prunes `node_modules`/`.git` and breaks symlink cycles by realpath:
+
+- At a *root* level, a loose `*.md` child is a single-file skill (its name is inferred from the directory and skips the directory-match check).
+- In any *subdirectory*, a `SKILL.md` is a packaged skill whose declared name **must match** its enclosing directory.
+
+Validation policy (the *format* is the shared public spec; the prose is the briefing's own):
+
+| Rule | Detail |
+|------|--------|
+| Name pattern | lowercase ASCII words joined by single hyphens (`[a-z0-9]+(?:-[a-z0-9]+)*`) |
+| Name length | ≤ `SKILL_NAME_LIMIT` (64) |
+| Description | required, ≤ `SKILL_DESCRIPTION_LIMIT` (1024) |
+| Frontmatter keys | must be in `KNOWN_FRONTMATTER_KEYS`; a stray key marks the file `invalid` (the format is closed, so a stray key is treated as a typo) |
+| Kebab → snake | `allowed-tools` and `disable-model-invocation` project to `allowed_tools` / `disable_model_invocation` |
+
+The walk **never raises**: an unreadable file becomes an `invalid` diagnostic. `gather_skill_cards` dedupes by name with first-name-wins and emits explicit `collision` diagnostics for later claimants; `load_skill_cards` does not dedupe across roots. `model_invocable_cards` drops cards flagged `disable-model-invocation` — those remain available as explicit `/skill:<name>` commands but never appear in the briefing's skill block.
+
+```python
+from induscode.briefing import SkillRoot, gather_skill_cards, model_invocable_cards
+
+load = gather_skill_cards([
+    SkillRoot(dir="/repo/.pindusagi/skills", origin="project"),   # project before user
+    SkillRoot(dir="/home/u/.pindusagi/skills", origin="user"),
+])
+visible = model_invocable_cards(load.cards)   # drops disable-model-invocation cards
+for d in load.diagnostics:
+    print(d.kind, d.location, d.detail)        # loaded / invalid / collision
+```
+
+## Faults
+
+`BriefingFault` is the closed, typed failure surface for this layer — always construct it via `briefing_fault(kind, message, cause=None)`. Its `kind` set is shared with [transcript-export](/python-cli/subsystems/transcript-export), which imports the fault from here so the closed set stays in one place.
+
+| Kind | Raised when |
+|------|-------------|
+| `skill_invalid` | a `SKILL.md` failed format validation |
+| `macro_invalid` | a macro file could not be read/parsed |
+| `publish` | building or writing the HTML transcript failed (transcript-export) |
+| `theme` | a theme color could not be parsed or derived (transcript-export) |
+
+## The Live Call Site
+
+The only place in the runtime that composes a briefing is `compose_system` in `induscode/boot/runners/session.py`. It is driven by every run mode — interactive, `-p` print, `--json` link — through the [boot](/python-cli/subsystems/boot) runners:
+
+```python
+from induscode.briefing import BriefingContext, compose_briefing
+
+def compose_system(tools: list[AgentTool], inv: Invocation) -> str:
+    base = (
+        _resolve_text(inv.system)
+        if inv.system is not None
+        else compose_briefing(BriefingContext(tools=tools))
+    )
+    if inv.append_system is not None:
+        return f"{base}\n\n{_resolve_text(inv.append_system)}"
+    return base
+```
+
+| Flag | Effect on the briefing |
+|------|------------------------|
+| `--system` | Replaces the built-in tool-aware briefing entirely with the supplied text/file. |
+| `--append-system` | Appends a trailing block after the base (composes with `--system`). |
+| neither | The tool-aware built-in briefing: role + tools + guidelines + footer. |
+
+Note the live `BriefingContext` is built from `tools` only. The `context_docs`, `skills`, and `subagents` fields — and thus the project-context, skills, and delegates sections — exist and are unit-testable but are **not yet populated by the runner**. `AGENTS.md`/`CLAUDE.md` discovery (`_CONTEXT_FILES = ("AGENTS.md", "CLAUDE.md")`, gathered by `_gather_context` in `console/startup.py` from the cwd and home `.pindusagi` brand profile dir, project before user) currently powers only the startup *display* panel, not the composed system prompt.
+
+## Framework Anchors
+
+The briefing builds directly on the `indusagi` framework and never re-declares its shapes:
+
+- `AgentState`, `AgentTool` ← [`indusagi.agent`](/python/facades/agent). `compose.py` consumes `AgentTool` purely by its `.name` and `.description`.
+- `TextContent`, `ImageContent` ← [`indusagi.ai`](/python/facades/ai).
+
+All four are re-exported through the `induscode.briefing` barrel so consumers can import them from one place, but their definitions live in the framework. The framework is a `pyproject` dependency (`indusagi[mcp,tui]`); see [models](/python-cli/configuration/models) for how the resolved tools reach the briefing.
+
+## Source Layout
+
+| Path | Holds |
+|------|-------|
+| `induscode/briefing/__init__.py` | The public barrel re-exporting the full briefing vocabulary. |
+| `induscode/briefing/contract.py` | The frozen type surface + framework anchors + `BriefingFault`. |
+| `induscode/briefing/compose.py` | `compose_briefing`, `BRIEFING_SECTIONS`, the section renderers, `TOOL_SUMMARIES`. |
+| `induscode/briefing/macros.py` | The single-pass scanner, resolver, loader, and `split_frontmatter`. |
+| `induscode/briefing/skills.py` | The `SKILL.md`/`*.md` walk, validation, and `gather_skill_cards`. |
+
+Neighboring consumers: `boot/runners/session.py` (the live `compose_system`), `console/startup.py` (context-doc / skill-root / macro-root discovery for the startup panel), `console/slash_commands/builtins.py` and `dynamic.py` (macros become `/template` commands, skill cards become `/skill:<name>` rows), and `transcript_export/contract.py` (imports the shared `BriefingFault`). The TS lineage additionally hosted the SGR machine and HTML transcript palette in the briefing contract; the Python port relocated those to `induscode.transcript_export`, leaving this package carrying only sections, macros, skills, `ContextDoc`, and `BriefingFault`. See the [parity reference](/python-cli/reference/parity) for the full rebuild mapping.

@@ -1,0 +1,450 @@
+# Window Budget
+
+> `window_budget` is `induscode`'s own context-window budgeting and compaction engine — a 1:1 port of the TypeScript `src/window-budget` subsystem onto the Rust gateway/runtime primitives. It measures transcript tokens, decides **when** and **where** to cut, folds the dropped head into one synthetic digest via an injectable `ModelInvoker`, and reclaims context with a free microcompact pre-pass and a recently-read-file rehydrate post-pass. The factory [`create_condenser`] yields a [`Condenser`] structurally identical to the [Conductor](/rust-cli/subsystems/conductor)'s `CondenseFn`, so it drops into the auto-compaction seam with no adapter — and runs fully network-free by default.
+
+A long-running coding session accrues turns — user prompts, assistant replies, tool calls and their results — until the transcript approaches the model's context window. `window_budget` keeps the session usable by answering questions in sequence: **when** are we over budget (the gate), **where** do we cut (the slice planner), **how** do we compress the dropped portion (model-driven summarization), and **what** can be reclaimed cheaply (microcompact + rehydrate). The older head is condensed into a single structured digest while a verbatim tail of recent turns is preserved.
+
+It is built **on top of** the [Rust indusagi framework](/rust) but is deliberately a *separate* engine from the framework's own [`runtime`](/rust/subsystems/runtime) memory compactor — different message types, thresholds, prompts, and digest headers (see [Two Compaction Engines](#two-compaction-engines)). The crate ships two console binaries, `indusr` (primary) and `indusagir`.
+
+## Table of Contents
+
+- [The Pipeline](#the-pipeline)
+- [Public Surface](#public-surface)
+- [The Message Enum (AgentMessage analog)](#the-message-enum-agentmessage-analog)
+- [The Contract Layer](#the-contract-layer)
+- [Budget Math: Estimate, Gate, Slice](#budget-math-estimate-gate-slice)
+- [The Summarize Path](#the-summarize-path)
+- [The Condenser Factory](#the-condenser-factory)
+- [Microcompact: the Free Pre-Pass](#microcompact-the-free-pre-pass)
+- [Rehydrate: the Read-Restore Post-Pass](#rehydrate-the-read-restore-post-pass)
+- [How the Conductor Wires It](#how-the-conductor-wires-it)
+- [Two Compaction Engines](#two-compaction-engines)
+- [Examples](#examples)
+- [Source Layout](#source-layout)
+
+## The Pipeline
+
+The bare [`create_condenser`] factory ties three pure pieces into one function; the full *runner* pipeline (in the conductor glue) wraps two more passes around them:
+
+| Stage | Question | Entry point | Where it runs |
+|-------|----------|-------------|---------------|
+| **Microcompact** | What stale tool output can we blank for free? | `clear_stale_tool_results(messages, keep_recent)` | runner only (pre-pass) |
+| **Gate** | *When* are we over budget? | `is_over_budget(messages, card, policy)` | factory + runner |
+| **Slice** | *Where* do we cut? | `plan_slice(messages, policy)` → `CondensePlan` | factory + runner |
+| **Condense** | *How* do we compress the head? | `summarize(dropped, deps)` → `Summary` | factory + runner |
+| **Rehydrate** | What freshly-read files should we restore? | `rehydrate_recent_reads(dropped, kept, opts)` | runner only (post-pass) |
+
+[`create_condenser`] stitches gate + slice + condense into a single boxed async [`Condenser`]. On any no-op path it returns the **input unchanged** (the identity the conductor expects); otherwise it returns `[summary.message, ...kept]`, a strictly smaller transcript. The runner-level pipeline ([`condense_transcript`] in the conductor glue) additionally microcompacts before slicing, honors a `force` flag for manual `/compact`, and rehydrates dropped reads under a strict-shrink count guard.
+
+## Public Surface
+
+Everything below is re-exported from the `crate::window_budget` barrel (`mod.rs`).
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `Message`, `Content` | enums | `message.rs` | The rich app-level `AgentMessage` analog (seven variants) the whole crate dispatches on. |
+| `BudgetPolicy` | struct | `contract.rs` | Config-sourced thresholds: `trigger_ratio`, `keep_recent` (tokens), `reserve_tokens`. |
+| `TokenEstimate` | struct | `contract.rs` | `context_tokens` / `context_window` / `anchored` (declared-but-unused by the gate). |
+| `CondensePlan` | struct | `contract.rs` | Output of `plan_slice`: `cut` index, `kept` tail, `dropped` head. |
+| `CondenseScope` | enum | `contract.rs` | `Session` (default) / `Branch` — collapses branch-archival into one path. |
+| `Summary` | struct | `contract.rs` | Synthetic digest `message` + `covered_count`. |
+| `estimate_tokens` | fn | `budget/estimate.rs` | Heuristic total token cost of a transcript (`0` for empty). |
+| `estimate_message_tokens` | fn | `budget/estimate.rs` | Per-message token estimate (conservative, biased high). |
+| `prefix_tokens` | fn | `budget/estimate.rs` | Forward cumulative-token array of length `n+1`. |
+| `is_over_budget` | fn | `budget/gate.rs` | `true` when `estimate_tokens` strictly exceeds `budget_limit`. |
+| `budget_limit` | fn | `budget/gate.rs` | `max(0, context_window - reserve_tokens) * trigger_ratio`. |
+| `plan_slice` | fn | `budget/slice.rs` | Forward prefix-sum + binary-search cut planner → `CondensePlan`. |
+| `last_user_turn_start` | fn | `budget/slice.rs` | Index of the final `User` turn (the `force` cut boundary). |
+| `summarize` | async fn | `summarize/condense.rs` | The single condensing primitive — one path for both scopes. |
+| `condense_scope` | async fn | `summarize/condense.rs` | Branch-archival entrypoint (pins `Branch`). |
+| `build_summary_prompt` | fn | `summarize/prompt.rs` | Assembles the user-turn prompt (framing + scrollback + template). |
+| `flatten_transcript` | fn | `summarize/prompt.rs` | Renders messages into `» role:` lines. |
+| `CONDENSER_BRIEF` | const | `summarize/prompt.rs` | System brief framing the model as a transcript recorder. |
+| `create_condenser` | fn | `condenser.rs` | Factory tying gate + slice + summarize into one async `Condenser`. |
+| `condense` | async fn | `condenser.rs` | Session-scope summarization wrapper (pins `Session`). |
+| `Condenser`, `CondenserDeps` | type / struct | `condenser.rs` | The boxed async condenser and its (all-optional) deps. |
+| `AUTO_CONDENSE_POLICY` | const | `condenser.rs` | `BudgetPolicy { trigger_ratio: 0.75, keep_recent: 6000, reserve_tokens: Some(2048) }`. |
+| `clear_stale_tool_results` | fn | `microcompact.rs` | Free pre-pass: blank stale compactable tool-result bodies. |
+| `compactable_tool_names` | fn | `microcompact.rs` | The `&'static HashSet<&'static str>` of blank-safe tools. |
+| `CLEARED_TOOL_RESULT`, `DEFAULT_KEEP_RECENT` | consts | `microcompact.rs` | Cleared-body sentinel + the `6` keep-recent default. |
+| `rehydrate_recent_reads` | fn | `rehydrate.rs` | Post-pass: re-attach the freshest dropped `read` results. |
+| `RehydrateOpts`, `RESTORED_FILE_PREFIX` | struct / const | `rehydrate.rs` | Rehydrate tunables + the restored-message prefix. |
+
+## The Message Enum (AgentMessage analog)
+
+`message.rs` owns the rich `Message` enum — the `AgentMessage` analog the whole crate (and the conductor) dispatch on. The framework only ships the gateway-neutral 3-role `Turn` (`indusagi::llmgateway::contract::Turn`), whose tool results are *nested* as a `Block::ToolResult` inside a `Turn::Tool`. The agent's transcript is richer: it has **seven variants**, and decisively `ToolResult` and `BashExecution` are **top-level messages, not nested blocks** — the single fact that forces this subsystem to define its own enum rather than reuse `Turn`.
+
+```rust
+pub enum Content {
+    Text(String),
+    Blocks(Vec<Block>),
+}
+
+pub enum Message {
+    User { content: Content, timestamp: i64 },
+    Assistant { content: Vec<Block>, error_message: Option<String> },
+    ToolResult { tool_call_id: String, tool_name: String, content: Vec<Block>, is_error: bool },
+    BashExecution { command: String, output: String, exit_code: Option<i32> },
+    Custom { custom_type: String, content: Content },
+    BranchSummary { summary: String, from_id: String },
+    CompactionSummary { summary: String, tokens_before: u64 },
+}
+```
+
+The enum is owned **here** and re-exported from the crate root (`pub use message::{Content, Message}`), so both downstream consumers reach it without a cycle: `window_budget` owns it, and the conductor (which depends *down* onto this crate) sees it as `crate::window_budget::Message`. `Block` is reused from the gateway (`indusagi::llmgateway::contract::Block`) for sub-content, so the estimator, flattener, microcompact, and rehydrate all match on the same block union the model wire uses.
+
+`BranchSummary` and `CompactionSummary` are kept **distinct** (not folded into one) because the flattener's `digest:` case re-reads both on an iterative re-condense pass; collapsing them would lose the marker on a second pass.
+
+## The Contract Layer
+
+`contract.rs` declares **only value shapes** — no behavior, no I/O, no prompt strings. The two function-type seams (the model completer and the condenser factory output) live in `summarize` / `condenser` where their `async` and `Arc` machinery is local.
+
+| Name | Kind | Purpose |
+|------|------|---------|
+| `BudgetPolicy` | `Clone, Copy, Debug, PartialEq` struct | Config-sourced thresholds: `trigger_ratio: f64` (fraction of the window in `(0, 1]`), `keep_recent: u64` (tokens of recent tail to keep verbatim), `reserve_tokens: Option<u64>` (optional headroom). No magic literals baked in. |
+| `TokenEstimate` | `Clone, Copy` struct | `context_tokens: u64`, `context_window: u64`, `anchored: bool` (`true` when based on a real provider `Usage` figure). |
+| `CondensePlan` | `Clone, Debug, PartialEq` struct | Output of `plan_slice`: `cut: usize`, `kept: Vec<Message>` (`messages[cut..]`), `dropped: Vec<Message>` (`messages[..cut]`). `cut == 0` means nothing condensable. |
+| `Summary` | `Clone, Debug, PartialEq` struct | Structured result: a single synthetic `message: Message` plus `covered_count: usize`. |
+| `CondenseScope` | `Clone, Copy, Default` enum | `Session` (`#[default]`, active in-place condense) / `Branch` (abandoned-branch archival, no verbatim tail). |
+
+### The `anchored` field is parity-only
+
+`TokenEstimate::anchored` marks whether `context_tokens` is anchored on a real provider `Usage` figure versus a pure heuristic, but it is **declared for parity and unused by the gate today** — `is_over_budget` / `budget_limit` consult only the heuristic. The conductor *tracks* real usage (`CondenseOpts.context_tokens`, the footer's `ctx`) but does not feed it into the gate. The faithful heuristic-only gate ships for v0.2.
+
+### Composed, never re-declared
+
+`contract.rs` composes the framework vocabulary rather than re-declaring it: `Message` from `crate::window_budget::message`, and `Block` / `Turn` / `ModelCard` / `Conversation` / `Emission` / `StreamOptions` from `indusagi::llmgateway::contract`. The completer seam chooses the framework's object-safe [`ModelInvoker`](/rust/subsystems/runtime) trait (over a bare `Fn`) for parity with the framework's own `memory::compactor::summarize`.
+
+## Budget Math: Estimate, Gate, Slice
+
+The `budget/` subpackage is **pure arithmetic with no I/O**.
+
+### Estimate (`budget/estimate.rs`)
+
+There is no tokenizer call. `estimate_message_tokens` walks each message's serialized payload and applies a transparent weighting model:
+
+```text
+cost = ceil(serialized_chars / CHARS_PER_TOKEN) + framing + images * IMAGE_TOKENS
+```
+
+The module's own tunables — deliberately distinct from the framework's `chars/4` fingerprint — are:
+
+| Constant | Value | Meaning |
+|----------|-------|---------|
+| `CHARS_PER_TOKEN` | `3.6` | Average serialized chars per token (conservative, skews high). |
+| `IMAGE_TOKENS` | `1024` | Flat per-image cost (resolution-agnostic; the base64 `data_base64` is **not** measured). |
+| `MESSAGE_FRAMING_TOKENS` | `4` | Per-message role/turn framing. |
+| `BLOCK_FRAMING_TOKENS` | `2` | Per structured block. |
+| `TOOLCALL_ENVELOPE_TOKENS` | `6` | Per tool call/result envelope (id + name framing). |
+
+`weigh_block` accounts each gateway `Block` variant: `Text`/`Thinking` bill their inner text length, `Image` bills flat (`1` image, `0` chars — the base64 `data_base64` field is **not** measured), `ToolCall` bills `name.chars().count() + safe_stringify(input).chars().count()` (a JSON `null` input contributes nothing, the `undefined` analog), and any other block (`ToolResult` / `Command`) falls through to a generic serialized-form measurement. Char counting uses `.chars().count()` (Unicode scalar values); `safe_stringify` is the never-panic `serde_json::to_string` analog.
+
+`weigh_message` dispatches all seven `Message` variants: `User`/`Assistant`/`ToolResult` accumulate per-block framing (the assistant tool-call and the tool-result both add the `TOOLCALL_ENVELOPE_TOKENS` surcharge), and the four custom variants (`BashExecution`, `Custom`, `BranchSummary`, `CompactionSummary`) weigh their string-bearing fields plus one block of framing.
+
+The estimate is **conservative** — rounding up and adding framing biases it high so the gate fires a little early rather than overflowing. `estimate_tokens` sums every message (an empty transcript estimates to exactly `0`), and `prefix_tokens` builds the forward cumulative-token array (length `n+1`, where `result[i]` is the tokens of `messages[0..i)`, `result[0] == 0`) that `plan_slice` binary-searches. The array is monotonically non-decreasing by construction — the invariant the binary search depends on.
+
+### Gate (`budget/gate.rs`)
+
+```rust
+pub fn budget_limit(card: &ModelCard, policy: &BudgetPolicy) -> f64 {
+    let reserve = policy.reserve_tokens.unwrap_or(0);
+    let usable = card.context_window.saturating_sub(reserve);
+    usable as f64 * policy.trigger_ratio
+}
+
+pub fn is_over_budget(messages: &[Message], card: &ModelCard, policy: &BudgetPolicy) -> bool {
+    estimate_tokens(messages) as f64 > budget_limit(card, policy)
+}
+```
+
+Optional fixed headroom is carved off the window first (`saturating_sub`, so a reserve larger than the window can never yield a negative limit), then the remaining capacity is scaled by the window-relative `trigger_ratio`. The gate reads `ModelCard.context_window` from the [llm-gateway](/rust/subsystems/llm-gateway) and fires once the estimate **strictly** exceeds the limit.
+
+### Slice (`budget/slice.rs`)
+
+`plan_slice` partitions the transcript into a `dropped` prefix and a `kept` suffix via **forward prefix-sum + binary search** (not a backward accumulate-and-snap):
+
+1. Build the cumulative-token array; the total is `prefix[n]`.
+2. We want the tail to hold ~`keep_recent` tokens, so binary-search the lower bound of the threshold `total - keep_recent` over the monotonic `prefix` array — O(log n) (`lower_bound`).
+3. **Snap the cut forward** past any leading `ToolResult` so the kept tail never begins with one (`snap_forward`).
+
+**Tool-pair safety**: a `ToolResult` must stay glued to the assistant turn that issued its `tool_call`, so the kept tail may never begin with a tool result. `is_legal_tail_start` returns `false` only for `Message::ToolResult`; every other variant (including the agent custom kinds) is a legal tail-start. If the whole transcript already fits in `keep_recent`, or snapping forward consumes everything (`cut >= n`), `cut` is `0` (nothing condensable, everything kept).
+
+`last_user_turn_start(messages)` is the **force-path** boundary: `rposition` of the last `Message::User`, or `None` when the transcript has no user turn. `/compact` folds everything *before* this index into the digest and keeps the final user turn (plus its trailing assistant/tool turns) verbatim, so it always reclaims context on a multi-turn session even when the token tail would leave it untouched.
+
+## The Summarize Path
+
+The `summarize/` subpackage does the model call. `summarize` is the **single condensing primitive** — one path for both `Session` and `Branch` scopes; the scope flag only changes the prompt framing line and the digest header, never the machinery.
+
+### Prompt assembly (`summarize/prompt.rs`)
+
+`build_summary_prompt(messages, scope, prior)` produces one user-turn string, joining blocks with `\n\n`:
+
+- A scope **framing line** (active-session checkpoint vs abandoned-branch archive).
+- An optional `<carried-digest>…</carried-digest>` block (the iterative-refresh / branch carry-in path), emitted only when `prior` is non-blank.
+- A `<scrollback>…</scrollback>` block holding the flattened transcript.
+- The fixed `SECTION_TEMPLATE`: `# Objective`, `# Guardrails`, `# Status (Shipped / Active / Stuck)`, `# Rationale`, `# Plan`, `# Carryover`.
+
+`flatten_transcript` renders each message into `» role:` lines (`TURN_MARK = '»'`): `» you`, `» agent`, `» agent.plan` (thinking), `» agent.call <name>: <json>`, `» tool (<name>)` / `» tool!err (<name>)`, `» shell$ <cmd> [exit N]` (bash executions), `» note (<type>)` (custom), and `» digest` (branch/compaction summaries). A `tidy` helper normalizes CRLF and strips trailing horizontal whitespace before newlines; messages that render empty are skipped.
+
+`CONDENSER_BRIEF` is the system prompt — it frames the model as a *transcript recorder*, not a chat continuation:
+
+```rust
+pub const CONDENSER_BRIEF: &str = "You are a transcript recorder for a long-running coding session.\n\
+The text you receive is archival data, not a live chat — do NOT reply to it,\n\
+continue it, run tools, or ask questions. Your sole job is to distill it into\n\
+a compact, faithful digest under the exact headings requested below.\n\
+...";
+```
+
+### The summarize core (`summarize/condense.rs`)
+
+```rust
+pub async fn summarize(messages: &[Message], deps: SummarizeDeps) -> Summary
+pub async fn condense_scope(messages: &[Message], mut deps: SummarizeDeps) -> Summary
+```
+
+`summarize` builds a `Conversation { system: Some(CONDENSER_BRIEF.to_string()), turns: vec![Turn::User { blocks: vec![Block::Text { text: prompt }] }], tools: None }` (the gateway `Turn::User` carries `blocks: Vec<Block>`, not a `prompt` field — the prompt string is wrapped in a single `Block::Text`), runs it through the injectable completer once with `StreamOptions { thinking: Some(ThinkingLevel::High), max_output_tokens, cancel, .. }` (the recorder reads the whole slice), folds the streamed text via `collect_text`, and wraps the digest as a synthetic `Message::User` stamped with a scope header. It returns `Summary { message, covered_count }`.
+
+| Scope | Digest header |
+|-------|---------------|
+| `Session` | `[session digest — older turns condensed]` (`DIGEST_HEADER`) |
+| `Branch` | `[branch digest — archived from a path not taken]` (`BRANCH_HEADER`) |
+
+`SummarizeDeps` carries `invoke: Option<Arc<dyn ModelInvoker>>`, `scope: CondenseScope` (default `Session`), `prior_digest: Option<String>`, `cancel: Option<CancellationToken>` (forwarded onto `StreamOptions.cancel`), and `max_tokens: Option<u64>` (→ `StreamOptions.max_output_tokens`). It derives `Default`.
+
+`collect_text` mirrors the framework `memory::compactor::collectText`: prefer the terminal `Emission::Done` reply's concatenated `Block::Text` blocks, else the accumulated `Emission::Text` deltas; a terminal `Emission::Error` yields `None`.
+
+**Network-free and never-raising**: with no `invoke` bound, `summarize` emits a deterministic `local_fallback_digest` (a `# Carryover` section recording the count of elided messages, plus any carried prior digest) rather than guessing a model. An empty model reply, a stream error, or a cancelled stream all degrade to the same local digest — so a `Summary` is **always** produced and `summarize` never throws. `condense_scope` simply pins `CondenseScope::Branch` and delegates.
+
+## The Condenser Factory
+
+```rust
+pub type Condenser = Box<dyn Fn(Vec<Message>) -> BoxFuture<'static, Vec<Message>> + Send + Sync>;
+
+pub fn create_condenser(deps: CondenserDeps) -> Condenser
+pub async fn condense(messages: &[Message], mut deps: SummarizeDeps) -> Summary
+```
+
+`create_condenser(deps)` returns a boxed async `Condenser` — structurally the conductor's `CondenseFn` — that ties the pipeline together:
+
+```rust
+Box::new(move |messages: Vec<Message>| {
+    Box::pin(async move {
+        let Some(card) = card.as_ref() else { return messages; };          // no window → identity
+        if !is_over_budget(&messages, card, &policy) { return messages; }   // under budget → identity
+        let plan = plan_slice(&messages, &policy);
+        if plan.cut == 0 || plan.dropped.is_empty() { return messages; }    // nothing condensable → identity
+        let summary = condense(&plan.dropped, SummarizeDeps {
+            invoke, scope: CondenseScope::Session, prior_digest: None, cancel: None, max_tokens: None,
+        }).await;
+        let mut out = Vec::with_capacity(1 + plan.kept.len());
+        out.push(summary.message);
+        out.extend(plan.kept);
+        out
+    })
+})
+```
+
+`CondenserDeps` is all-optional — `invoke: Option<Arc<dyn ModelInvoker>>` (`None` ⇒ network-free local digest), `card: Option<ModelCard>` (`None` ⇒ no window ⇒ identity), `policy: Option<BudgetPolicy>` (default `AUTO_CONDENSE_POLICY`) — so `create_condenser(CondenserDeps::default())` yields a working, network-free no-op condenser. On the three no-op paths it returns the input unchanged; otherwise `[summary.message, ...plan.kept]`. `condense` is exported alongside the factory so callers can summarize a slice directly: it pins `scope = Session`. **Microcompact and rehydrate are deliberately NOT called here** — the runner applies them, matching the TS `createCondenser`.
+
+```rust
+pub const AUTO_CONDENSE_POLICY: BudgetPolicy = BudgetPolicy {
+    trigger_ratio: 0.75,   // condense once ~¾ of the window is used
+    keep_recent: 6000,     // keep ~the last 6k TOKENS of turns verbatim
+    reserve_tokens: Some(2048),
+};
+```
+
+This is the **single** policy the gate and the slicer share, so the trigger and the cut never disagree.
+
+## Microcompact: the Free Pre-Pass
+
+`microcompact.rs` blanks stale tool-result bodies for free (no model call) *before* slicing, so the head the summarizer folds is lighter.
+
+```rust
+pub fn clear_stale_tool_results(messages: Vec<Message>, keep_recent: usize) -> Option<Vec<Message>>
+pub fn compactable_tool_names() -> &'static HashSet<&'static str>
+pub const CLEARED_TOOL_RESULT: &str = "[Old tool result content cleared]";
+pub const DEFAULT_KEEP_RECENT: usize = 6;
+```
+
+`clear_stale_tool_results` walks newest→oldest, keeps the last `keep_recent` (floored at `1`) compactable results verbatim, and replaces every older non-cleared one's `content` with a single `CLEARED_TOOL_RESULT` text block. It gates on the **owning assistant `tool_call` id + name** — `collect_compactable_tool_ids` collects the `tool_call_id`s whose owning call named a compactable tool, and a result whose call is absent is treated as non-compactable. Non-tool messages, control-tool results (e.g. `todo`/`memory`), and already-cleared results are left exactly as they were.
+
+The compactable set is read-style and edit tools whose output is reconstructable: `read`, `grep`, `find`, `ls`, `glob`, `bash`, `websearch`, `webfetch`, `edit`, `write`.
+
+**Identity no-op**: TS returns the same array reference on a no-op; Rust has no cheap ref-eq on owned `Vec`s, so the function returns `Option<Vec<Message>>` — `None` means "nothing cleared; reuse your input", and the runner does `clear_stale_tool_results(msgs.clone(), 6).unwrap_or(msgs)`.
+
+## Rehydrate: the Read-Restore Post-Pass
+
+`rehydrate.rs` re-attaches recently-read files dropped by a condense, as synthetic user messages, so the model does not lose context for files it just read.
+
+```rust
+pub fn rehydrate_recent_reads(dropped: &[Message], kept: &[Message], opts: &RehydrateOpts) -> Vec<Message>
+pub const RESTORED_FILE_PREFIX: &str = "[Restored file after compaction]";
+
+pub struct RehydrateOpts {
+    pub max_files: usize,        // default 5
+    pub token_budget: u64,       // default 8000
+    pub read_tool_name: String,  // default "read"
+}
+```
+
+It scans `dropped` for `read` calls + their result bodies (`collect_dropped_reads`, pairing call → result by `tool_call_id`, skipping error/empty bodies, keeping the freshest body when the same path is read twice), dedups against paths still visible in `kept` (`collect_visible_read_paths`), sorts survivors most-recent-first, takes up to `max_files`, and emits each as a `RESTORED_FILE_PREFIX`-stamped `Message::User` — stopping once the running token estimate (via `estimate_message_tokens`) would exceed `token_budget`, but **always restoring at least the single freshest** even if it alone blows the budget. The restored messages are returned **oldest-first** so they read naturally when spliced after the summary. `[]` on nothing to restore.
+
+## How the Conductor Wires It
+
+The real consumer is the [Conductor](/rust-cli/subsystems/conductor)'s `CondenseFn` seam (`conductor/contract.rs`):
+
+```rust
+pub struct CondenseOpts {
+    pub force: bool,            // true for manual /compact (cut at last user turn)
+    pub model: Option<String>,
+    pub context_tokens: u64,    // live occupancy at gate time
+}
+
+#[async_trait::async_trait]
+pub trait CondenseFn: Send + Sync {
+    async fn condense(&self, messages: Vec<Turn>, opts: CondenseOpts) -> Vec<Turn>;
+}
+```
+
+The default binding is `IdentityCondense` (returns its input unchanged) so a conductor built without a window-budget dep never condenses. When an engine is wired, the conductor binds `WindowBudgetCondense` (`conductor/session_ops.rs`), which adapts the conductor's framework-`Turn` message model to the rich `Message`, runs the **full** runner pipeline, and bridges the digested result back to `Vec<Turn>`. The bridge functions are `turn_to_message` / `message_to_turn` / `content_to_blocks` — a framework `Turn::Tool` maps to a `Message::User` carrying the tool-result blocks, because the window-budget estimator only needs the textual weight.
+
+The runner pipeline is `condense_transcript(deps, messages, opts)` — the port of the TS `condenseTranscript`, distinct from the bare `create_condenser` (which is slice+summary only and never microcompacts, rehydrates, or honors `force`):
+
+```rust
+async fn condense_transcript(deps: &CondenserDeps, messages: Vec<Message>, opts: &CondenseOpts) -> Vec<Message> {
+    // 1. Microcompact first (None ⇒ reuse input).
+    let cleared = clear_stale_tool_results(messages.clone(), DEFAULT_KEEP_RECENT).unwrap_or(messages.clone());
+    let policy = deps.policy.unwrap_or(AUTO_CONDENSE_POLICY);
+
+    // 2. Slice: force ⇒ cut at last user turn; auto ⇒ token tail.
+    let (dropped, kept) = if opts.force {
+        match last_user_turn_start(&cleared) {
+            Some(cut) if cut > 0 => (cleared[..cut].to_vec(), cleared[cut..].to_vec()),
+            _ => return messages,                       // 0/1 turn → nothing to fold
+        }
+    } else {
+        let plan = plan_slice(&cleared, &policy);
+        if plan.cut == 0 || plan.dropped.is_empty() { return messages; }
+        (plan.dropped, plan.kept)
+    };
+
+    // 3. Summarize the dropped head (deterministic local digest with no completer).
+    let summary = crate::window_budget::condense(&dropped, SummarizeDeps {
+        invoke: deps.invoke.clone(), scope: CondenseScope::Session, prior_digest: None, cancel: None, max_tokens: None,
+    }).await;
+
+    // 4. Rehydrate under the strict-shrink count guard.
+    let restored = restore_under_count_guard(&dropped, &kept);
+
+    let mut out = Vec::with_capacity(1 + restored.len() + kept.len());
+    out.push(summary.message);
+    out.extend(restored);
+    out.extend(kept);
+    out
+}
+```
+
+**Strict-shrink contract**: the condense replaces `dropped.len()` messages with one digest; rehydration adds `restored.len()` back. The conductor rebinds only when `after.len() < before.len()`, i.e. `1 + restored.len() < dropped.len()`. So `restore_under_count_guard` caps the restored count at `dropped.len() - 2` (`max_files = headroom.min(5)`), guaranteeing the net transcript is strictly shorter and the compaction actually lands. The `WindowBudgetCondense::condense` wrapper short-circuits to the verbatim input `Turn`s when the pipeline returns an unchanged length, keeping `/compact` idempotent on an already-tight window.
+
+Both folds keep recent turns verbatim; the difference is *how much*. The **auto** path is budget-gated — it folds only the head beyond the recent ~6k-token tail. The **manual** `/compact` force path folds everything before the last user turn, keeping only that final turn — always reclaiming context on a multi-turn session while cutting at a user-message boundary keeps tool call/result pairs intact. Because the summarizer emits a deterministic local digest with no completer bound, compaction never depends on a provider key or a round-trip. See [Boot](/rust-cli/subsystems/boot) for where the conductor's deps are assembled.
+
+## Two Compaction Engines
+
+`window_budget` is the app's **conductor `CondenseFn`** seam. The framework ships its own compactor in [`runtime`](/rust/subsystems/runtime) `memory` (`should_compact` / `find_cut_point` / `summarize` / `compact`), but it is a **different engine** and is never wired into the conductor. Keep them distinct:
+
+| | `window_budget` (this crate) | `runtime` memory (framework) |
+|--|------------------------------|-------------------------------|
+| message type | `Message` (the rich 7-variant `AgentMessage` analog) | gateway `Turn` |
+| `keep_recent` | **tokens** (default `6000`) | **turns** (default `8`) |
+| trigger | ratio **0.75** of the window | ratio **0.8** |
+| completer | injectable `ModelInvoker` (shared trait) | `ModelInvoker` |
+| digest header | `[session digest …]` / `[branch digest …]` | `[condensed earlier context]` |
+
+The `keep_recent` unit warning is baked into the `BudgetPolicy` doc comment itself: it is **tokens**, not the turns of `runtime`'s `CompactionPolicy`. The policies, prompts, and digest headers differ, and tests pin this crate's headers. Do not substitute one for the other.
+
+## Examples
+
+### Build a network-free condenser (identity no-op without a card)
+
+```rust
+use induscode::window_budget::{create_condenser, CondenserDeps};
+
+let condenser = create_condenser(CondenserDeps::default());  // no card bound
+let out = condenser(messages.clone()).await;
+assert_eq!(out, messages);   // identity: nothing to do without a window to measure
+```
+
+### Drive the summary path with a scripted ModelInvoker (no network)
+
+```rust
+use std::sync::Arc;
+use induscode::window_budget::{create_condenser, CondenserDeps, AUTO_CONDENSE_POLICY};
+
+let condenser = create_condenser(CondenserDeps {
+    invoke: Some(scripted_model),          // Arc<dyn ModelInvoker>
+    card: Some(my_card),                   // ModelCard with a real context_window
+    policy: Some(AUTO_CONDENSE_POLICY),
+});
+let rebuilt = condenser(long_transcript).await;   // -> [digest_message, ...recent_tail]
+```
+
+### Use the budget math directly
+
+```rust
+use induscode::window_budget::{estimate_tokens, is_over_budget, budget_limit, plan_slice, AUTO_CONDENSE_POLICY};
+
+let total = estimate_tokens(&messages);                    // heuristic total
+let limit = budget_limit(&card, &AUTO_CONDENSE_POLICY);    // (context_window - 2048) * 0.75
+if is_over_budget(&messages, &card, &AUTO_CONDENSE_POLICY) {
+    let plan = plan_slice(&messages, &AUTO_CONDENSE_POLICY);   // plan.cut / plan.kept / plan.dropped
+}
+```
+
+### Branch-archival via the scope wrapper
+
+```rust
+use induscode::window_budget::{condense_scope, SummarizeDeps};
+
+let summary = condense_scope(&abandoned_branch, SummarizeDeps {
+    invoke: Some(my_model),
+    ..SummarizeDeps::default()
+}).await;
+// summary.message text starts with "[branch digest — archived from a path not taken]"
+```
+
+### Microcompact + rehydrate (the runner pre/post passes)
+
+```rust
+use induscode::window_budget::{clear_stale_tool_results, rehydrate_recent_reads, RehydrateOpts, DEFAULT_KEEP_RECENT};
+
+// Pre-pass: blank stale tool-result bodies (None ⇒ reuse the input).
+let lighter = clear_stale_tool_results(messages.clone(), DEFAULT_KEEP_RECENT).unwrap_or(messages);
+
+// Post-pass: re-attach the freshest dropped reads not still visible in `kept`.
+let restored = rehydrate_recent_reads(&dropped, &kept, &RehydrateOpts::default());
+```
+
+## Source Layout
+
+```text
+window_budget/
+├── mod.rs               # public barrel + the re-exported Message/Content seam
+├── message.rs           # Message enum (AgentMessage analog) + Content
+├── contract.rs          # frozen value shapes (no behavior): BudgetPolicy, CondensePlan, …
+├── condenser.rs         # create_condenser, condense, Condenser, CondenserDeps, AUTO_CONDENSE_POLICY
+├── microcompact.rs      # clear_stale_tool_results (free pre-pass)
+├── rehydrate.rs         # rehydrate_recent_reads (read-restore post-pass)
+├── budget/              # pure budget arithmetic (no I/O)
+│   ├── mod.rs
+│   ├── estimate.rs      # token heuristic + forward prefix-sum
+│   ├── gate.rs          # is_over_budget / budget_limit
+│   └── slice.rs         # plan_slice + last_user_turn_start
+└── summarize/           # model-driven summarization
+    ├── mod.rs
+    ├── prompt.rs        # CONDENSER_BRIEF, flatten_transcript, build_summary_prompt, SECTION_TEMPLATE
+    └── condense.rs      # summarize core, SummarizeDeps, condense_scope, local fallback digest
+```
+
+The produced `Condenser` and the runner pipeline are consumed by the [Conductor](/rust-cli/subsystems/conductor)'s `CondenseFn` seam and assembled in [Boot](/rust-cli/subsystems/boot); the messages it operates on bridge to and from the gateway `Turn`, and the default completer is the framework's [`ModelInvoker`](/rust/subsystems/runtime) over the [llm-gateway](/rust/subsystems/llm-gateway). For the TypeScript and Python lineage of this engine, see the [TS edition](/cli) and the [Python Window Budget](/python-cli/subsystems/window-budget).

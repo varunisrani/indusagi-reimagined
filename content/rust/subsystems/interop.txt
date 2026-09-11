@@ -1,0 +1,576 @@
+# Interop (MCP)
+
+> `indusagi::interop` is the bidirectional Model Context Protocol bridge of the
+> Rust edition, built on the official Rust MCP SDK (`rmcp`). As a *client* it
+> dials external MCP servers, normalizes their tools, and grafts them into the
+> capabilities kernel under collision-free `server__tool` names; as a *provider
+> host* it stands up an MCP server over the agent's own `ToolBox` so outside
+> clients can enumerate and call our tools. Reached as `indusagi::interop::*`
+> (one barrel re-exporting the whole `protocol_bridge` module), gated behind the
+> `mcp` cargo feature.
+
+The interop layer is indusagi's seam to the wider MCP ecosystem, and it works in
+both directions over the same `ToolRegistry` / `ToolBox` abstractions the
+[Capabilities](/rust/subsystems/capabilities) kernel uses for local tools. As a
+client it spawns or connects to external MCP servers (a stdio subprocess or a
+streamable-HTTP endpoint), enumerates their tools, normalizes their untrusted
+JSON schemas, and registers each remote tool as a kernel tool the model can call
+like any built-in. As a provider host it stands up an `rmcp` server that answers
+`tools/list` and `tools/call` against a [Runtime](/rust/subsystems/runtime)
+`ToolBox`. Conceptually it is the inverse of the kernel: capabilities defines
+local tools; interop grafts remote tools in and publishes local tools out. The
+module is the 100%-Rust port of the TypeScript `interop/` subsystem; parity
+behaviour (the `__` qualifier, the byte-for-byte schema normalizer, the
+six-variant fault model, the endpoint lifecycle machine, pre-flight-only invoke
+cancellation) is preserved deliberately and pinned by tests.
+
+## Table of Contents
+
+- [Cargo feature and dependency](#cargo-feature-and-dependency)
+- [Public surface](#public-surface)
+- [Module map](#module-map)
+- [Key concepts](#key-concepts)
+- [The bridge contract](#the-bridge-contract)
+- [Mounting external servers](#mounting-external-servers)
+- [Driving a single endpoint](#driving-a-single-endpoint)
+- [The server fleet](#the-server-fleet)
+- [The provider host](#the-provider-host)
+- [Schema normalization](#schema-normalization)
+- [The fault model](#the-fault-model)
+- [Design invariants](#design-invariants)
+- [Relationship to neighbors](#relationship-to-neighbors)
+
+## Cargo feature and dependency
+
+The entire module is gated behind the `mcp` cargo feature (on by `default`). The
+feature pulls in `rmcp` (the official Rust MCP SDK) and the `http` header-type
+crate its transport config uses:
+
+```toml
+[features]
+default = ["rustls", "mcp", "tui"]
+
+# `mcp` — the MCP protocol bridge surface. Gates the `interop` module (its `rmcp`
+# dependency) plus the facade's legacy `indusagi/mcp` vocabulary shim.
+mcp = ["dep:rmcp", "dep:http"]
+
+[dependencies]
+rmcp = { version = "1.7.0", default-features = false, features = [
+  "client", "server", "transport-io", "transport-async-rw",
+  "transport-child-process", "transport-streamable-http-client",
+  "transport-streamable-http-client-reqwest", "reqwest",
+], optional = true }
+http = { version = "1", optional = true }
+```
+
+Both the client (`client`, `transport-child-process`,
+`transport-streamable-http-client`) and server (`server`) halves of `rmcp` are
+enabled, so the bridge can act as either party. With `--no-default-features` and
+no `mcp`, the `interop` module and its `rmcp` dependency vanish entirely.
+
+## Public surface
+
+`interop/mod.rs` re-exports the whole `protocol_bridge` barrel to the crate root
+(`pub use protocol_bridge::*`), mirroring the TS `interop/index.ts` re-export.
+Everything below is reachable as `indusagi::interop::<Name>`.
+
+| Name | Kind | Source | Purpose |
+|------|------|--------|---------|
+| `mount_protocol_bridge` | `async fn` | `bridge.rs` | The join point: start a fleet, list each ready endpoint's tools, wrap each as a kernel tool, return a `MountedProtocolBridge` (`ToolBox` + live fleet) |
+| `MountedProtocolBridge` | struct | `bridge.rs` | The mount return value: `box_` (`ToolBox`) plus `fleet` (`Arc<dyn ServerFleet>`) |
+| `create_server_endpoint` | `fn` | `endpoint.rs` | Factory for one `ServerEndpointImpl` over a `ServerConfig`, with an optional injected transport |
+| `ServerEndpointImpl` | struct | `endpoint.rs` | The one concrete client endpoint: a single live `rmcp` connection driving the phase machine |
+| `InjectedTransport` | enum | `endpoint.rs` | A pre-built transport injected at construction (the in-process / test seam); variant `Duplex(DuplexStream)` |
+| `CLIENT_NAME` / `CLIENT_VERSION` | `const &str` | `endpoint.rs` | The intended client identity (`"indus-protocol-bridge"` / `"0.1.0"`), documented for parity with the TS `CLIENT_INFO`; the `rmcp` `()` client handler currently advertises its own default name, so these document the intent and reserve it for future handler customization |
+| `start_server_fleet` | `async fn` | `fleet.rs` | Construct and `start()` a `ServerFleetImpl` from a `BridgeConfig`, returning it after every connection has settled |
+| `ServerFleetImpl` | struct | `fleet.rs` | The one concrete fleet: mints one endpoint per `ServerConfig`, connects them in parallel with per-server failure isolation |
+| `create_provider_host` | `fn` | `host.rs` | Provider-host factory: build a `ProviderHost` over an `Arc<ToolBox>` |
+| `ProviderHost` | struct | `host.rs` | The agent-as-MCP-server: `connect(transport)` binds an `rmcp` `ServerHandler` and serves |
+| `RunningProviderHost` | struct | `host.rs` | A live host session; holding it keeps the server task alive, `waiting()`/`cancel()` end it |
+| `ProviderHostInfo` | struct | `host.rs` | Identity (`name`, `version`) the host advertises to connecting clients |
+| `normalize_schema` | `fn` | `schema.rs` | Reshape an untrusted remote `inputSchema` into a draft-agnostic subset every provider accepts |
+| `ProtocolFault` | struct | `contract.rs` | The normalized, discriminable error raised everywhere in the bridge; class on `.kind`, cause on the `Error::source` chain |
+| `protocol_fault` | `fn` | `contract.rs` | Terse constructor `protocol_fault(kind, message, cause)` |
+| `is_protocol_fault` | `fn` | `contract.rs` | Downcasting guard narrowing a `dyn Error` to `ProtocolFault` |
+| `is_usable_phase` | `fn` | `contract.rs` | True only when `phase == EndpointPhase::Ready` (can accept tool calls) |
+| `is_terminal_phase` | `fn` | `contract.rs` | True when phase is `Closed` or `Faulted` |
+| `qualify_tool_name` | `fn` | `contract.rs` | Build the agent-facing `"<server>__<tool>"` from a `RemoteToolRef` |
+| `QUALIFIER` | `const &str` | `contract.rs` | The `"__"` delimiter joining server id and tool name |
+| `ServerEndpoint` | trait | `contract.rs` | A live single-server connection: `config`/`phase` plus `open`/`list_tools`/`invoke`/`status`/`close` |
+| `ServerFleet` | trait | `contract.rs` | A name-keyed endpoint collection: `spin_up`/`tear_down`/`endpoint`/`endpoints`/`status` |
+| `EndpointPhase` | enum | `contract.rs` | Lifecycle: `Idle`, `Connecting`, `Ready`, `Closing`, `Closed`, `Faulted` |
+| `FaultKind` | enum | `contract.rs` | Six-variant fault class: `Transport`, `Protocol`, `Timeout`, `ToolError`, `NotConnected`, `SpawnFailed` |
+| `FaultCause` | type alias | `contract.rs` | `Arc<dyn std::error::Error + Send + Sync + 'static>` — the cause chain |
+| `TransportKind` | enum | `contract.rs` | `Stdio`, `Sse`, `StreamableHttp` |
+| `ServerConfig` | enum | `contract.rs` | Per-server connection description, discriminated by transport: `Stdio`/`Sse`/`StreamableHttp` |
+| `BridgeConfig` | struct | `contract.rs` | The set of `ServerConfig`s to connect on start: `servers: Vec<ServerConfig>` |
+| `RemoteToolRef` | struct | `contract.rs` | A `{ server, name }` pair identifying one tool on one server |
+| `RemoteTool` | struct | `contract.rs` | A `RemoteToolRef` (`r#ref`) paired with the model-facing `ToolDescriptor` |
+| `RemoteCallResult` | struct | `contract.rs` | Raw invocation result: `content: Vec<Value>` (MCP blocks) plus `is_error: bool` |
+| `EndpointStatus` | struct | `contract.rs` | Point-in-time health: `server`, `phase`, `tool_count`, optional `fault` |
+| `FleetStatus` | type alias | `contract.rs` | `IndexMap<String, EndpointStatus>` keyed by server id, in config order |
+
+## Module map
+
+| Module | Holds |
+|--------|-------|
+| `protocol_bridge::contract` | The frozen vocabulary and declares no behaviour: the fault model (`ProtocolFault`/`FaultKind`), the endpoint lifecycle (`EndpointPhase`), per-server config shapes (`ServerConfig`/`BridgeConfig`), the `server__tool` grammar (`QUALIFIER`/`qualify_tool_name`), the shared handles (`RemoteTool`/`RemoteCallResult`/`EndpointStatus`), and the two behavioural traits (`ServerEndpoint`, `ServerFleet`). |
+| `protocol_bridge::endpoint` | `ServerEndpointImpl` — the single-server client connection over the `rmcp` client; the transport builders, the phase machine, single-flight connect, and the tool-listing cache. |
+| `protocol_bridge::fleet` | `ServerFleetImpl` — parallel multi-server lifecycle with per-server fault isolation. |
+| `protocol_bridge::bridge` | `mount_protocol_bridge` — grafts remote tools into the kernel `ToolRegistry`; the inert remote backends, content projection, and remote-tool wrapper. |
+| `protocol_bridge::host` | `ProviderHost` — the agent-as-MCP-server provider (the `rmcp` `ServerHandler`). |
+| `protocol_bridge::schema` | `normalize_schema` — the byte-for-byte JSON-Schema normalizer. |
+
+`contract.rs` is the single source of truth: every behavioural module imports its
+nouns from there. `bridge.rs` is the only module that crosses into the
+[Capabilities](/rust/subsystems/capabilities) kernel; the rest is self-contained
+over `rmcp`.
+
+## Key concepts
+
+**Qualified tool name.** Remote tool names are unique only within their own
+server, so each is grafted under `"<server_id>__<tool_name>"`. The `QUALIFIER` is
+`"__"`, kept a legal identifier across providers. The endpoint stamps the
+qualified name onto each `ToolDescriptor` (via `qualify_tool_name`) while keeping
+the unqualified server-side name on the `RemoteToolRef`; the wrapper advertises
+the qualified name to the model but routes invocations back under the unqualified
+`r#ref.name`.
+
+**The `EndpointPhase` machine.** An endpoint advertises an explicit lifecycle —
+`idle → connecting → ready → closing → closed`, with any failure short-circuiting
+to `faulted` — instead of scattered boolean flags. `is_usable_phase`
+(`== Ready`) gates tool calls; `is_terminal_phase` is `Closed | Faulted`.
+
+**Discriminated fault model.** Every bridge error is a single `ProtocolFault`
+discriminated by `.kind` (a `FaultKind`), with the original triggering value on
+the standard `std::error::Error::source` chain (a `FaultCause = Arc<dyn Error +
+Send + Sync>`). Callers branch on the kind rather than parsing message text. The
+fault is `Clone` (the `Arc` cause makes it cheap to share — single-flight connect
+memoizes and hands the same fault to concurrent callers).
+
+**Failure isolation.** The fleet connects all endpoints in parallel via
+`futures::future::join_all` (deliberately *not* `try_join_all`, which would
+short-circuit). A server that fails to spawn or handshake just stays `faulted`,
+records its own fault, and contributes no tools, while healthy peers serve.
+`mount_protocol_bridge` skips non-`Ready` endpoints and any whose `list_tools`
+errs.
+
+**Fault classification by call site.** Faults are classified by *where* they
+occur, not by inspecting the `rmcp` error type — so the six-kind contract
+survives a different SDK's error taxonomy. stdio connect → `SpawnFailed`; http
+connect → `Transport`; `list_tools` failure → `Protocol`; `invoke` SDK throw →
+`ToolError`; any operation before `Ready` → `NotConnected`.
+
+**Single-flight connect.** A second `open()` while a connect is in flight
+serializes on the endpoint's `connect_lock` mutex rather than starting a second
+attempt, matching the TS shared-promise semantics.
+
+**Injected-transport seam.** `create_server_endpoint` accepts an optional
+`InjectedTransport`. When present, config-derived transport construction is
+bypassed entirely. The one variant, `InjectedTransport::Duplex(DuplexStream)`,
+wires an endpoint to the client half of a `tokio::io::duplex` pair so in-process
+callers and tests can connect a host to an endpoint with no process spawned (the
+in-memory round-trip the `mod.rs` doc-comment describes). It mirrors the TS
+`InMemoryTransport`.
+
+**Pre-flight-only invoke cancellation (W-7).** `invoke` performs a *pre-flight*
+readiness check only; an in-flight MCP `call_tool` is never raced against a
+cancel token. Threading cancel into the `rmcp` call would be a behavioral change
+versus the TS/Python editions, so it is deliberately not done.
+
+## The bridge contract
+
+`contract.rs` declares the two behavioural traits that the endpoint, fleet, host,
+and mount pass between one another. Both are `async_trait` and `Send + Sync`.
+
+A `ServerEndpoint` is one live connection to one external MCP server. Every
+failure surfaces as a `ProtocolFault`; `open`/`list_tools`/`invoke` are fallible,
+while `close` is infallible (it swallows errors and always lands at `closed`, or
+leaves a `faulted` terminal untouched):
+
+```rust
+#[async_trait]
+pub trait ServerEndpoint: Send + Sync {
+    fn config(&self) -> &ServerConfig;
+    fn phase(&self) -> EndpointPhase;
+    async fn open(&self) -> Result<(), ProtocolFault>;
+    async fn list_tools(&self) -> Result<Vec<RemoteTool>, ProtocolFault>;
+    async fn invoke(&self, name: &str, args: Value) -> Result<RemoteCallResult, ProtocolFault>;
+    fn status(&self) -> EndpointStatus;
+    async fn close(&self);
+}
+```
+
+A `ServerFleet` is a name-keyed collection of endpoints with a unified lifecycle;
+its defining responsibility is per-server failure isolation:
+
+```rust
+#[async_trait]
+pub trait ServerFleet: Send + Sync {
+    async fn spin_up(&self) -> Result<(), ProtocolFault>;
+    async fn tear_down(&self);
+    fn endpoint(&self, server: &str) -> Option<Arc<dyn ServerEndpoint>>;
+    fn endpoints(&self) -> Vec<Arc<dyn ServerEndpoint>>;
+    fn status(&self) -> FleetStatus;
+}
+```
+
+A server's connection description is a discriminated union on its transport, so a
+stdio server and an http server cannot be confused at the type level. The
+`StreamableHttp` variant is reserved for the SSE → Streamable HTTP migration
+(interop.md R7); reserving it from day one keeps the union and fault contracts
+stable:
+
+```rust
+pub enum ServerConfig {
+    Stdio { id: String, command: String, args: Vec<String>, env: IndexMap<String, String> },
+    Sse { id: String, url: String, headers: IndexMap<String, String> },
+    StreamableHttp { id: String, url: String, headers: IndexMap<String, String> },
+}
+```
+
+Convenience constructors `ServerConfig::stdio(id, command)` and
+`ServerConfig::sse(id, url)` build the no-args / no-headers forms, and
+`.id()` / `.kind()` read the shared discriminants across all variants.
+
+## Mounting external servers
+
+`mount_protocol_bridge` is the high-level entry point — the join between the two
+halves of the bridge:
+
+```rust
+pub async fn mount_protocol_bridge(config: BridgeConfig) -> MountedProtocolBridge
+```
+
+It starts a `ServerFleetImpl` from the `BridgeConfig`, iterates the endpoints,
+skips any failing `is_usable_phase`, lists the rest's tools (skipping any whose
+`list_tools` errs), wraps each remote tool as a kernel `DefinedTool` (routing
+`run` back to the owning endpoint under the *unqualified* name), registers them
+in a fresh `ToolRegistry`, and returns the boxed tools alongside the live fleet:
+
+```rust
+pub struct MountedProtocolBridge {
+    pub box_: ToolBox,
+    pub fleet: Arc<dyn ServerFleet>,
+}
+```
+
+```rust
+use std::sync::Arc;
+use indusagi::interop::{BridgeConfig, ServerConfig, mount_protocol_bridge};
+use indexmap::IndexMap;
+
+#[tokio::main]
+async fn main() {
+    let config = BridgeConfig::new(vec![
+        ServerConfig::Stdio {
+            id: "fs".into(),
+            command: "npx".into(),
+            args: vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-filesystem".into(),
+                "/tmp".into(),
+            ],
+            env: IndexMap::new(),
+        },
+        ServerConfig::Sse {
+            id: "remote".into(),
+            url: "https://example.com/mcp".into(),
+            headers: IndexMap::new(),
+        },
+    ]);
+
+    let mounted = mount_protocol_bridge(config).await;
+
+    // Every grafted tool, qualified: e.g. "fs__read_file", "remote__search".
+    for descriptor in mounted.box_.descriptors() {
+        println!("{}", descriptor.name);
+    }
+
+    // Which servers came up ready vs. faulted.
+    for (server_id, status) in mounted.fleet.status() {
+        println!("{server_id} {} tools={} fault={:?}",
+            status.phase, status.tool_count, status.fault.map(|f| f.kind));
+    }
+
+    mounted.fleet.tear_down().await;
+}
+```
+
+Each remote tool's `inputSchema` is run through `normalize_schema` before it is
+shown to the model, and each `RemoteCallResult` is projected onto a kernel
+`ToolResult` — a `{type:"text", text}` block becomes a `ToolContentBlock::text`,
+everything else (images, resources, embedded data, malformed) becomes
+`ToolContentBlock::json` so nothing is dropped on the way to the model, and
+`is_error` is carried straight through. Because remote tools do no local I/O, the
+registry is boxed against an inert `ToolContext` whose `UnavailableFs` and
+`UnavailableShell` backends `io::Error::other(...)` only if a tool incorrectly
+reaches for them.
+
+## Driving a single endpoint
+
+For finer control, drive a `ServerEndpoint` directly. It owns one transport,
+advances through the phase machine, and caches its tool listing after the first
+successful `list_tools`. `invoke` takes the *unqualified* server-side tool name:
+
+```rust
+use indusagi::interop::{
+    create_server_endpoint, ServerConfig, ServerEndpoint, EndpointPhase,
+    is_usable_phase, is_protocol_fault,
+};
+use serde_json::json;
+
+#[tokio::main]
+async fn main() {
+    let endpoint = create_server_endpoint(
+        ServerConfig::stdio("echo", "python"),
+        None, // no injected transport — build one from the config on connect
+    );
+    assert_eq!(endpoint.phase(), EndpointPhase::Idle);
+
+    match endpoint.open().await { // idle -> connecting -> ready
+        Ok(()) if is_usable_phase(endpoint.phase()) => {
+            for tool in endpoint.list_tools().await.unwrap() {
+                println!("{} -> {}", tool.descriptor.name, tool.r#ref.name);
+            }
+            let result = endpoint.invoke("echo", json!({ "text": "hi" })).await.unwrap();
+            println!("is_error={} content={:?}", result.is_error, result.content);
+        }
+        Ok(()) => {}
+        Err(fault) => {
+            if is_protocol_fault(&fault) {
+                eprintln!("bridge fault: {} {}", fault.kind, fault);
+            }
+        }
+    }
+    endpoint.close().await; // -> closing -> closed
+}
+```
+
+The endpoint is single-shot: once it reaches a terminal phase (`Closed` or
+`Faulted`) it is not reusable — `open()` on a `Closed`/`Closing` endpoint returns
+a `NotConnected` fault, and on a `Faulted` endpoint returns the stored fault.
+The mutable interior (`phase`, the live `rmcp` `RunningService`, the tool cache,
+the recorded fault, the injected transport) is guarded by one `tokio::sync::Mutex`
+so the `&self` trait methods can mutate it; `phase()`/`status()` read it through a
+cheap `try_lock`.
+
+## The server fleet
+
+`ServerFleetImpl` is the multi-server form. Construct it empty, then `start(config)`
+mints one endpoint per `ServerConfig` and connects them concurrently. Endpoints
+are keyed by `ServerConfig::id` in an `IndexMap`, which gives O(1) lookup while
+preserving declaration order in every snapshot (interop.md R4 — a `BTreeMap` or
+`HashMap` would re-sort and break ordering parity). `endpoints()` and `status()`
+return fresh owned snapshots; `tear_down()` closes everything in parallel.
+
+```rust
+use indusagi::interop::{start_server_fleet, BridgeConfig, ServerConfig, ServerFleet};
+
+#[tokio::main]
+async fn main() {
+    let fleet = start_server_fleet(BridgeConfig::new(vec![
+        ServerConfig::stdio("a", "node"),
+        ServerConfig::stdio("b", "python"),
+    ])).await;
+
+    // Every connection already attempted, in parallel, with failure isolation.
+    for (id, status) in fleet.status() {
+        println!("{id}: {}", status.phase);
+    }
+    fleet.tear_down().await;
+}
+```
+
+Each endpoint is registered *before* any connect, so even one that fails to
+connect appears in `endpoints()`/`status()` carrying its fault. Connects run via
+`join_all` (never `try_join_all`): a single failed `open()` is absorbed — the
+endpoint records its own `ProtocolFault` and moves to `Faulted` — and never
+propagates. A later duplicate id silently supersedes an earlier one
+(last-id-wins), matching the registry's last-registration-wins convention.
+`spin_up()` (the trait's vocabulary alias) re-runs `start` against the last
+config, or returns a `NotConnected` fault if called before any `start`.
+
+## The provider host
+
+The host is the mirror image: it makes the agent an MCP *server*.
+`create_provider_host(box_, info)` builds a `ProviderHost` over an `Arc<ToolBox>`
+and an optional `ProviderHostInfo`; when `info` is `None` the host advertises the
+default identity (`name: "indus-provider-host", version: "0.1.0"`).
+
+The host is a thin, stateless `rmcp` `ServerHandler` that closes over the box in
+two directions:
+
+- **Catalog.** `list_tools` maps `box_.descriptors()` to MCP `Tool`s — each
+  descriptor's JSON-Schema `parameters` *is* the client-facing `inputSchema`, so
+  the host does *not* re-normalize.
+- **Dispatch.** `call_tool` routes a request straight into `box_.runner.run(...)`
+  with a fresh, never-cancelled `CancellationToken` (a client `tools/call`
+  carries none), then projects the `ToolOutcome` onto a `CallToolResult` of shape
+  `{ content: [{ type: "text", text }], isError }`.
+
+`connect(transport)` binds the handler to a transport and serves; it resolves
+once the MCP session is established and returns a `RunningProviderHost` that must
+be kept alive for the connection's lifetime (`waiting()` awaits the server task,
+`cancel()` tears it down). The host is transport-agnostic — the transport governs
+how a client reaches it (stdio pipe, http stream, or an in-memory `duplex` pair):
+
+```rust
+use std::sync::Arc;
+use indusagi::interop::{create_provider_host, ProviderHostInfo};
+use indusagi::capabilities::ToolBox;
+
+async fn serve(box_: Arc<ToolBox>) {
+    let host = create_provider_host(
+        box_,
+        Some(ProviderHostInfo::new("my-agent", "1.0")),
+    );
+    let (client_io, server_io) = tokio::io::duplex(8 * 1024);
+    let running = host.connect(server_io).await.expect("host serves");
+    // An MCP client on `client_io` can now enumerate and call our tools.
+    running.waiting().await;
+}
+```
+
+`connect` is generic over `rmcp::transport::IntoTransport<RoleServer, E, A>`, so
+a `tokio::io::duplex` half, a stdio transport, or an http stream all bind through
+the same call. A failure to start the server surfaces as a `Transport`
+`ProtocolFault`.
+
+## Schema normalization
+
+`normalize_schema` is a pure, table-driven, total function ported byte-for-byte
+from the TS source. A remote MCP server authors each tool's `inputSchema` to its
+own taste; before it can become the model-facing `parameters` it must be reshaped
+into a small, defensive, draft-agnostic subset every provider accepts.
+
+```rust
+pub fn normalize_schema(input: &Value) -> Value
+```
+
+It reads the declared `type` and dispatches per type
+(`object`/`array`/`string`/`number`/`integer`/`boolean`/`null`), falling back to
+a closed `{ "type": "object", "properties": {} }` when the type is absent,
+non-string, or unrecognized (including the array-of-types form). A `relax`
+combinator strips, at every level, the keywords no provider validates against:
+
+| Stripped keyword | Why |
+|------------------|-----|
+| `$schema`, `$id`, `$ref`, `$defs`, `definitions` | Draft plumbing / cross-references no provider resolves |
+| `$comment`, `deprecated`, `readOnly`, `writeOnly` | Annotations the validator ignores |
+| `default`, `examples` | Sample data, not constraints |
+| `contentEncoding`, `contentMediaType` | Content metadata outside the accepted subset |
+
+The object normalizer guarantees a record-shaped `properties` with every child
+recursively normalized, filters `required` to keys that actually exist (dropping
+it when empty), and normalizes `additionalProperties` when it is a schema (a
+boolean is forwarded untouched). The array normalizer collapses a tuple-form
+`items` (an array of schemas) to its first element so the result stays within the
+single-schema subset providers reliably accept. The argument is never mutated;
+key insertion order is preserved (serde_json under `preserve_order`).
+
+```rust
+use indusagi::interop::normalize_schema;
+use serde_json::json;
+
+let clean = normalize_schema(&json!({
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+        "path": { "type": "string", "default": "/tmp" },
+        "tags": { "type": "array", "items": [{ "type": "string" }, { "type": "number" }] },
+    },
+    "required": ["path", "missing"],
+}));
+// `$schema` and `default` stripped; `required` filtered to declared keys (["path"]);
+// tuple-form `items` collapsed to the first element ({ "type": "string" }).
+```
+
+## The fault model
+
+Every failure surfaces as a `ProtocolFault`, and the fault's `.kind` is
+site-determined:
+
+| Site | `FaultKind` |
+|------|-------------|
+| Opening a stdio transport / spawning the subprocess | `SpawnFailed` |
+| Building a stdio transport (`TokioChildProcess::new`) | `Transport` |
+| Opening an SSE / Streamable-HTTP transport / handshake | `Transport` |
+| `list_tools` failure | `Protocol` |
+| `invoke` SDK failure | `ToolError` |
+| Operating on a non-`Ready` endpoint | `NotConnected` |
+| Provider host fails to start | `Transport` |
+
+The `Timeout` kind is reserved in the enum (`FaultKind::ALL` enumerates the
+closed set of six). Branch on the kind, and read the underlying cause from the
+standard `Error::source` chain:
+
+```rust
+use indusagi::interop::{FaultKind, is_protocol_fault};
+use std::error::Error;
+
+fn handle(fault: &(dyn Error + 'static)) {
+    if is_protocol_fault(fault) {
+        let pf = fault.downcast_ref::<indusagi::interop::ProtocolFault>().unwrap();
+        match pf.kind {
+            FaultKind::SpawnFailed => { /* the subprocess could not be started */ }
+            FaultKind::ToolError   => { /* the remote tool ran and reported failure */ }
+            _ => {}
+        }
+        if let Some(cause) = pf.source() {
+            eprintln!("caused by: {cause}");
+        }
+    }
+}
+```
+
+`ProtocolFault` is `Clone` (its `cause` is an `Arc<dyn Error + Send + Sync>`), so
+the single-flight connect can memoize one fault and hand it to every concurrent
+caller. `Display` writes the message only — the discriminant lives on `.kind`,
+exactly as the TS `Error.message` carries no kind prefix.
+
+## Design invariants
+
+- **One vocabulary, one source.** `contract.rs` owns every noun and declares no
+  behaviour; the endpoint, fleet, bridge, and host all import from it, so the
+  fault model, lifecycle, and config shapes have a single definition.
+- **Discriminate at the type level.** `ServerConfig` is a discriminated union on
+  transport, `ProtocolFault` discriminates on `FaultKind`, and `EndpointPhase`
+  is an explicit state machine — no boolean flags, no string codes, no `kind`
+  inferred from an SDK error type.
+- **Order preservation.** `IndexMap` is used for `env`, `headers`, `by_id`, and
+  `FleetStatus` so configuration order survives every snapshot (interop.md R4).
+- **Failure isolation everywhere.** `join_all` (never `try_join_all`) on both
+  connect and teardown means one bad server never sinks its peers; the mount
+  skips non-`Ready` endpoints and `list_tools` errors silently.
+- **Faithful content passthrough.** MCP content blocks ride back as opaque
+  `Vec<Value>` so images and resource blocks reach the model untouched (R9); a
+  non-array result defaults to `[]` (R10).
+- **Behavioural parity, not SDK parity.** Fault classification by call site,
+  the `__` qualifier, the byte-for-byte `normalize_schema`, and pre-flight-only
+  invoke cancellation (W-7) are pinned to the TS/Python editions regardless of
+  `rmcp`'s own shapes.
+
+## Relationship to neighbors
+
+Interop depends inward on the [Capabilities](/rust/subsystems/capabilities)
+kernel — it pulls `ToolDescriptor` into the contract, and in `bridge.rs` it uses
+`ToolRegistry`, `DefinedTool`, `define_tool`, `Tool`, `ToolBox`, `ToolContext`,
+`ToolResult`, `ToolContentBlock`, the `Fs`/`Shell` backend traits, and
+`standard_budget` to graft remote tools and box them. The provider host routes
+into `ToolBox::runner` with a `ToolCall` and reads `ToolBox::descriptors()`. It
+takes `CancellationToken` from [Core](/rust/subsystems/core), and `ProtocolFault`
+is one of the subsystem error types that wraps the shared `CoreError` base.
+Externally it sits on top of the official `rmcp` SDK (`ServiceExt`,
+`RunningService`, `RoleClient`/`RoleServer`, `ServerHandler`,
+`TokioChildProcess`, `StreamableHttpClientTransport`, `CallToolRequestParams`,
+`CallToolResult`, `Content`, `Tool`, `ListToolsResult`) and `tokio::io::duplex`
+for the in-memory transport.
+
+This module is the Rust counterpart of the
+[Python interop bridge](/python/subsystems/interop), preserving its directional
+design (client graft + provider host), its `__` qualifier, and its discriminated
+fault model on top of a different MCP SDK. The legacy `indusagi/mcp` facade (also
+gated by the `mcp` feature) is a thin camelCase vocabulary shim over this module
+for migrating code. See the [Architecture overview](/rust/architecture) for where
+the layer sits in the stack.
