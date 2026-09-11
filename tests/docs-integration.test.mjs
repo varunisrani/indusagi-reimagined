@@ -82,10 +82,15 @@ test('area roots have one preferred canonical identity', async () => {
   }
 });
 
-test('required shell entrypoints are executable in release artifacts', async () => {
-  for (const file of ['build-verified.sh', 'install-ci.sh', 'install-pnpm.sh', 'sites-env.sh']) {
-    const mode = (await stat(resolve(root, 'scripts', file))).mode;
-    assert.notEqual(mode & 0o111, 0, `${file} is not executable`);
+test('shell entrypoints survive mode-stripping ZIP extractors', async () => {
+  const manifest = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'));
+  assert.equal(manifest.scripts['install:ci'], 'bash scripts/install-ci.sh');
+  for (const file of ['build-verified.sh', 'install-ci.sh', 'install-pnpm.sh']) {
+    const path = resolve(root, 'scripts', file);
+    const mode = (await stat(path)).mode;
+    const source = await readFile(path, 'utf8');
+    assert.match(source, /exec bash "\$\{script_dir\}\/sites-env\.sh" -- bash "\$0" "\$@"/);
+    if ((mode & 0o111) === 0) assert.match(source, /^#!\/usr\/bin\/env bash/m);
   }
 });
 
