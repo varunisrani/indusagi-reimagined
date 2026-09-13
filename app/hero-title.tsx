@@ -8,7 +8,7 @@ export function HeroTitle() {
   const [title, setTitle] = useState(phrase);
 
   useEffect(() => {
-    const preference = window.matchMedia('(prefers-reduced-motion: reduce)');
+    const preference = window.matchMedia('(prefers-reduced-motion: reduce), (max-width: 1024px)');
     let timer: ReturnType<typeof setTimeout>;
     let length = phrase.length;
     let deleting = true;

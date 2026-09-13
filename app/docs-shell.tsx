@@ -18,6 +18,7 @@ export function DocsShell({ path, title, html, nav, sections }: DocumentPage & {
       <DocsNavigation path={path} title={title} items={items} />
       <main className="doc-main">
         <div className="article-topline"><span className="eyebrow">{edition.lang} / {edition.type}</span><BookOpen size={19} /></div><h1>{title}</h1>
+        {sections.length > 0 && <details className="docs-mobile-toc"><summary>On this page</summary><nav aria-label="On this page">{sections.map((s, i) => <a key={s.id + '-' + i} href={'#' + s.id}>{s.title}</a>)}</nav></details>}
         <ArticleLinks><article className="article-prose" dangerouslySetInnerHTML={{ __html: html }} /></ArticleLinks>
         <div className="doc-pagination">{current > 0 ? <SiteLink href={items[current - 1].url}><ArrowLeft size={18} /><span><small>Previous</small>{items[current - 1].text}</span></SiteLink> : <span />}{current >= 0 && current < items.length - 1 && <SiteLink href={items[current + 1].url}><span><small>Next</small>{items[current + 1].text}</span><ArrowRight size={18} /></SiteLink>}</div>
       </main>

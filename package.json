@@ -6,7 +6,7 @@
     "node": ">=22.13.0"
   },
   "scripts": {
-    "install:ci": "bash scripts/install-ci.sh",
+    "install:ci": "pnpm install --frozen-lockfile",
     "docs:build": "node scripts/build-docs.mjs",
     "dev": "node scripts/build-docs.mjs && node scripts/run-framework.mjs dev",
     "build": "node scripts/build-docs.mjs && node scripts/run-framework.mjs build",

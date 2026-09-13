@@ -84,7 +84,8 @@ test('area roots have one preferred canonical identity', async () => {
 
 test('shell entrypoints survive mode-stripping ZIP extractors', async () => {
   const manifest = JSON.parse(await readFile(resolve(root, 'package.json'), 'utf8'));
-  assert.equal(manifest.scripts['install:ci'], 'bash scripts/install-ci.sh');
+  assert.equal(manifest.scripts['install:ci'], 'pnpm install --frozen-lockfile');
+  assert.match(manifest.packageManager, /^pnpm@/);
   for (const file of ['build-verified.sh', 'install-ci.sh', 'install-pnpm.sh']) {
     const path = resolve(root, 'scripts', file);
     const mode = (await stat(path)).mode;
