@@ -1,20 +1,21 @@
-# IndusAGI Coding Agent
+# IndusAGI
 
-## What it is
-IndusAGI Coding Agent is a terminal-first AI coding agent distributed as the `indusagi-coding-agent` npm package. Its installed command names are `indus` and `indusagi`.
-Source: https://registry.npmjs.org/indusagi-coding-agent/latest
+> IndusAGI is an open-source developer framework and terminal-first AI coding agent documented for TypeScript, Python, and Rust.
 
-The documentation on this site is generated from the IndusAGI documentation corpus pinned at commit `a24f7e9823d0149e27bf05af912fba8dd959866c`.
-Source: https://github.com/varunisrani/indusagi-docs/tree/a24f7e9823d0149e27bf05af912fba8dd959866c
+## Start here
+- Website: https://www.indusagi.com/
+- TypeScript framework documentation: https://www.indusagi.com/docs/getting-started
+- TypeScript coding agent documentation: https://www.indusagi.com/cli/README
+- TypeScript coding agent package: https://www.npmjs.com/package/indusagi-coding-agent
 
-## Install the TypeScript coding agent
+Install the TypeScript coding agent, which provides the `indus` and `indusagi` commands:
 
 ```bash
 npm install -g indusagi-coding-agent
 ```
 
-The npm registry metadata requires Node.js 20 or newer.
-Source: https://www.npmjs.com/package/indusagi-coding-agent
+The npm package requires Node.js 20 or newer.
+Source: https://registry.npmjs.org/indusagi-coding-agent/latest
 
 ## Documentation families
 - TypeScript framework: https://www.indusagi.com/docs/getting-started
@@ -24,7 +25,9 @@ Source: https://www.npmjs.com/package/indusagi-coding-agent
 - Rust framework: https://www.indusagi.com/rust/getting-started
 - Rust coding agent: https://www.indusagi.com/rust-cli/getting-started
 
-## Project links
-- Website: https://www.indusagi.com
+## Source
 - Documentation source: https://github.com/varunisrani/indusagi-docs
 - TypeScript coding-agent source: https://github.com/varunisrani/induscode-ts
+
+This site's documentation corpus is pinned to source commit `a24f7e9823d0149e27bf05af912fba8dd959866c`.
+Source: https://github.com/varunisrani/indusagi-docs/tree/a24f7e9823d0149e27bf05af912fba8dd959866c

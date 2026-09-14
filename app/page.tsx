@@ -1,2 +1,4 @@
 import { HomePage } from './site';
-export default function Page(){return <HomePage/>;}
+import { HomeStructuredData } from './home-structured-data';
+
+export default function Page(){return <><HomeStructuredData/><HomePage/></>;}

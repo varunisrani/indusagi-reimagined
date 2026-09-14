@@ -3,14 +3,15 @@ import { DocsShell } from '../docs-shell';
 import { SiteLink } from '../site-link';
 import { ArticleLinks } from '../article-links';
 import { documentRedirects, getDocument } from '../data/content-index';
+import { buildDocumentMetadata } from '../seo';
 type PageParams = { params: Promise<{ slug: string[] }> };
 export async function generateMetadata({ params }: PageParams) {
   const { slug } = await params;
   const doc = await getDocument('/' + slug.join('/'));
-  if (!doc) return { title: 'Page not found — IndusAGI' };
+  if (!doc) return { title: 'Page not found — IndusAGI', robots: { index: false, follow: false } };
   const description = doc.html.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 160);
   const canonical = doc.canonicalPath || '/' + slug.join('/');
-  return { title: `${doc.title} — IndusAGI Documentation`, description, alternates: { canonical } };
+  return buildDocumentMetadata(doc.title, description, canonical);
 }
 export default async function Page({ params }: PageParams) {
   const { slug } = await params;

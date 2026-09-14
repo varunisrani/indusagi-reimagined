@@ -1,17 +1,10 @@
-import type { Metadata } from "next";
 import "./globals.css";
 import { Header } from "./header";
 import { Footer } from "./footer";
 import { ThemeInit } from "./theme-init";
+import { homepageMetadata } from "./seo";
 
-export const metadata: Metadata = {
-  title: "IndusAGI — The open-source AI agent stack",
-  description: "A terminal-first coding agent and the framework underneath it. TypeScript, Python, and Rust.",
-  icons: {
-    icon: "/favicon.svg",
-    shortcut: "/favicon.svg",
-  },
-};
+export const metadata = homepageMetadata;
 
 export default function RootLayout({
   children,
