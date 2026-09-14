@@ -22,10 +22,12 @@ function attribute(html, elementPattern, attributeName) {
 const { text: home } = await get('/');
 assert.match(home, new RegExp(`<title>${homeTitle}</title>`));
 assert.equal(attribute(home, /<meta name="description"[^>]*>/, 'content'), homeDescription);
-assert.equal(new URL(attribute(home, /<link rel="canonical"[^>]*>/, 'href')).href, `${canonicalOrigin}/`);
+assert.equal((home.match(/<link rel="canonical"[^>]*>/g) || []).length, 1);
+assert.equal(attribute(home, /<link rel="canonical"[^>]*>/, 'href'), `${canonicalOrigin}/`);
 assert.equal(attribute(home, /<meta property="og:title"[^>]*>/, 'content'), homeTitle);
 assert.equal(attribute(home, /<meta property="og:description"[^>]*>/, 'content'), homeDescription);
-assert.equal(new URL(attribute(home, /<meta property="og:url"[^>]*>/, 'content')).href, `${canonicalOrigin}/`);
+assert.equal((home.match(/<meta property="og:url"[^>]*>/g) || []).length, 1);
+assert.equal(attribute(home, /<meta property="og:url"[^>]*>/, 'content'), `${canonicalOrigin}/`);
 assert.equal(attribute(home, /<meta name="twitter:card"[^>]*>/, 'content'), 'summary_large_image');
 assert.equal((home.match(/<h1(?:\s|>)/g) || []).length, 1);
 

@@ -26,12 +26,11 @@ test('homepage metadata has one canonical production identity and complete socia
   assert.equal(homepageMetadata.metadataBase?.href, 'https://www.indusagi.com/');
   assert.equal(homepageMetadata.title, HOME_TITLE);
   assert.equal(homepageMetadata.description, HOME_DESCRIPTION);
-  assert.equal(homepageMetadata.alternates?.canonical, '/');
+  assert.equal(homepageMetadata.alternates, undefined);
   assert.deepEqual(homepageMetadata.robots, { index: true, follow: true });
   assert.deepEqual(homepageMetadata.openGraph, {
     type: 'website',
     locale: 'en_US',
-    url: '/',
     siteName: 'IndusAGI',
     title: HOME_TITLE,
     description: HOME_DESCRIPTION,

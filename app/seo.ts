@@ -118,12 +118,10 @@ export const homepageMetadata: Metadata = {
   metadataBase: new URL(SITE_ORIGIN),
   title: HOME_TITLE,
   description: HOME_DESCRIPTION,
-  alternates: { canonical: '/' },
   robots: { index: true, follow: true },
   openGraph: {
     type: 'website',
     locale: 'en_US',
-    url: '/',
     siteName: SITE_NAME,
     title: HOME_TITLE,
     description: HOME_DESCRIPTION,
