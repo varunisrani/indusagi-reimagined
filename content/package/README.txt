@@ -6,7 +6,7 @@
 
 The `indusagi` npm package is the framework. The companion CLI agent ships separately as
 `indusagi-coding-agent`. The framework is designed and written from scratch — its code reuses no
-third-party application source. See [`PROVENANCE.md`](https://github.com/varunisrani/indusagi-ts)
+third-party application source. See [`PROVENANCE.md`](https://github.com/varunisrani/indusagi-sdk)
 for the independent-creation log.
 
 This folder documents the public surface of `indusagi`: the capability layers, the CLI it bundles,
@@ -152,4 +152,4 @@ taps the live `RunEvent` stream. See [Getting Started](/docs/getting-started) fo
 
 ## License
 
-MIT — see [`NOTICE`](https://github.com/varunisrani/indusagi-ts) and `CREDITS.md`.
+MIT — see [`NOTICE`](https://github.com/varunisrani/indusagi-sdk) and `CREDITS.md`.

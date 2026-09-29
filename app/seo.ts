@@ -35,7 +35,7 @@ export function buildHomeStructuredData(faq: readonly FaqItem[]) {
           width: 640,
           height: 213,
         },
-        sameAs: ['https://github.com/varunisrani/indusagi'],
+        sameAs: ['https://github.com/varunisrani/indusagi-sdk'],
       },
       {
         '@type': 'SoftwareApplication',

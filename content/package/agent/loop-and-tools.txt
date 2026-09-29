@@ -90,7 +90,7 @@ const agent = new Agent({
 
 ---
 
-# Built-in Tools
+## Built-in Tools
 
 The built-in tools/actions live in `src/facade/bot/actions/` and are exported from `indusagi/agent`. Every tool implements `AgentTool` and supports:
 

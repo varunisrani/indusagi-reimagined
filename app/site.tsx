@@ -21,7 +21,7 @@ export function HomePage() {
           <p>A terminal-first coding agent and the framework underneath it. Install from npm, pip, or cargo — free models included, or bring Claude, GPT, Gemini and your own.</p>
           <div className="hero-actions">
             <SiteLink href="/docs" className="primary-button">Read the docs <ArrowUpRight size={18} /></SiteLink>
-            <SiteLink href="https://github.com/varunisrani/indusagi" className="secondary-button"><Star size={16} /> Star on GitHub</SiteLink>
+            <SiteLink href="https://github.com/varunisrani/indusagi-sdk" className="secondary-button"><Star size={16} /> Star on GitHub</SiteLink>
           </div>
           <div className="hero-install"><code>npm install -g indusagi</code><CopyButton text="npm install -g indusagi" label="Copy" /></div>
           <a className="hero-proof" href="#benchmarks"><strong>386 / 445</strong><span>Terminal-Bench 2.1 · TypeScript &amp; Python<br />IndusAGI-reported results</span><ArrowUpRight size={15} /></a>
