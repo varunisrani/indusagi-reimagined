@@ -29,6 +29,20 @@ test('benchmark copy separates the official Terminal-Bench 2.0 rank from 2.1 cam
   assert.match(site, /Terminal-Bench 2\.1 · TypeScript &amp; Python/);
 });
 
+test('benchmark announcement rotates factual highlights every five seconds without visible controls', async () => {
+  const [site, ticker] = await Promise.all([source('app/site.tsx'), source('app/benchmark-announcement.tsx')]);
+  assert.match(site, /<BenchmarkAnnouncement \/>/);
+  assert.match(ticker, /setInterval\([^]*5_000\)/);
+  assert.match(ticker, /#24 official rank/);
+  assert.match(ticker, /Python · 86\.74%/);
+  assert.match(ticker, /TypeScript · 86\.74%/);
+  assert.match(ticker, /Rust · 73\.03%/);
+  assert.doesNotMatch(ticker, /Rust · 86\.5%/);
+  assert.match(ticker, /prefers-reduced-motion: reduce/);
+  assert.match(ticker, /onMouseEnter=\{\(\) => setPaused\(true\)\}/);
+  assert.doesNotMatch(ticker, /carousel|slider|pagination|dot/i);
+});
+
 test('footer contains working legal links, no placeholder navigation, and a current year', async () => {
   const footer = await source('app/footer.tsx');
   for (const [href, label] of [['/privacy', 'Privacy'], ['/terms', 'Terms'], ['/cookies', 'Cookies']]) {

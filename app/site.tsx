@@ -9,10 +9,11 @@ import { HeroTitle } from './hero-title';
 import { SiteLink } from './site-link';
 import { CapabilityShowcase } from './capability-showcase';
 import { Benchmarks } from './benchmarks';
+import { BenchmarkAnnouncement } from './benchmark-announcement';
 
 export function HomePage() {
   return <div id="top"><main>
-    <a href="https://www.tbench.ai/?version=2.0" className="benchmark-announcement" target="_blank" rel="noreferrer"><span>TERMINAL-BENCH 2.0</span><strong>#24 official rank</strong><span className="announcement-detail">IndusAGI Coding Agent · 69.1%</span><ArrowUpRight size={16} /></a>
+    <BenchmarkAnnouncement />
     <section className="hero wrap">
       <div className="hero-grid">
         <div className="hero-copy">
