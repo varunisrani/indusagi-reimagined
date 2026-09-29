@@ -6,14 +6,27 @@ import { resolve } from 'node:path';
 const root = resolve(import.meta.dirname, '..');
 const source = (path) => readFile(resolve(root, path), 'utf8');
 
-test('global shell provides keyboard bypass navigation and overflow-safe media', async () => {
+test('global shell omits the visible skip-to-content control and keeps overflow-safe media', async () => {
   const [layout, css] = await Promise.all([source('app/layout.tsx'), source('app/globals.css')]);
-  assert.match(layout, /className="skip-link" href="#main-content"/);
+  assert.doesNotMatch(layout, /Skip to main content|className="skip-link"/);
   assert.match(layout, /id="main-content" tabIndex=\{-1\}/);
   assert.match(css, /html,body\{[^}]*overflow-x:clip/);
   assert.match(css, /img\{[^}]*max-width:100%[^}]*height:auto/);
-  assert.match(css, /\.skip-link\{/);
-  assert.match(css, /\.skip-link:focus\{/);
+  assert.doesNotMatch(css, /\.skip-link(?:\{|:focus)/);
+});
+
+test('benchmark copy separates the official Terminal-Bench 2.0 rank from 2.1 campaigns', async () => {
+  const [site, benchmarks] = await Promise.all([source('app/site.tsx'), source('app/benchmarks.tsx')]);
+  const combined = site + benchmarks;
+  assert.match(combined, /https:\/\/www\.tbench\.ai\/\?version=2\.0/);
+  assert.match(combined, /#24/);
+  assert.match(combined, /IndusAGI Coding Agent/);
+  assert.match(combined, /GPT-5\.3-Codex/);
+  assert.match(combined, /69\.1%/);
+  assert.match(combined, /Terminal-Bench 2\.0/);
+  assert.match(benchmarks, /Terminal-Bench 2\.1/);
+  assert.match(benchmarks, /IndusAGI-reported campaigns/);
+  assert.match(site, /Terminal-Bench 2\.1 · TypeScript &amp; Python/);
 });
 
 test('footer contains working legal links, no placeholder navigation, and a current year', async () => {

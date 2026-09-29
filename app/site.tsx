@@ -12,7 +12,7 @@ import { Benchmarks } from './benchmarks';
 
 export function HomePage() {
   return <div id="top"><main>
-    <a href="#benchmarks" className="benchmark-announcement"><span>TERMINAL-BENCH 2.1</span><strong>86.74% strict accuracy</strong><span className="announcement-detail">IndusAGI-reported · 445 trials each</span><ArrowUpRight size={16} /></a>
+    <a href="https://www.tbench.ai/?version=2.0" className="benchmark-announcement" target="_blank" rel="noreferrer"><span>TERMINAL-BENCH 2.0</span><strong>#24 official rank</strong><span className="announcement-detail">IndusAGI Coding Agent · 69.1%</span><ArrowUpRight size={16} /></a>
     <section className="hero wrap">
       <div className="hero-grid">
         <div className="hero-copy">

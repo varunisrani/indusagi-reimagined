@@ -2,7 +2,8 @@ import { ArrowUpRight, Check } from 'lucide-react';
 import { SiteLink } from './site-link';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
 
-const leaderboardUrl = 'https://www.tbench.ai/?version=2.1';
+const leaderboard20Url = 'https://www.tbench.ai/?version=2.0';
+const leaderboard21Url = 'https://www.tbench.ai/?version=2.1';
 // Read from the official Terminal-Bench 2.1 table on 11 September 2026.
 const references = [
   { agent: 'Codex', model: 'GPT-6 Astra', effort: 'high', rate: '87.4', interval: '1.8' },
@@ -19,6 +20,11 @@ const campaigns = [
 
 export function Benchmarks() {
   return <section className="benchmarks-section wrap" id="benchmarks" aria-labelledby="benchmarks-title">
+    <article className="benchmark-rank-card" aria-labelledby="official-rank-title">
+      <div className="benchmark-rank-number"><span>OFFICIAL RANK</span><strong>#24</strong></div>
+      <div className="benchmark-rank-copy"><span className="section-number">Terminal-Bench 2.0</span><h3 id="official-rank-title">IndusAGI Coding Agent</h3><p><strong>GPT-5.3-Codex · 69.1% ± 2.3</strong> resolution rate on the official leaderboard, checked <time dateTime="2026-09-29">29 September 2026</time>.</p></div>
+      <SiteLink href={leaderboard20Url} target="_blank" rel="noreferrer">View Terminal-Bench 2.0 <ArrowUpRight size={16} /></SiteLink>
+    </article>
     <div className="benchmark-heading"><div><span className="section-number">Terminal-Bench 2.1</span><h2 id="benchmarks-title">445 trials.<br /><span className="muted">Every result counts.</span></h2></div><p>In IndusAGI’s reported campaigns, TypeScript and Python each passed <strong>386 of 445 trials</strong> — <strong>86.74% strict accuracy</strong>, with errored trials counted as unsuccessful.</p></div>
     <div className="benchmark-source-line"><span>IndusAGI-reported campaigns</span><span>Complete runs · source jobs linked below</span></div>
     <div className="benchmark-grid">{campaigns.map(c => <article className="benchmark-card" key={c.edition}>
@@ -33,7 +39,7 @@ export function Benchmarks() {
     </article>)}</div>
     <div className="benchmark-method"><p><strong>How to read these results.</strong> Strict accuracy uses all 445 trials, including errored trials as unsuccessful. Pass@5 reports tasks solved out of 89. Models differ between campaigns: TypeScript and Python used GPT-6 Astra; Rust used GPT-5.6 Sol. All used xhigh reasoning.</p><p>The newer Rust GPT-6 Astra campaign is excluded because it stopped after 87/445 attempts and was not a fully completed run.</p></div>
     <div className="benchmark-reference">
-      <div className="benchmark-reference-heading"><div><span className="section-number">From the official leaderboard</span><h3>Terminal-Bench 2.1 reference results</h3></div><SiteLink href={leaderboardUrl} target="_blank" rel="noreferrer">View source <ArrowUpRight size={16} /></SiteLink></div>
+      <div className="benchmark-reference-heading"><div><span className="section-number">From the official leaderboard</span><h3>Terminal-Bench 2.1 reference results</h3></div><SiteLink href={leaderboard21Url} target="_blank" rel="noreferrer">View source <ArrowUpRight size={16} /></SiteLink></div>
       <Table className="benchmark-reference-table" aria-label="Terminal-Bench reference results" role="table"><TableHeader role="rowgroup"><TableRow role="row"><TableHead scope="col">Agent</TableHead><TableHead scope="col">Model</TableHead><TableHead scope="col">Reasoning</TableHead><TableHead scope="col" className="reference-rate">Resolution rate</TableHead></TableRow></TableHeader><TableBody role="rowgroup">{references.map(row => <TableRow role="row" key={row.agent + row.model}><TableCell role="cell" data-label="Agent">{row.agent}</TableCell><TableCell role="cell" data-label="Model">{row.model}</TableCell><TableCell role="cell" data-label="Reasoning">{row.effort}</TableCell><TableCell role="cell" data-label="Resolution rate" className="reference-rate"><strong>{row.rate}%</strong><span> ± {row.interval}%</span></TableCell></TableRow>)}</TableBody></Table>
       <p className="benchmark-reference-note">Source: Terminal-Bench 2.1, checked <time dateTime="2026-09-11">11 September 2026</time>. The ± values show 95% confidence intervals. These are selected official entries, separate from the IndusAGI-reported campaigns above. IndusAGI was not listed in the official table checked; no official rank is claimed. Scoring and run configurations may differ.</p>
     </div>
